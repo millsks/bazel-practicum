@@ -1,0 +1,31 @@
+[[check]]
+name = "the inventory package loads"
+command = ["query", "//inventory:all"]
+message = "Bazel could not load inventory/BUILD.bazel. Read the first ERROR line."
+
+[[check]]
+name = "bazel test //inventory:stock_test passes"
+command = ["test", "//inventory:stock_test", "--test_output=errors"]
+message = "The test cannot find prices.csv. Which target reads it at run time, and which attribute puts a file into the runfiles?"
+
+[[check]]
+name = "prices.csv is declared as data of the library that reads it"
+command = ["query", "labels(data, //inventory:stock)"]
+stdout_contains = ["//inventory:prices.csv"]
+message = "Declare the file on //inventory:stock (the code that opens it), so every test and binary that uses the library gets it too."
+
+[[check]]
+name = "bazel build //inventory:item_count succeeds in the sandbox"
+command = ["build", "//inventory:item_count"]
+message = "The genrule's command reads a file it never declared, so the sandbox does not contain it. Add it to srcs and refer to it with $(location ...)."
+
+[[check]]
+name = "the item count is 3"
+file_contains = { "bazel-bin/inventory/item_count.txt" = "3" }
+message = "bazel-bin/inventory/item_count.txt should contain 3 (the header line is not an item)."
+
+[[check]]
+name = "prices.csv is a declared input of the genrule"
+command = ["query", "labels(srcs, //inventory:item_count)"]
+stdout_contains = ["//inventory:prices.csv"]
+message = "List prices.csv in the genrule's srcs."

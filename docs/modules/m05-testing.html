@@ -1,0 +1,1577 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M05 · Testing at Scale · Bazel Practicum</title>
+<link rel="stylesheet" href="../assets/css/course.css">
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/viz.js" defer></script>
+<script src="../assets/js/viz-bazel.js" defer></script>
+<script src="../assets/js/course.js" defer></script>
+</head>
+<body data-root="../" data-module="m05">
+<main class="lesson">
+  <header class="lesson-hero">
+    <p class="eyebrow">Stage 2 · Growing the Monorepo · Module 05</p>
+    <h1>Testing at Scale</h1>
+    <p class="lede">With pytest, "run the tests" means "run all of them, every time". In a monorepo with thousands of
+      tests that stops working. Bazel treats every test as a cached action with a declared size, tags, and environment,
+      so <code>bazel test //...</code> runs only what your change can affect. This module teaches you to control which
+      tests run, read what they did, and keep them fast and trustworthy.</p>
+    <div class="lesson-meta"><span>⏱ ~2 hours</span><span>Prerequisites: <a href="m04-bzlmod-pypi.html">M04</a></span></div>
+    <ul class="objectives">
+      <li>Explain why an unchanged test reports <code>(cached) PASSED</code>, and when to bypass the cache</li>
+      <li>Give tests a <code>size</code> and <code>timeout</code>, and act on Bazel's "size is too big" hint</li>
+      <li>Select tests with <code>tags</code>, <code>manual</code>, <code>--test_tag_filters</code>, <code>--test_size_filters</code>, and <code>test_suite</code></li>
+      <li>Find and read <code>test.log</code> and <code>test.xml</code>, and choose a <code>--test_output</code> mode</li>
+      <li>Write tests that respect the test environment: runfiles, <code>TEST_TMPDIR</code>, arguments, and filters</li>
+      <li>Detect flaky tests with <code>--runs_per_test</code>, and know what <code>flaky = True</code> and sharding really do</li>
+      <li>Keep test helpers out of production code with <code>testonly</code></li>
+    </ul>
+  </header>
+
+  <section class="lesson-section" id="cached-tests">
+    <h2>Tests are cached actions</h2>
+    <aside class="callout python">
+      <p>pytest keeps no memory between runs. <code>pytest --lf</code> reruns last failures, but nothing tells pytest
+        "you changed <code>billing.py</code>, so only these 40 tests can be affected". You choose a subset by hand, or you
+        wait for all of them.</p>
+    </aside>
+    <p>In Bazel, running a test is an <strong>action</strong>, just like compiling a file (M02). Its inputs are the test
+      program, its runfiles (sources, dependencies, data files, the interpreter), the environment, and the test flags.
+      Its outputs are the exit code and the log. If none of the inputs changed, Bazel already knows the result.</p>
+    <p>Run the tests of a workspace twice. The first line comes from a test that already passed earlier; the second
+      ran now, because its inputs were new:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">//calc:env_test                                                 (cached) PASSED in 0.3s
+//calc:calc_test                                                         PASSED in 0.7s
+
+Executed 1 out of 2 tests: 2 tests pass.</code></pre>
+    <p><code>Executed 1 out of 2</code> is the headline. <code>(cached)</code> means the result was reused: the time
+      shown is from the run that produced it. Now edit one library, <code>calc/calc.py</code>, and test four packages:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">//app:app_test                                                  (cached) PASSED in 0.3s
+//calc:env_test                                                 (cached) PASSED in 0.7s
+//rd:read_test                                                  (cached) PASSED in 0.5s
+//calc:calc_test                                                         PASSED in 0.3s
+Executed 1 out of 4 tests: 4 tests pass.</code></pre>
+    <p>Only <code>//calc:calc_test</code> depends on <code>calc.py</code>, so only it ran. Its neighbor
+      <code>//calc:env_test</code> lives in the same package but does not depend on the library, so it stayed cached.
+      This is the payoff of declaring <code>deps</code> precisely.</p>
+    <h3>Bypassing the cache</h3>
+    <p>Sometimes you want a real run anyway: you suspect the machine, or you are timing a test. Two spellings of the
+      same flag force it:</p>
+    <pre data-label="Terminal"><code class="language-bash">pixi run bazel test //... --nocache_test_results
+pixi run bazel test //... --cache_test_results=no    # same thing</code></pre>
+    <p>The default, <code>--cache_test_results=auto</code>, caches passing results. It reruns a test that failed last time,
+      and a test tagged <code>external</code> (see <a href="#tags">Tags</a>), which is never cached.</p>
+    <aside class="callout warn">
+      <p>Changing <em>how you look at</em> results does not invalidate them. <code>--test_output=errors</code> and
+        <code>--test_output=all</code> both print <code>(cached) PASSED</code> for an unchanged test, and with
+        <code>all</code> you see the cached log. A test whose behavior depends on something Bazel does not track (the
+        clock, the network, a file outside the workspace) can be cached with a stale verdict. That is a bug in the test,
+        and later sections show how to fix it.</p>
+    </aside>
+    <aside class="callout sim">
+      <p>The simulator never runs tests. Its <code>bazel test</code> prints which tests <em>would</em> run, after the
+        loading and analysis phases, and says <code>(would run)</code> instead of PASSED. Selection (tags, sizes,
+        suites, <code>manual</code>) is modeled exactly; results and caching need real Bazel and the labs.</p>
+    </aside>
+    <p>Try it: which tests does <code>bazel test //...</code> select here, and which does <code>//calc:all</code>?</p>
+    <div class="runnable" data-title="What would bazel test run?" data-commands="bazel test //...|bazel test //calc:all|bazel query 'tests(//...)'">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "practicum")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="calc/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "calc",
+    srcs = ["calc.py"],
+    visibility = ["//visibility:public"],
+)
+
+py_test(
+    name = "calc_test",
+    size = "small",
+    srcs = ["calc_test.py"],
+    deps = [":calc"],
+)
+
+py_test(
+    name = "env_test",
+    srcs = ["env_test.py"],
+)
+</textarea>
+<textarea class="file" data-path="app/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_test")
+
+py_test(
+    name = "app_test",
+    size = "small",
+    srcs = ["app_test.py"],
+    deps = ["//calc"],
+)
+</textarea>
+<textarea class="file" data-path="calc/calc.py" data-hidden></textarea>
+<textarea class="file" data-path="calc/calc_test.py" data-hidden></textarea>
+<textarea class="file" data-path="calc/env_test.py" data-hidden></textarea>
+<textarea class="file" data-path="app/app_test.py" data-hidden></textarea>
+</div>
+    <p><strong>Remember:</strong> a test is an action keyed by its inputs. Unchanged inputs mean <code>(cached)
+      PASSED</code>; <code>--nocache_test_results</code> forces a fresh run.</p>
+  </section>
+
+  <section class="lesson-section" id="size-timeout">
+    <h2>Size and timeout</h2>
+    <aside class="callout python">
+      <p>pytest has no built-in timeout. A test that hangs on a socket hangs your CI job until something outside kills
+        it. The <code>pytest-timeout</code> plugin exists because of that.</p>
+    </aside>
+    <p>Every Bazel test has a <code>size</code>: <code>small</code>, <code>medium</code> (the default),
+      <code>large</code>, or <code>enormous</code>. The size describes how heavy the test is, and it sets the default
+      <code>timeout</code>. When the timeout passes, Bazel kills the test and reports <code>TIMEOUT</code>.</p>
+    <table>
+      <thead><tr><th><code>size</code></th><th>Default <code>timeout</code></th><th>Seconds (<code>TEST_TIMEOUT</code>)</th><th>Typical test</th></tr></thead>
+      <tbody>
+        <tr><td><code>small</code></td><td><code>short</code></td><td>60</td><td>Pure functions, no I/O beyond a temp file</td></tr>
+        <tr><td><code>medium</code></td><td><code>moderate</code></td><td>300</td><td>A local database, a subprocess, a few seconds of work</td></tr>
+        <tr><td><code>large</code></td><td><code>long</code></td><td>900</td><td>Several services, end-to-end flows</td></tr>
+        <tr><td><code>enormous</code></td><td><code>eternal</code></td><td>3600</td><td>Rare: hour-long system tests</td></tr>
+      </tbody>
+    </table>
+    <p>The seconds column is what a test actually received in its <code>TEST_TIMEOUT</code> environment variable under
+      Bazel 9.3.2. You can set <code>timeout</code> on its own when a test is light but slow, for example
+      <code>size = "small", timeout = "long"</code> gives 900 seconds.</p>
+    <pre data-label="geo/BUILD.bazel"><code class="language-starlark">py_test(
+    name = "distance_test",
+    size = "small",
+    srcs = ["distance_test.py"],
+    deps = [":geo"],
+)</code></pre>
+    <p>Only those four words are allowed. A typo is a loading error that stops the whole package:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: /work/practicum/bad/BUILD.bazel:4:8: In rule 'tiny_test', size 'tiny' is not a valid size.
+ERROR: /work/practicum/bad/BUILD.bazel:4:8: In rule 'tiny_test', timeout 'illegal' is not a valid timeout.</code></pre>
+    <h3>What a timeout looks like</h3>
+    <p><code>--test_timeout=N</code> overrides every test's timeout for one run, which is handy to reproduce a hang
+      quickly. A test that sleeps five seconds, run with a two-second limit:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">INFO: Build completed, 1 test FAILED, 2 total actions
+//sel:slow_test                                                         TIMEOUT in 2.0s
+  /root/.cache/bazel/_bazel_root/…/execroot/_main/bazel-out/k8-fastbuild/testlogs/sel/slow_test/test.log
+
+Executed 1 out of 1 test: 1 fails locally.</code></pre>
+    <p>The last line of that <code>test.log</code> is <code>-- Test timed out at 2026-11-09 08:48:36 UTC --</code>.</p>
+    <h3>The "size is too big" hint</h3>
+    <p>You saw this line in M03, after every test run where a test had no size:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">There were tests whose specified size is too big. Use the --test_verbose_timeout_warnings command line option to see which ones these are.</code></pre>
+    <p>Bazel noticed a test finished far inside its timeout. Add the flag it suggests to find out which one:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">//calc:calc_test                                                (cached) PASSED in 1.1s
+//calc:env_test                                                 (cached) PASSED in 1.2s
+  WARNING: //calc:env_test: Test execution time (1.2s excluding execution overhead) outside of range for MODERATE tests. Consider setting timeout="short" or size="small".</code></pre>
+    <p>Why care, if it passes? Two reasons. A tight timeout catches a hang in one minute instead of five. And sizes let
+      you choose tests by weight, as the next sandbox shows.</p>
+    <p>Predict which tests <code>--test_size_filters=small</code> selects. Remember the default size.</p>
+    <div class="runnable" data-predict data-title="Filter by size" data-commands="bazel test //... --test_size_filters=small|bazel test //... --test_size_filters=medium,large|bazel test //... --test_size_filters=enormous">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "practicum")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="geo/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_test")
+
+py_test(
+    name = "distance_test",
+    size = "small",
+    srcs = ["distance_test.py"],
+)
+
+py_test(
+    name = "parse_test",
+    size = "small",
+    timeout = "long",
+    srcs = ["parse_test.py"],
+)
+
+py_test(
+    name = "tiles_test",
+    srcs = ["tiles_test.py"],
+)
+
+py_test(
+    name = "import_test",
+    size = "large",
+    srcs = ["import_test.py"],
+)
+</textarea>
+<textarea class="file" data-path="geo/distance_test.py" data-hidden></textarea>
+<textarea class="file" data-path="geo/parse_test.py" data-hidden></textarea>
+<textarea class="file" data-path="geo/tiles_test.py" data-hidden></textarea>
+<textarea class="file" data-path="geo/import_test.py" data-hidden></textarea>
+</div>
+    <p><code>parse_test</code> is still small even with a long timeout: the filter looks at <code>size</code> only
+      (<code>--test_timeout_filters</code> filters by timeout). When a filter matches nothing, Bazel stops with
+      <code>ERROR: No test targets were found, yet testing was requested</code>.</p>
+    <p><strong>Remember:</strong> set <code>size</code> on every test; <code>small</code> is right for most unit tests.
+      The size gives a default timeout (60, 300, 900, 3600 seconds) and a handle for <code>--test_size_filters</code>.</p>
+  </section>
+
+  <section class="lesson-section" id="tags">
+    <h2>Tags and test filters</h2>
+    <aside class="callout python">
+      <p>pytest has markers: <code>@pytest.mark.slow</code> on a function, then <code>pytest -m "not slow"</code>.
+        Markers live in the code and select individual test functions.</p>
+    </aside>
+    <p>Bazel's equivalent is the <code>tags</code> attribute, a list of strings on the <em>target</em>. Any string works
+      as a label for your own filters, like <code>"slow"</code> or <code>"integration"</code>. A handful of tags also
+      change what Bazel does:</p>
+    <table>
+      <thead><tr><th>Tag</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td><code>manual</code></td><td>Wildcards (<code>//...</code>, <code>:all</code>) skip the target. It runs only when named explicitly or through a <code>test_suite</code>.</td></tr>
+        <tr><td><code>external</code></td><td>The test talks to the outside world, so its result is never cached. It reran on every invocation in our checks.</td></tr>
+        <tr><td><code>exclusive</code></td><td>Run this test alone, with no other test in parallel. Still sandboxed in Bazel 9.</td></tr>
+        <tr><td><code>no-sandbox</code></td><td>Run without the sandbox, directly in the execution root (<code>local</code> instead of <code>linux-sandbox</code> in the summary line). A last resort.</td></tr>
+        <tr><td><code>no-cache</code>, <code>no-remote</code></td><td>Keep the action out of the disk and remote caches. For tests, prefer <code>external</code>.</td></tr>
+      </tbody>
+    </table>
+    <aside class="callout warn">
+      <p><code>no-cache</code> does not do what its name suggests for local test reruns. A test tagged
+        <code>no-cache</code> still printed <code>(cached) PASSED</code> on its second run in our workspace, because the
+        local test result cache is separate. Use <code>external</code> when a test's result must never be reused.</p>
+    </aside>
+    <h3>Choosing tests with --test_tag_filters</h3>
+    <p><code>--test_tag_filters</code> takes a comma-separated list. A plain tag means "has at least one of these"; a tag
+      with <code>-</code> means "has none of these". Exclusions win.</p>
+    <pre data-label="Terminal"><code class="language-bash">pixi run bazel test //... --test_tag_filters=-slow,-external   # everyday run
+pixi run bazel test //... --test_tag_filters=integration        # only integration tests</code></pre>
+    <p>Filters only narrow what the target pattern already selected. Two consequences surprise people:</p>
+    <ul>
+      <li><strong><code>manual</code> is not a filter.</strong> <code>--test_tag_filters=manual</code> does not select
+        manual tests; real Bazel ignores a positive <code>manual</code> and runs the usual non-manual tests. Name a manual
+        test explicitly, or put it in a suite.</li>
+      <li><strong>A size counts as a tag here.</strong> <code>--test_tag_filters=small</code> selected the small tests in
+        our workspace, exactly like <code>--test_size_filters=small</code>.</li>
+    </ul>
+    <h3>Tests only: --build_tests_only</h3>
+    <p><code>bazel test //...</code> also <em>builds</em> every non-test target the pattern matches. If an unrelated
+      binary is broken, the build fails and the tests are skipped with <code>NO STATUS</code>:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: /work/practicum/bt/BUILD.bazel:3:10: //bt:tool: missing input file '//bt:tool.py'
+ERROR: Build did NOT complete successfully
+//bt:ok_test                                                          NO STATUS
+Executed 0 out of 1 test: 1 was skipped.</code></pre>
+    <p><code>--build_tests_only</code> builds only what the selected tests need. The same command then passes:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">INFO: Build completed successfully, 3 total actions
+//bt:ok_test                                                             PASSED in 1.3s
+Executed 1 out of 1 test: 1 test passes.</code></pre>
+    <aside class="callout pro">
+      <p>Many teams keep two habits: CI runs <code>bazel test //...</code> without <code>--build_tests_only</code>, so a
+        broken binary fails the build; developers use it locally with tag and size filters for a fast loop. Lines like
+        <code>test --test_tag_filters=-external</code> in <code>.bazelrc</code> (M06) make the everyday filter the
+        default.</p>
+    </aside>
+    <p>Predict which tests each command selects, then run them.</p>
+    <div class="runnable" data-predict data-title="Tags, manual, and filters" data-commands="bazel test //...|bazel test //... --test_tag_filters=-slow,-external|bazel test //... --test_tag_filters=integration|bazel test //search:live_api_test|bazel query 'attr(tags, manual, //...)'">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "practicum")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="search/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_test")
+
+py_test(
+    name = "index_test",
+    size = "small",
+    srcs = ["index_test.py"],
+)
+
+py_test(
+    name = "ranking_test",
+    srcs = ["ranking_test.py"],
+    tags = ["slow"],
+)
+
+py_test(
+    name = "api_test",
+    srcs = ["api_test.py"],
+    tags = [
+        "external",
+        "integration",
+    ],
+)
+
+py_test(
+    name = "live_api_test",
+    srcs = ["live_api_test.py"],
+    tags = [
+        "external",
+        "integration",
+        "manual",
+    ],
+)
+</textarea>
+<textarea class="file" data-path="search/index_test.py" data-hidden></textarea>
+<textarea class="file" data-path="search/ranking_test.py" data-hidden></textarea>
+<textarea class="file" data-path="search/api_test.py" data-hidden></textarea>
+<textarea class="file" data-path="search/live_api_test.py" data-hidden></textarea>
+</div>
+    <p><strong>Remember:</strong> <code>manual</code> hides a target from wildcards; <code>external</code> disables result
+      caching; <code>--test_tag_filters</code> narrows with any-of and none-of, but never adds manual tests back.</p>
+  </section>
+
+  <section class="lesson-section" id="test-suite">
+    <h2>Grouping tests with test_suite</h2>
+    <p>A <strong><code>test_suite</code></strong> is a native rule (no <code>load</code> needed) that names a group of
+      tests. <code>bazel test //billing:quick</code> runs the group. It has two ways to choose members:</p>
+    <pre data-label="billing/BUILD.bazel"><code class="language-starlark"># 1. By tag: every non-manual test in this package that matches.
+test_suite(
+    name = "quick",
+    tags = ["-slow"],
+)
+
+# 2. Explicitly: exactly these tests (or other suites), from any package.
+test_suite(
+    name = "nightly",
+    tags = ["manual"],
+    tests = [
+        ":ledger_db_test",
+        ":pdf_test",
+        "//shipping:label_test",
+    ],
+)</code></pre>
+    <p>With no <code>tests</code> attribute, a suite collects the package's tests, skipping manual ones, and
+      <code>tags</code> filters them like <code>--test_tag_filters</code>. That form keeps itself up to date: a new
+      non-slow test joins <code>:quick</code> automatically. With <code>tests</code>, it holds exactly what you list
+      (and <code>tags</code> still filters that list, except the <code>manual</code> tag, which is about the suite
+      itself).</p>
+    <h3>Suites and manual tests</h3>
+    <p>A suite that names a manual test <strong>runs it</strong>. That is the standard way to give manual tests a
+      single entry point: <code>bazel test //billing:nightly</code>. The trap is the other direction: <code>//...</code>
+      matches the suite itself, so a non-manual suite drags its manual members into every wildcard run. In our workspace
+      a suite naming <code>//sel:manual_test</code> made <code>bazel test //sel/...</code> run it. Tag the suite
+      <code>manual</code> too, as <code>:nightly</code> does above.</p>
+    <p>Only tests and suites may be members. Listing a library is an error:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: /work/practicum/bad/BUILD.bazel:5:11: in test_suite rule '//bad:suite': expecting a test or a test_suite rule but '//bad:lib' is not one.</code></pre>
+    <p><code>bazel query 'tests(//billing:quick)'</code> expands a suite into its tests without running anything. Try
+      it, and predict the answer for <code>:nightly</code> first.</p>
+    <div class="runnable" data-predict data-title="Expand the suites" data-commands="bazel query 'tests(//billing:nightly)'|bazel query 'tests(//billing:quick)'|bazel test //...|bazel test //billing:nightly">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "practicum")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="billing/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_test")
+
+py_test(
+    name = "tax_test",
+    size = "small",
+    srcs = ["tax_test.py"],
+)
+
+py_test(
+    name = "pdf_test",
+    srcs = ["pdf_test.py"],
+    tags = ["slow"],
+)
+
+py_test(
+    name = "ledger_db_test",
+    srcs = ["ledger_db_test.py"],
+    tags = [
+        "external",
+        "manual",
+    ],
+)
+
+test_suite(
+    name = "quick",
+    tags = ["-slow"],
+)
+
+test_suite(
+    name = "nightly",
+    tags = ["manual"],
+    tests = [
+        ":ledger_db_test",
+        ":pdf_test",
+    ],
+)
+</textarea>
+<textarea class="file" data-path="billing/tax_test.py" data-hidden></textarea>
+<textarea class="file" data-path="billing/pdf_test.py" data-hidden></textarea>
+<textarea class="file" data-path="billing/ledger_db_test.py" data-hidden></textarea>
+</div>
+    <aside class="callout think">
+      <p>Remove <code>tags = ["manual"]</code> from <code>:nightly</code> and run <code>bazel test //...</code> again.
+        Which test appears, and why would that hurt on a laptop without the ledger database?</p>
+    </aside>
+    <p><strong>Remember:</strong> a suite selects by tag (package tests, minus manual) or by explicit list. Explicit
+      members run even if manual, so tag suites that hold manual tests <code>manual</code> as well.</p>
+  </section>
+
+  <section class="lesson-section" id="test-output">
+    <h2>Test output and logs</h2>
+    <aside class="callout python">
+      <p>pytest prints everything to your terminal and, with <code>--junitxml</code>, writes a report CI can read.</p>
+    </aside>
+    <p>Bazel runs tests in parallel, so it keeps their output out of your terminal by default. You choose how much to
+      see with <code>--test_output</code>:</p>
+    <table>
+      <thead><tr><th>Value</th><th>What you see</th></tr></thead>
+      <tbody>
+        <tr><td><code>summary</code> (default)</td><td>One status line per test and the path of each failing log.</td></tr>
+        <tr><td><code>errors</code></td><td>Also the full log of every failing test. The everyday choice.</td></tr>
+        <tr><td><code>all</code></td><td>The log of every test, passing or failing (cached ones too).</td></tr>
+        <tr><td><code>streamed</code></td><td>Output live as the test runs. Bazel runs the tests locally, one at a time, so their output does not interleave, so use it to watch one test, not a whole suite.</td></tr>
+      </tbody>
+    </table>
+    <p>With <code>streamed</code>, the unittest output of two tests appears in sequence, before the summary:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">..
+----------------------------------------------------------------------
+Ran 2 tests in 0.000s
+
+OK
+.
+----------------------------------------------------------------------
+Ran 1 test in 0.000s
+
+OK
+[24 / 25] 1 / 2 tests; Testing //rd:read_test; 0s linux-sandbox
+INFO: Found 2 test targets...</code></pre>
+    <h3>bazel-testlogs</h3>
+    <p>Whatever you print, Bazel saves. The <code>bazel-testlogs</code> symlink holds one directory per test, at the
+      test's package path and name:</p>
+    <pre data-label="bazel-testlogs/calc/calc_test/ (real)"><code class="language-none">test.cache_status
+test.log                 # stdout and stderr of the test
+test.outputs/            # files the test wrote to TEST_UNDECLARED_OUTPUTS_DIR
+test.outputs_manifest/
+test.raw_splitlogs/
+test.xml                 # a JUnit-style report for CI</code></pre>
+    <p><code>test.log</code> is the place to look first. <code>test.xml</code> is meant for CI dashboards. If the test
+      runner does not write one (plain unittest does not), Bazel writes a minimal report with one test case per target
+      and the log embedded:</p>
+    <pre data-label="bazel-testlogs/calc/calc_test/test.xml (real, abridged)"><code class="language-none">&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+&lt;testsuites&gt;
+  &lt;testsuite name="calc/calc_test" tests="1" failures="0" errors="0"&gt;
+    &lt;testcase name="calc/calc_test" classname="" status="run" duration="1" time="1"&gt;&lt;/testcase&gt;
+      &lt;system-out&gt;
+Generated test.log (if the file is not UTF-8, then this may be unreadable):
+…</code></pre>
+    <p>A runner that knows the protocol writes its own, richer file to the path in <code>XML_OUTPUT_FILE</code>; the
+      pytest runner in <a href="#args-filter">Arguments and filters</a> does. Repeated runs get one directory each:
+      <code>--runs_per_test=4</code> produced <code>run_1_of_4/</code> to <code>run_4_of_4/</code>, and retries of a
+      flaky test land in <code>test_attempts/</code>.</p>
+    <aside class="callout tip">
+      <p><code>bazel-testlogs</code> points at the latest configuration you tested. The absolute path in the summary
+        line (<code>…/execroot/_main/bazel-out/k8-fastbuild/testlogs/…</code>) is the same directory; on this page
+        we shorten Bazel's output base to <code>…</code> and workspaces to <code>/work/practicum</code>.</p>
+    </aside>
+    <p><strong>Remember:</strong> <code>--test_output=errors</code> for daily work; <code>bazel-testlogs/&lt;pkg&gt;/&lt;name&gt;/test.log</code>
+      for the details; <code>test.xml</code> for CI.</p>
+  </section>
+
+  <section class="lesson-section" id="test-env">
+    <h2>The test environment</h2>
+    <aside class="callout python">
+      <p>pytest runs in your shell's directory, with your environment variables, and your tests can write anywhere,
+        often next to the test file. <code>tmp_path</code> exists, but nothing forces you to use it.</p>
+    </aside>
+    <p>Bazel starts each test in a controlled place. It sets these variables, among others (values from a real run,
+      paths shortened):</p>
+    <table>
+      <thead><tr><th>Variable</th><th>Value in our run</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>TEST_SRCDIR</code>, <code>RUNFILES_DIR</code></td><td><code>…/bin/calc/env_test.runfiles</code></td><td>The test's runfiles tree (M03)</td></tr>
+        <tr><td><code>TEST_TMPDIR</code></td><td><code>…/execroot/_main/_tmp/531d74…</code></td><td>A private, writable scratch directory. <code>HOME</code> points here too.</td></tr>
+        <tr><td><code>TEST_UNDECLARED_OUTPUTS_DIR</code></td><td><code>…/testlogs/calc/env_test/test.outputs</code></td><td>Files written here are kept after the test</td></tr>
+        <tr><td><code>XML_OUTPUT_FILE</code></td><td><code>…/testlogs/calc/env_test/test.xml</code></td><td>Where a runner should write its JUnit XML</td></tr>
+        <tr><td><code>TEST_SIZE</code>, <code>TEST_TIMEOUT</code></td><td><code>medium</code>, <code>300</code></td><td>The test's size and timeout in seconds</td></tr>
+        <tr><td><code>TEST_TARGET</code>, <code>TEST_WORKSPACE</code></td><td><code>//calc:env_test</code>, <code>_main</code></td><td>Which test this is</td></tr>
+        <tr><td><code>PATH</code>, <code>TZ</code></td><td><code>.:/bin:/usr/bin:/usr/local/bin</code>, <code>UTC</code></td><td>A fixed, minimal environment</td></tr>
+      </tbody>
+    </table>
+    <p>The working directory is the workspace inside the runfiles tree, <code>…/env_test.runfiles/_main</code>, the same
+      place <code>bazel run</code> uses. Your own variables do not leak in: pass them with
+      <code>--test_env=NAME=value</code> (or <code>--test_env=NAME</code> to copy one from your shell), or set
+      <code>env</code> on the target.</p>
+    <h3>Mistake: reading files relative to the working directory</h3>
+    <p>A test that opens <code>"rd/testdata/cases.json"</code> fails if the file is not in <code>data</code>, even though
+      it is right there in your checkout:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">FileNotFoundError: [Errno 2] No such file or directory: 'rd/testdata/cases.json'</code></pre>
+    <p>Adding <code>data = ["testdata/cases.json"]</code> makes it pass, because the file is now in the runfiles and
+      the working directory happens to be the runfiles root. "Happens to" is the problem: wrappers, debuggers, and
+      <code>--run_under</code> start tests elsewhere. Use the runfiles library from M03, which works from any directory:</p>
+    <pre data-label="rd/read_test.py"><code class="language-python">from python.runfiles import runfiles
+
+path = runfiles.Create().Rlocation("_main/rd/testdata/cases.json")</code></pre>
+    <h3>Mistake: writing next to the test</h3>
+    <p>Python tests often write fixtures with <code>Path(__file__).parent / "report.txt"</code>. Under the sandbox,
+      <code>__file__</code> resolves into your source tree, which is mounted read-only:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">OSError: [Errno 30] Read-only file system: '/work/practicum/io/report.txt'</code></pre>
+    <p>The sandbox just saved you from a test that edits your checkout. Writing to the current directory, by contrast,
+      silently succeeds: it lands in the runfiles tree, which is shared with other runs of the same test. Neither is
+      safe. Write to <code>TEST_TMPDIR</code>:</p>
+    <pre data-label="io/write_test.py"><code class="language-python">import os
+from pathlib import Path
+
+out = Path(os.environ["TEST_TMPDIR"]) / "report.txt"
+out.write_text("ok")</code></pre>
+    <p>Under the Linux sandbox even <code>/tmp</code> is private to the test: a test that created
+      <code>/tmp/cards_export.txt</code> with <code>open(..., "x")</code> passed four runs in a row, and the file never
+      appeared in the real <code>/tmp</code>. Still, use <code>TEST_TMPDIR</code>: it is the documented contract on
+      every platform and strategy. To keep a file for later inspection (a screenshot, a diff), write it to
+      <code>TEST_UNDECLARED_OUTPUTS_DIR</code>; it shows up in <code>bazel-testlogs/&lt;pkg&gt;/&lt;name&gt;/test.outputs/</code>.</p>
+    <aside class="callout danger" data-title="no-sandbox hides the bug">
+      <p>Tag the same test <code>no-sandbox</code> and the write to the source tree succeeds: the test passes and leaves
+        <code>io/report.txt</code> in your checkout. If a test only passes without the sandbox, it depends on something
+        undeclared. Fix the test, not the tag.</p>
+    </aside>
+    <p><strong>Remember:</strong> the working directory is the runfiles root, but find files with
+      <code>Rlocation</code>; write only to <code>TEST_TMPDIR</code> (or <code>TEST_UNDECLARED_OUTPUTS_DIR</code> to keep
+      files); pass environment variables with <code>--test_env</code>.</p>
+  </section>
+
+  <section class="lesson-section" id="args-filter">
+    <h2>Arguments, filters, and pytest</h2>
+    <p>Bazel offers two ways to talk to a test runner. Both depend on the runner listening.</p>
+    <h3>--test_arg</h3>
+    <p><code>--test_arg=X</code> appends <code>X</code> to the test's command line, after the target's own
+      <code>args</code>. Repeat the flag for each word. Plain unittest parses its command line, so this selects one
+      test method by substring:</p>
+    <pre data-label="Terminal"><code class="language-bash">pixi run bazel test //shard:filter_test --test_arg=-k --test_arg=beta --test_output=all</code></pre>
+    <pre data-label="Real output (Bazel 9.3.2, test log)"><code class="language-none">test_beta (__main__.FilterTest.test_beta) ... ok
+----------------------------------------------------------------------
+Ran 1 test in 0.000s</code></pre>
+    <p>The flip side: <code>unittest.main()</code> rejects arguments it does not know. A test with
+      <code>args = ["--from-build"]</code> meant for the code under test fails before running anything:</p>
+    <pre data-label="Real output (Bazel 9.3.2, test log)"><code class="language-none">usage: env_test.py [-h] [-v] [-q] [--locals] [--durations N] [-f] [-c] [-b]
+                   [-k TESTNAMEPATTERNS]
+                   [tests ...]
+env_test.py: error: unrecognized arguments: --from-build</code></pre>
+    <p>If your test needs its own arguments, read them from <code>sys.argv</code> first, then call
+      <code>unittest.main(argv=sys.argv[:1])</code> so unittest sees none.</p>
+    <aside class="callout note">
+      <p>Changing <code>--test_arg</code> changes the test action, so the result is not reused from a run with
+        different arguments.</p>
+    </aside>
+    <h3>--test_filter</h3>
+    <p><code>--test_filter=EXPR</code> is Bazel's portable "run only these test cases" flag. Bazel does not filter
+      anything itself: it puts the value in the <code>TESTBRIDGE_TEST_ONLY</code> environment variable and leaves it to
+      the runner. Runners for Java and Go read it. <strong>rules_python 2.4.6 does not</strong>, and neither does plain
+      unittest. We checked: with <code>--test_filter=FilterTest.test_alpha</code>, the variable was set and both test
+      methods still ran.</p>
+    <h3>pytest under Bazel</h3>
+    <p>M04 ran pytest through a tiny entry point, a <code>py_test</code> whose <code>main</code> calls
+      <code>pytest.main()</code> on the files in <code>args</code>, with <code>@pypi//pytest</code> in
+      <code>deps</code>. That works, and <code>--test_arg=-k --test_arg=beta</code> selects tests as you would expect.
+      <code>--test_filter</code> is ignored there too:</p>
+    <pre data-label="Real output (Bazel 9.3.2, test log with --test_filter=test_beta)"><code class="language-none">collected 4 items
+t/math_test.py ....                                                      [100%]
+============================== 4 passed in 0.01s ===============================</code></pre>
+    <p>Three more lines in the entry point make pytest follow Bazel's conventions: honor the filter and write the XML
+      report where Bazel expects it.</p>
+    <pre data-label="t/pytest_main.py"><code class="language-python">"""Run pytest the way Bazel expects: honor --test_filter and write test.xml."""
+
+import os
+import sys
+
+import pytest
+
+if __name__ == "__main__":
+    args = sys.argv[1:]
+    if os.environ.get("TESTBRIDGE_TEST_ONLY"):  # set by --test_filter
+        args += ["-k", os.environ["TESTBRIDGE_TEST_ONLY"]]
+    if os.environ.get("XML_OUTPUT_FILE"):  # Bazel's test.xml
+        args += ["--junitxml", os.environ["XML_OUTPUT_FILE"]]
+    sys.exit(pytest.main(args))</code></pre>
+    <pre data-label="Real output (Bazel 9.3.2, test log with --test_filter=beta)"><code class="language-none">collected 4 items / 3 deselected / 1 selected
+- generated xml file: …/testlogs/t/math_test/test.xml -
+======================= 1 passed, 3 deselected in 0.01s ========================</code></pre>
+    <div class="two-col">
+      <div>
+        <h4>unittest</h4>
+        <p>No dependency, works from day one. Needs <code>unittest.main()</code> at the bottom, or the test silently
+          passes (M03). Parses <code>sys.argv</code>.</p>
+      </div>
+      <div>
+        <h4>pytest</h4>
+        <p>Fixtures, plain <code>assert</code>, plugins. Needs <code>@pypi//pytest</code> (M04) and an entry point.
+          Write the entry point once, as above, and reuse it.</p>
+      </div>
+    </div>
+    <p>The labs in this module use unittest so they run without a PyPI hub. Everything else on this page applies to
+      both.</p>
+    <p><strong>Remember:</strong> <code>--test_arg</code> reaches the runner's command line; <code>--test_filter</code>
+      becomes <code>TESTBRIDGE_TEST_ONLY</code>, which a Python runner must read itself.</p>
+  </section>
+
+  <section class="lesson-section" id="flaky">
+    <h2>Flaky tests</h2>
+    <p>A <strong>flaky test</strong> passes and fails on the same code. In a cached world flakiness is worse than in
+      pytest: a lucky pass is cached and nobody sees the failure until an unrelated change reruns the test.</p>
+    <p>Here is a classic Python flake: a test that uses <code>random</code> without a seed.</p>
+    <pre data-label="flaky/coin_test.py"><code class="language-python">import random
+import unittest
+
+
+class CoinTest(unittest.TestCase):
+    def test_heads(self) -> None:
+        self.assertLess(random.random(), 0.5)
+
+
+if __name__ == "__main__":
+    unittest.main()</code></pre>
+    <h3>Detect: --runs_per_test</h3>
+    <p><code>--runs_per_test=N</code> runs each selected test N times, in parallel, and reports how many runs failed.
+      It is the fastest way to prove a test is (or is no longer) flaky:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">//flaky:coin_test                                                        FAILED in 4 out of 10 in 3.0s
+  Stats over 10 runs: max = 3.0s, min = 0.7s, avg = 1.4s, dev = 0.8s
+  …/testlogs/flaky/coin_test/run_2_of_10/test.log
+  …/testlogs/flaky/coin_test/run_3_of_10/test.log
+  …/testlogs/flaky/coin_test/run_5_of_10/test.log
+  …/testlogs/flaky/coin_test/run_7_of_10/test.log
+
+Executed 1 out of 1 test: 1 fails locally.</code></pre>
+    <p>One failure out of N means FAILED. Runs with <code>--runs_per_test</code> are not served from the cache: two
+      identical commands with <code>--runs_per_test=3</code> both executed every run.</p>
+    <h3>Tolerate: flaky = True and --flaky_test_attempts</h3>
+    <p><code>flaky = True</code> on the target tells Bazel to retry a failing test, up to three attempts in total. If
+      any attempt passes, the test counts as passing, but is labeled:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">//flaky:coin_flaky_test                                                   FLAKY, failed in 2 out of 3 in 0.4s
+  Stats over 3 runs: max = 0.4s, min = 0.3s, avg = 0.4s, dev = 0.0s
+  …/testlogs/flaky/coin_flaky_test/test_attempts/attempt_1.log
+  …/testlogs/flaky/coin_flaky_test/test_attempts/attempt_2.log
+Executed 1 out of 1 test: 1 test passes.</code></pre>
+    <p>When all three fail, it is <code>FAILED in 3 out of 3</code>. <code>--flaky_test_attempts=N</code> does the same
+      from the command line, for every test, without editing BUILD files.</p>
+    <aside class="callout danger" data-title="Retries are a bandage">
+      <p>A coin-flip test with <code>flaky = True</code> still failed outright in one of our six runs. Retries make a
+        flake rarer and slower, and they hide real bugs that happen to be intermittent: race conditions, ordering
+        assumptions, leaked state. Use <code>flaky = True</code> to unblock a team for a few days, with an issue to fix
+        the test. <code>bazel query 'attr(flaky, 1, //...)'</code> lists every test currently excused.</p>
+    </aside>
+    <h3>Fix: make the test deterministic</h3>
+    <p>The usual Python causes and fixes:</p>
+    <ul>
+      <li><strong>Randomness:</strong> pass a seeded <code>random.Random(1234)</code> into the code under test instead of
+        using the global <code>random</code> module.</li>
+      <li><strong>Time:</strong> inject a clock, or compare with a tolerance; never assert on <code>time.time()</code>
+        differences tighter than the machine can guarantee.</li>
+      <li><strong>Order:</strong> iteration order of a <code>set</code> of strings can change between interpreter runs
+        (hash randomization); sort before comparing.</li>
+      <li><strong>Shared state:</strong> files in the runfiles tree or a fixed <code>/tmp</code> path; use
+        <code>TEST_TMPDIR</code>.</li>
+      <li><strong>The network:</strong> tag it <code>external</code> and <code>manual</code>, and test the logic against a
+        fake.</li>
+    </ul>
+    <p><strong>Remember:</strong> <code>--runs_per_test=10</code> detects; <code>flaky = True</code> and
+      <code>--flaky_test_attempts</code> tolerate; only a deterministic test fixes. Lab 1 walks through it.</p>
+  </section>
+
+  <section class="lesson-section" id="sharding">
+    <h2>Sharding</h2>
+    <p>One big test target can be split into <strong>shards</strong>: N copies of the same test program run in
+      parallel, each running a different slice of the test cases. Set <code>shard_count</code> on the target:</p>
+    <pre data-label="shard/BUILD.bazel"><code class="language-starlark">py_test(
+    name = "many_test",
+    size = "small",
+    srcs = ["many_test.py"],
+    shard_count = 2,
+)</code></pre>
+    <p>Bazel starts the program twice and tells each copy which slice is its job through environment variables:
+      <code>TEST_TOTAL_SHARDS</code> (2) and <code>TEST_SHARD_INDEX</code> (0 or 1). Choosing the slice is the
+      runner's job. To prove the runner understood, it must create the file named in
+      <code>TEST_SHARD_STATUS_FILE</code>.</p>
+    <h3>What happens with Python today</h3>
+    <p>Neither plain unittest nor pytest touches that file, and rules_python 2.4.6 does not do it for them. So under
+      Bazel 9.3.2, <code>shard_count = 2</code> on an ordinary unittest or pytest target fails:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: /work/practicum/shard/BUILD.bazel:3:8: Testing //shard:many_test (shard 1 of 2) failed: Sharding requested, but the test runner did not advertise support for it by touching TEST_SHARD_STATUS_FILE. Either remove the 'shard_count' attribute, use a test runner that supports sharding or temporarily disable this check via --noincompatible_check_sharding_support.
+…
+//shard:many_test                                                     NO STATUS
+
+Executed 0 out of 1 test: 1 was skipped.</code></pre>
+    <p>The check exists because the old behavior was worse: every shard ran every test, so sharding only multiplied the
+      work. (<code>--noincompatible_check_sharding_support</code> brings that back. Don't.) A runner that implements the
+      protocol is short. This one keeps every Nth unittest case:</p>
+    <pre data-label="shard/many_test.py (the runner part)"><code class="language-python">def sharded_suite() -&gt; unittest.TestSuite:
+    """Keep every Nth test, as Bazel's sharding protocol asks."""
+    status = os.environ.get("TEST_SHARD_STATUS_FILE")
+    if status:
+        pathlib.Path(status).touch()  # tell Bazel this runner understands sharding
+    index = int(os.environ.get("TEST_SHARD_INDEX", "0"))
+    total = int(os.environ.get("TEST_TOTAL_SHARDS", "1"))
+    tests = list(unittest.defaultTestLoader.loadTestsFromName("__main__"))
+    flat = [t for suite in tests for t in suite]
+    mine = [t for i, t in enumerate(flat) if i % total == index]
+    print(f"shard {index} of {total}: {[t.id().split('.')[-1] for t in mine]}")
+    return unittest.TestSuite(mine)
+
+
+if __name__ == "__main__":
+    result = unittest.TextTestRunner().run(sharded_suite())
+    raise SystemExit(0 if result.wasSuccessful() else 1)</code></pre>
+    <pre data-label="Real output (Bazel 9.3.2, --test_output=all, abridged)"><code class="language-none">==================== Test output for //shard:many_test (shard 2 of 2):
+shard 1 of 2: ['test_b', 'test_d']
+==================== Test output for //shard:many_test (shard 1 of 2):
+shard 0 of 2: ['test_a', 'test_c']
+//shard:many_test                                                        PASSED in 1.1s
+Executed 1 out of 1 test: 1 test passes.</code></pre>
+    <p>Each shard gets its own log directory, <code>bazel-testlogs/shard/many_test/shard_1_of_2/</code> and
+      <code>shard_2_of_2/</code>. For pytest, community plugins implement the same protocol; check one against these
+      variables before you rely on it.</p>
+    <h3>--test_sharding_strategy</h3>
+    <p><code>explicit</code> (the default) shards targets that set <code>shard_count</code>. <code>disabled</code>
+      ignores <code>shard_count</code> and runs one copy, which is useful when debugging:</p>
+    <pre data-label="Real output (Bazel 9.3.2, --test_sharding_strategy=disabled)"><code class="language-none">shard 0 of 1: ['test_a', 'test_b', 'test_c', 'test_d']
+//shard:many_test                                                        PASSED in 0.5s</code></pre>
+    <p><code>forced=K</code> shards every selected test K ways, which only works when every runner supports it.</p>
+    <aside class="callout pro">
+      <p>Before sharding a Python test, try splitting it into several targets along natural lines (one per module under
+        test). Separate targets cache separately, so a change reruns only the affected part. Sharding helps when one
+        target is slow and must stay one target.</p>
+    </aside>
+    <p><strong>Remember:</strong> <code>shard_count</code> splits one test across processes, but only a runner that
+      reads <code>TEST_SHARD_INDEX</code>/<code>TEST_TOTAL_SHARDS</code> and touches <code>TEST_SHARD_STATUS_FILE</code>
+      can be sharded. Python runners need that code added.</p>
+  </section>
+
+  <section class="lesson-section" id="testonly">
+    <h2>testonly: helpers that never ship</h2>
+    <aside class="callout python">
+      <p>In a pytest project, shared helpers go in <code>conftest.py</code> or a <code>tests/helpers.py</code>. Nothing
+        stops production code from importing them, except reviewers.</p>
+    </aside>
+    <p>In Bazel, put shared test helpers (fakes, fixtures, builders) in their own <code>py_library</code> with
+      <code>testonly = True</code>. Tests are testonly automatically, so they may depend on it. Anything else may not:</p>
+    <pre data-label="helpers/BUILD.bazel"><code class="language-starlark">py_library(
+    name = "fakes",
+    srcs = ["fakes.py"],
+    testonly = True,
+    visibility = ["//visibility:public"],
+)</code></pre>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: /work/practicum/app/BUILD.bazel:3:11: in py_library rule //app:app: non-test target '//app:app' depends on testonly target '//helpers:fakes' and doesn't have testonly attribute set
+ERROR: /work/practicum/app/BUILD.bazel:3:11: Analysis of target '//app:app' (config: a7a71fd) failed
+ERROR: Analysis of target '//app:app' failed; build aborted</code></pre>
+    <p>This is an analysis error, so it is caught before anything runs, for every target in the graph. Two correct
+      fixes, depending on intent:</p>
+    <ul>
+      <li>Production code should not use the fake: remove the dependency and depend on the real library.</li>
+      <li>The depending target is itself test infrastructure (a demo server with fake data, a test-data generator): mark
+        it <code>testonly = True</code> as well. testonly spreads upward, never into production.</li>
+    </ul>
+    <p>Do not "fix" it by removing <code>testonly</code> from the helper. That is how fakes end up in a release.
+      <code>package(default_testonly = True)</code> marks a whole package of helpers at once.</p>
+    <p>Run the build, read the error, then mark <code>//app:demo</code> testonly and build again.</p>
+    <div class="runnable" data-title="The testonly error" data-commands="bazel build //...|bazel query 'attr(testonly, 1, //...)'">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "practicum")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="helpers/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "fakes",
+    srcs = ["fakes.py"],
+    testonly = True,
+    visibility = ["//visibility:public"],
+)
+</textarea>
+<textarea class="file" data-path="app/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_binary", "py_test")
+
+py_binary(
+    name = "demo",
+    srcs = ["demo.py"],
+    deps = ["//helpers:fakes"],
+)
+
+py_test(
+    name = "app_test",
+    size = "small",
+    srcs = ["app_test.py"],
+    deps = ["//helpers:fakes"],
+)
+</textarea>
+<textarea class="file" data-path="helpers/fakes.py" data-hidden></textarea>
+<textarea class="file" data-path="app/demo.py" data-hidden></textarea>
+<textarea class="file" data-path="app/app_test.py" data-hidden></textarea>
+</div>
+    <h3>The Python developer's checklist</h3>
+    <p>Every mistake below produced the exact output shown on this page or in M03:</p>
+    <ul>
+      <li>No <code>unittest.main()</code> at the bottom: the file exits 0 and Bazel reports PASSED for broken code.</li>
+      <li><code>open("testdata/x.json")</code>: works only from the runfiles root, and only if the file is in
+        <code>data</code>. Use <code>Rlocation</code>.</li>
+      <li>Writing next to <code>__file__</code>: <code>Read-only file system</code>. Use <code>TEST_TMPDIR</code>.</li>
+      <li>Arguments in <code>args</code> that <code>unittest.main()</code> does not know: <code>unrecognized arguments</code>.</li>
+      <li>Unseeded randomness or wall-clock assertions: flaky, and a lucky pass gets cached.</li>
+      <li>Expecting <code>--test_filter</code> or <code>shard_count</code> to work with a plain Python runner: they need
+        runner support.</li>
+    </ul>
+    <p><strong>Remember:</strong> test helpers live in <code>testonly = True</code> libraries; only tests and other
+      testonly targets may depend on them.</p>
+  </section>
+
+  <section class="lesson-section" id="practice">
+    <h2>Practice</h2>
+    <p>The simulator models test <em>selection</em> exactly: wildcards, <code>manual</code>, tags, sizes, suites, and
+      <code>testonly</code>. Each exercise checks which tests <code>bazel test</code> would run.</p>
+
+    <div class="exercise" data-id="m05-e1" data-title="Keep slow and networked tests out of //...">
+      <div class="exercise-prompt">
+        <p>In the <code>search</code> package, <code>live_api_test</code> calls a real HTTP API and
+          <code>benchmark_test</code> takes twenty minutes. Developers run <code>bazel test //...</code> dozens of times a
+          day. Change only tags so that:</p>
+        <ul>
+          <li><code>bazel test //...</code> selects exactly <code>//search:index_test</code> and
+            <code>//search:ranking_test</code>.</li>
+          <li>Both excluded tests still run when named, for example <code>bazel test //search:benchmark_test</code>.</li>
+          <li><code>live_api_test</code> is also marked as talking to the outside world, so its result is never cached.</li>
+        </ul>
+      </div>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "practicum")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="search/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "search",
+    srcs = ["search.py"],
+)
+
+py_test(
+    name = "index_test",
+    size = "small",
+    srcs = ["index_test.py"],
+    deps = [":search"],
+)
+
+py_test(
+    name = "ranking_test",
+    size = "small",
+    srcs = ["ranking_test.py"],
+    deps = [":search"],
+)
+
+py_test(
+    name = "live_api_test",
+    srcs = ["live_api_test.py"],
+    deps = [":search"],
+)
+
+py_test(
+    name = "benchmark_test",
+    size = "large",
+    srcs = ["benchmark_test.py"],
+    deps = [":search"],
+)
+</textarea>
+<textarea class="file" data-path="search/search.py" data-hidden></textarea>
+<textarea class="file" data-path="search/index_test.py" data-hidden></textarea>
+<textarea class="file" data-path="search/ranking_test.py" data-hidden></textarea>
+<textarea class="file" data-path="search/live_api_test.py" data-hidden></textarea>
+<textarea class="file" data-path="search/benchmark_test.py" data-hidden></textarea>
+<script type="text/x-python" class="tests">
+def test_wildcard_selects_only_the_fast_tests(bazel):
+    result = bazel.test("//...")
+    assert result.ok, "bazel test //... fails:\n" + result.error
+    want = ["//search:index_test", "//search:ranking_test"]
+    assert result.tests == want, f"bazel test //... would run {result.tests}, expected {want}"
+
+def test_excluded_tests_still_run_by_name(bazel):
+    for name in ("live_api_test", "benchmark_test"):
+        label = "//search:" + name
+        assert bazel.target(label).kind == "py_test", f"keep {label} as a py_test"
+        result = bazel.test(label)
+        assert result.ok and result.tests == [label], f"bazel test {label} should run it, got {result.tests}"
+
+def test_live_api_test_is_external(bazel):
+    tags = bazel.target("//search:live_api_test").tags
+    assert "external" in tags, f"tag live_api_test \"external\" so it is never cached; its tags are {tags}"
+
+def test_fast_tests_are_not_tagged(bazel):
+    for name in ("index_test", "ranking_test"):
+        tags = bazel.target("//search:" + name).tags
+        assert "manual" not in tags, f"//search:{name} should stay in //..., but it is tagged {tags}"
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p><code>manual</code> is the tag that wildcards skip. Add <code>tags = ["manual"]</code> to the benchmark and
+          <code>tags = ["external", "manual"]</code> to the live API test.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="search/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "search",
+    srcs = ["search.py"],
+)
+
+py_test(
+    name = "index_test",
+    size = "small",
+    srcs = ["index_test.py"],
+    deps = [":search"],
+)
+
+py_test(
+    name = "ranking_test",
+    size = "small",
+    srcs = ["ranking_test.py"],
+    deps = [":search"],
+)
+
+py_test(
+    name = "live_api_test",
+    srcs = ["live_api_test.py"],
+    tags = [
+        "external",
+        "manual",
+    ],
+    deps = [":search"],
+)
+
+py_test(
+    name = "benchmark_test",
+    size = "large",
+    srcs = ["benchmark_test.py"],
+    tags = ["manual"],
+    deps = [":search"],
+)</code></pre>
+        <p>A tag filter such as <code>--test_tag_filters=-external</code> would also have kept the API test out, but only
+          for people who remember the flag. <code>manual</code> puts the decision in the BUILD file.</p>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m05-e2" data-title="Write two test suites">
+      <div class="exercise-prompt">
+        <p>The <code>billing</code> package needs two entry points:</p>
+        <ul>
+          <li><code>//billing:quick</code>: every non-manual test in the package except those tagged
+            <code>slow</code>. Select them <strong>by tag</strong>, not by listing names, so new tests join
+            automatically.</li>
+          <li><code>//billing:nightly</code>: exactly <code>:ledger_db_test</code> (which is manual) and
+            <code>:pdf_test</code>, listed explicitly.</li>
+          <li><code>bazel test //...</code> must still <em>not</em> run <code>:ledger_db_test</code>.</li>
+        </ul>
+      </div>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "practicum")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="billing/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_test")
+
+py_test(
+    name = "tax_test",
+    size = "small",
+    srcs = ["tax_test.py"],
+)
+
+py_test(
+    name = "invoice_test",
+    size = "small",
+    srcs = ["invoice_test.py"],
+)
+
+py_test(
+    name = "pdf_test",
+    srcs = ["pdf_test.py"],
+    tags = ["slow"],
+)
+
+py_test(
+    name = "ledger_db_test",
+    srcs = ["ledger_db_test.py"],
+    tags = [
+        "external",
+        "manual",
+    ],
+)
+
+# Add the two test suites here.
+</textarea>
+<textarea class="file" data-path="billing/tax_test.py" data-hidden></textarea>
+<textarea class="file" data-path="billing/invoice_test.py" data-hidden></textarea>
+<textarea class="file" data-path="billing/pdf_test.py" data-hidden></textarea>
+<textarea class="file" data-path="billing/ledger_db_test.py" data-hidden></textarea>
+<script type="text/x-python" class="tests">
+def test_quick_runs_the_fast_tests(bazel):
+    assert bazel.target("//billing:quick").kind == "test_suite", "//billing:quick should be a test_suite"
+    result = bazel.test("//billing:quick")
+    want = ["//billing:invoice_test", "//billing:tax_test"]
+    assert result.ok and result.tests == want, f"//billing:quick runs {result.tests}, expected {want}"
+
+def test_quick_selects_by_tag(bazel):
+    assert not bazel.attr("//billing:quick", "tests"), "select :quick's members with tags = [\"-slow\"], not a tests list"
+
+def test_nightly_lists_its_tests(bazel):
+    assert bazel.target("//billing:nightly").kind == "test_suite", "//billing:nightly should be a test_suite"
+    result = bazel.test("//billing:nightly")
+    want = ["//billing:ledger_db_test", "//billing:pdf_test"]
+    assert result.ok and result.tests == want, f"//billing:nightly runs {result.tests}, expected {want}"
+
+def test_wildcard_skips_the_database_test(bazel):
+    result = bazel.test("//...")
+    assert result.ok, "bazel test //... fails:\n" + result.error
+    assert "//billing:ledger_db_test" not in result.tests, (
+        "bazel test //... runs //billing:ledger_db_test: //... matches the nightly suite, and a suite runs the "
+        "manual tests it names. Tag the suite itself \"manual\"."
+    )
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p>A <code>test_suite</code> without <code>tests</code> collects the package's tests and filters them with
+          <code>tags</code>. If the last check fails, ask what <code>//...</code> matches besides tests.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="billing/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_test")
+
+py_test(
+    name = "tax_test",
+    size = "small",
+    srcs = ["tax_test.py"],
+)
+
+py_test(
+    name = "invoice_test",
+    size = "small",
+    srcs = ["invoice_test.py"],
+)
+
+py_test(
+    name = "pdf_test",
+    srcs = ["pdf_test.py"],
+    tags = ["slow"],
+)
+
+py_test(
+    name = "ledger_db_test",
+    srcs = ["ledger_db_test.py"],
+    tags = [
+        "external",
+        "manual",
+    ],
+)
+
+test_suite(
+    name = "quick",
+    tags = ["-slow"],
+)
+
+test_suite(
+    name = "nightly",
+    tags = ["manual"],
+    tests = [
+        ":ledger_db_test",
+        ":pdf_test",
+    ],
+)</code></pre>
+        <p>Without <code>tags = ["manual"]</code> on <code>:nightly</code>, <code>//...</code> matches the suite and the
+          suite brings its manual member along. Real Bazel behaves the same way.</p>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m05-e3" data-title="Size the tests">
+      <div class="exercise-prompt">
+        <p>None of the <code>geo</code> tests declares a size. Their typical durations, measured in CI:</p>
+        <table>
+          <thead><tr><th>Test</th><th>Typical time</th></tr></thead>
+          <tbody>
+            <tr><td><code>distance_test</code></td><td>0.2 s</td></tr>
+            <tr><td><code>parse_test</code></td><td>0.4 s</td></tr>
+            <tr><td><code>tiles_test</code></td><td>2 minutes</td></tr>
+            <tr><td><code>import_test</code></td><td>10 minutes</td></tr>
+            <tr><td><code>e2e_test</code></td><td>25 minutes</td></tr>
+          </tbody>
+        </table>
+        <p>Give every test the smallest <code>size</code> whose default timeout (60, 300, 900, 3600 seconds) leaves
+          room for its typical time. Then <code>bazel test //... --test_size_filters=small</code> must select exactly the
+          two quick tests. Set <code>size</code> explicitly on all five, even where it equals the default.</p>
+      </div>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "practicum")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="geo/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_test")
+
+py_test(
+    name = "distance_test",
+    srcs = ["distance_test.py"],
+)
+
+py_test(
+    name = "parse_test",
+    srcs = ["parse_test.py"],
+)
+
+py_test(
+    name = "tiles_test",
+    srcs = ["tiles_test.py"],
+)
+
+py_test(
+    name = "import_test",
+    srcs = ["import_test.py"],
+)
+
+py_test(
+    name = "e2e_test",
+    srcs = ["e2e_test.py"],
+)
+</textarea>
+<textarea class="file" data-path="geo/distance_test.py" data-hidden></textarea>
+<textarea class="file" data-path="geo/parse_test.py" data-hidden></textarea>
+<textarea class="file" data-path="geo/tiles_test.py" data-hidden></textarea>
+<textarea class="file" data-path="geo/import_test.py" data-hidden></textarea>
+<textarea class="file" data-path="geo/e2e_test.py" data-hidden></textarea>
+<script type="text/x-python" class="tests">
+def test_every_test_declares_a_size(bazel):
+    for t in bazel.query("tests(//...)"):
+        size = bazel.target(t).attrs.get("size")
+        assert size, f"{t} has no size attribute"
+
+def test_sizes_match_the_timings(bazel):
+    want = {"distance_test": "small", "parse_test": "small", "tiles_test": "medium",
+            "import_test": "large", "e2e_test": "enormous"}
+    for name, size in want.items():
+        got = bazel.target("//geo:" + name).attrs.get("size")
+        assert got == size, f"//geo:{name} takes the time in the table; its size should be {size!r}, not {got!r}"
+
+def test_small_filter_selects_the_quick_tests(bazel):
+    result = bazel.test("//...", "--test_size_filters=small")
+    want = ["//geo:distance_test", "//geo:parse_test"]
+    assert result.ok and result.tests == want, f"--test_size_filters=small selects {result.tests}, expected {want}"
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p>2 minutes fits in 300 seconds but not 60; 10 minutes fits in 900; 25 minutes needs 3600.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="geo/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_test")
+
+py_test(
+    name = "distance_test",
+    size = "small",
+    srcs = ["distance_test.py"],
+)
+
+py_test(
+    name = "parse_test",
+    size = "small",
+    srcs = ["parse_test.py"],
+)
+
+py_test(
+    name = "tiles_test",
+    size = "medium",
+    srcs = ["tiles_test.py"],
+)
+
+py_test(
+    name = "import_test",
+    size = "large",
+    srcs = ["import_test.py"],
+)
+
+py_test(
+    name = "e2e_test",
+    size = "enormous",
+    srcs = ["e2e_test.py"],
+)</code></pre>
+        <p>A test whose time is close to a boundary (55 seconds on a 60-second budget) belongs in the next size up, or
+          gets an explicit <code>timeout</code>: CI machines are slower than laptops.</p>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m05-e4" data-title="Move a test helper into a testonly library">
+      <div class="exercise-prompt">
+        <p>Two tests in <code>app</code> each list the helper <code>fake_clock.py</code> in their own <code>srcs</code>,
+          and a teammate wired the production server to a fake. Clean it up:</p>
+        <ul>
+          <li>Create <code>//testing:fakes</code>, a <code>py_library</code> with <code>srcs = ["fake_clock.py"]</code>
+            (the file <code>testing/fake_clock.py</code> exists), marked <code>testonly</code> and visible to
+            <code>//app</code>.</li>
+          <li>Both tests depend on <code>//testing:fakes</code> instead of listing a helper file.</li>
+          <li><code>//app:server</code> must not depend on the fakes, directly or indirectly.</li>
+          <li><code>//app:demo</code> is a developer demo that really does use the fake clock. Keep that dependency and
+            make it legal.</li>
+          <li><code>bazel build //...</code> succeeds.</li>
+        </ul>
+      </div>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "practicum")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="app/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
+
+py_library(
+    name = "billing",
+    srcs = ["billing.py"],
+)
+
+py_binary(
+    name = "server",
+    srcs = ["server.py"],
+    deps = [
+        ":billing",
+        "//testing:fakes",
+    ],
+)
+
+py_binary(
+    name = "demo",
+    srcs = ["demo.py"],
+    deps = [
+        ":billing",
+        "//testing:fakes",
+    ],
+)
+
+py_test(
+    name = "billing_test",
+    size = "small",
+    srcs = [
+        "billing_test.py",
+        "fake_clock.py",
+    ],
+    deps = [":billing"],
+)
+
+py_test(
+    name = "invoice_test",
+    size = "small",
+    srcs = [
+        "invoice_test.py",
+        "fake_clock.py",
+    ],
+    deps = [":billing"],
+)
+</textarea>
+<textarea class="file" data-path="testing/BUILD.bazel">
+# Declare //testing:fakes here.
+</textarea>
+<textarea class="file" data-path="app/billing.py" data-hidden></textarea>
+<textarea class="file" data-path="app/server.py" data-hidden></textarea>
+<textarea class="file" data-path="app/demo.py" data-hidden></textarea>
+<textarea class="file" data-path="app/billing_test.py" data-hidden></textarea>
+<textarea class="file" data-path="app/invoice_test.py" data-hidden></textarea>
+<textarea class="file" data-path="app/fake_clock.py" data-hidden></textarea>
+<textarea class="file" data-path="testing/fake_clock.py" data-hidden></textarea>
+<script type="text/x-python" class="tests">
+def test_fakes_is_a_testonly_library(bazel):
+    t = bazel.target("//testing:fakes")
+    assert t.kind == "py_library", f"//testing:fakes should be a py_library, but it is a {t.kind}"
+    assert t.attrs.get("testonly"), "set testonly = True on //testing:fakes"
+
+def test_tests_depend_on_fakes(bazel):
+    for name in ("billing_test", "invoice_test"):
+        label = "//app:" + name
+        deps = bazel.query(f"deps({label}, 1)")
+        assert "//testing:fakes" in deps, f"{label} should list //testing:fakes in deps"
+        srcs = bazel.attr(label, "srcs") or []
+        assert all("fake_clock" not in s for s in srcs), f"{label} should not list a fake_clock.py in srcs, got {srcs}"
+
+def test_server_does_not_ship_fakes(bazel):
+    deps = bazel.query("deps(//app:server)")
+    assert "//testing:fakes" not in deps, "//app:server still depends on //testing:fakes; production code should not"
+    assert not bazel.attr("//app:server", "testonly"), "do not mark the production server testonly; remove the fake instead"
+
+def test_demo_keeps_its_fake(bazel):
+    deps = bazel.query("deps(//app:demo, 1)")
+    assert "//testing:fakes" in deps, "//app:demo should keep using //testing:fakes"
+
+def test_everything_builds(bazel):
+    result = bazel.build("//...")
+    assert result.ok, "bazel build //... fails:\n" + result.error
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p>Build after each step and read the error. The testonly error names the target that needs a decision: drop the
+          dependency (production) or become <code>testonly</code> itself (test infrastructure).</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="testing/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "fakes",
+    srcs = ["fake_clock.py"],
+    testonly = True,
+    visibility = ["//app:__pkg__"],
+)</code></pre>
+<pre data-path="app/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
+
+py_library(
+    name = "billing",
+    srcs = ["billing.py"],
+)
+
+py_binary(
+    name = "server",
+    srcs = ["server.py"],
+    deps = [":billing"],
+)
+
+py_binary(
+    name = "demo",
+    testonly = True,
+    srcs = ["demo.py"],
+    deps = [
+        ":billing",
+        "//testing:fakes",
+    ],
+)
+
+py_test(
+    name = "billing_test",
+    size = "small",
+    srcs = ["billing_test.py"],
+    deps = [
+        ":billing",
+        "//testing:fakes",
+    ],
+)
+
+py_test(
+    name = "invoice_test",
+    size = "small",
+    srcs = ["invoice_test.py"],
+    deps = [
+        ":billing",
+        "//testing:fakes",
+    ],
+)</code></pre>
+        <p>The tests now import <code>from testing.fake_clock import FakeClock</code>, the helper's path from the
+          workspace root. <code>app/fake_clock.py</code> can be deleted.</p>
+      </details>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="lab">
+    <h2>Labs: real test runs</h2>
+    <p>The exercises proved which tests are selected. What the simulator cannot show is the part that makes Bazel
+      testing fast and trustworthy: results, caching, retries, logs, and the sandbox. These two labs check those with
+      real Bazel. Note that the grader stages a fresh copy of your workspace each time, so "is it cached?" checks run the
+      test command twice inside one grading.</p>
+
+    <div class="lab" data-id="m05-lab1" data-title="Tame a flaky test">
+      <div class="lab-prompt">
+        <p>The <code>cards</code> workspace has a <code>//deck:deck_test</code> that checks a shuffle is fair by
+          shuffling twenty times. It passes on some runs and fails on others. Make it deterministic, without
+          <code>flaky = True</code>, so that it passes ten runs out of ten. Then give it the right size and confirm a
+          second run is served from the cache.</p>
+        <p>The grader adds <code>//grading:seeded_shuffle_test</code>, which calls <code>shuffle(cards, rng)</code> with
+          a seeded <code>random.Random</code> twice and expects the same order: the library should accept an optional
+          generator, the standard way to make randomness testable.</p>
+        <ul class="checklist" data-id="m05-lab1-steps">
+          <li>Run <code>pixi run start m05-lab1</code>, then <code>cd work/m05-lab1</code></li>
+          <li>Run <code>pixi run bazel test //deck:all --runs_per_test=10</code> and read one failing <code>run_N_of_10/test.log</code></li>
+          <li>Add an <code>rng: random.Random | None = None</code> parameter to <code>shuffle()</code> in <code>deck/deck.py</code></li>
+          <li>In the test, use a seeded generator and enough shuffles that a fairness bound is meaningful</li>
+          <li>Set <code>size = "small"</code> and check the "size is too big" hint is gone</li>
+          <li>Run <code>pixi run bazel test //deck:all</code> twice; look for <code>(cached) PASSED</code></li>
+          <li>Run <code>pixi run grade m05-lab1</code> from the repository root</li>
+        </ul>
+      </div>
+      <details class="hint"><summary>Hint</summary>
+        <p>With a fixed seed, the count is the same on every run, so any bound that passes once passes forever. Pick a
+          bound that still means something: with 4000 shuffles of four cards, the ace of spades lands on top about 1000
+          times. <code>range(900, 1101)</code> is a reasonable window.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-label="deck/deck.py (shuffle)"><code class="language-python">def shuffle(cards: list[str], rng: random.Random | None = None) -&gt; list[str]:
+    """Return a shuffled copy of cards, using rng if one is given."""
+    out = list(cards)
+    (rng or random.Random()).shuffle(out)
+    return out</code></pre>
+<pre data-label="deck/deck_test.py (the fairness test)"><code class="language-python">    def test_shuffle_is_fair(self) -&gt; None:
+        # A seeded generator makes the result the same on every run, while
+        # 4000 shuffles still say something about fairness (about 1000 on top).
+        rng = random.Random(1234)
+        cards = new_deck()
+        on_top = sum(shuffle(cards, rng)[0] == "ace of spades" for _ in range(4000))
+        self.assertIn(on_top, range(900, 1101))</code></pre>
+<pre data-label="deck/BUILD.bazel (the test)"><code class="language-starlark">py_test(
+    name = "deck_test",
+    size = "small",
+    srcs = ["deck_test.py"],
+    deps = [":deck"],
+)</code></pre>
+      </details>
+    </div>
+
+    <div class="lab" data-id="m05-lab2" data-title="Give tests a clean environment">
+      <div class="lab-prompt">
+        <p>The <code>ledger</code> workspace has two tests. <code>//ledger:ledger_test</code> reads
+          <code>testdata/entries.json</code> by a relative path and writes its CSV export next to its own source file.
+          <code>//ledger:smoke_test</code> needs a real database URL, so <code>bazel test //...</code> fails on every
+          laptop.</p>
+        <p>Make <code>ledger_test</code> pass from any working directory (the grader runs it through a wrapper that starts
+          it in <code>/tmp</code>), keep the smoke test out of <code>//...</code>, and give it an entry point,
+          <code>//ledger:integration</code>, that runs it on request.</p>
+        <ul class="checklist" data-id="m05-lab2-steps">
+          <li>Run <code>pixi run start m05-lab2</code>, then <code>cd work/m05-lab2</code></li>
+          <li>Run <code>pixi run bazel test //... --test_output=errors</code> and read both failures</li>
+          <li>Add the JSON file to the test's <code>data</code>, and <code>@rules_python//python/runfiles</code> to its <code>deps</code></li>
+          <li>Open the file with <code>Rlocation("_main/ledger/testdata/entries.json")</code>; write the CSV under <code>TEST_TMPDIR</code></li>
+          <li>Tag the smoke test <code>manual</code> and <code>external</code>; add a manual <code>test_suite</code> named <code>integration</code> that lists it</li>
+          <li>Run <code>pixi run bazel test //ledger:integration --test_env=LEDGER_DB_URL=memory://</code></li>
+          <li>Look at <code>bazel-testlogs/ledger/ledger_test/</code>, then run <code>pixi run grade m05-lab2</code> from the repository root</li>
+        </ul>
+      </div>
+      <details class="hint"><summary>Hint</summary>
+        <p><code>Read-only file system</code> means the test writes into the source tree: use
+          <code>Path(os.environ["TEST_TMPDIR"])</code>. If <code>bazel test //...</code> still runs the smoke test after
+          you tagged it, check the suite: <code>//...</code> matches suites too.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-label="ledger/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "ledger",
+    srcs = ["ledger.py"],
+)
+
+py_test(
+    name = "ledger_test",
+    size = "small",
+    srcs = ["ledger_test.py"],
+    data = ["testdata/entries.json"],
+    deps = [
+        ":ledger",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_test(
+    name = "smoke_test",
+    srcs = ["smoke_test.py"],
+    tags = [
+        "external",
+        "manual",
+    ],
+)
+
+test_suite(
+    name = "integration",
+    tags = ["manual"],
+    tests = [":smoke_test"],
+)</code></pre>
+<pre data-label="ledger/ledger_test.py"><code class="language-python">import os
+import unittest
+from pathlib import Path
+
+from python.runfiles import runfiles
+
+from ledger.ledger import export_csv, load_entries, total
+
+
+class LedgerTest(unittest.TestCase):
+    def setUp(self) -&gt; None:
+        r = runfiles.Create()
+        self.entries = load_entries(r.Rlocation("_main/ledger/testdata/entries.json"))
+
+    def test_total(self) -&gt; None:
+        self.assertEqual(total(self.entries), 38.25)
+
+    def test_export_csv(self) -&gt; None:
+        out = Path(os.environ["TEST_TMPDIR"]) / "export.csv"
+        export_csv(self.entries, out)
+        lines = out.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(lines[0], "date,amount")
+        self.assertEqual(len(lines), 4)
+
+
+if __name__ == "__main__":
+    unittest.main()</code></pre>
+      </details>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="quiz">
+    <h2>Quiz</h2>
+    <div class="quiz" data-id="m05-quiz">
+<script type="application/json">
+{"title": "Testing at scale quiz", "passScore": 0.7, "questions": [
+  {"type": "single", "prompt": "You change a comment in <code>calc/calc.py</code> and run <code>bazel test //...</code>. Which tests run?", "options": ["All of them: a test command always reruns tests", "Only tests whose transitive inputs include <code>calc/calc.py</code>", "Only tests in the <code>calc</code> package", "None: comments do not change behavior"], "answer": 1, "explanation": "<p>A test is an action keyed by its inputs. Bazel hashes file contents, so even a comment counts. Tests that do not depend on the file stay <code>(cached) PASSED</code>, including neighbors in the same package.</p>"},
+  {"type": "multi", "prompt": "Which make Bazel run a test whose inputs have not changed? Select all that apply.", "options": ["<code>--nocache_test_results</code>", "<code>--test_output=all</code>", "<code>--cache_test_results=no</code>", "Tagging the test <code>external</code>", "<code>--test_output=errors</code>"], "answer": [0, 2, 3], "explanation": "<p>The two cache flags force a run, and <code>external</code> tests are never cached. <code>--test_output</code> only changes what is printed: an unchanged test still shows <code>(cached) PASSED</code>.</p>"},
+  {"type": "single", "prompt": "What is the default timeout of a <code>py_test</code> with no <code>size</code> or <code>timeout</code>?", "options": ["60 seconds", "300 seconds", "900 seconds", "No timeout"], "answer": 1, "explanation": "<p>The default size is <code>medium</code>, whose default timeout is <code>moderate</code>: 300 seconds. Small is 60, large 900, enormous 3600.</p>"},
+  {"type": "single", "prompt": "Does this package load?", "code": "py_test(\n    name = \"parse_test\",\n    size = \"tiny\",\n    srcs = [\"parse_test.py\"],\n)", "lang": "starlark", "options": ["Yes", "No: size 'tiny' is not a valid size", "Yes, but the test gets a 30-second timeout", "Only with --test_size_filters=tiny"], "answer": 1, "explanation": "<p>Only <code>small</code>, <code>medium</code>, <code>large</code>, and <code>enormous</code> are valid. Real Bazel reports <code>In rule 'parse_test', size 'tiny' is not a valid size.</code> and the whole package fails to load.</p>"},
+  {"type": "single", "prompt": "Bazel prints <code>There were tests whose specified size is too big.</code> What should you do?", "options": ["Nothing; it is an internal warning", "Rerun with <code>--test_verbose_timeout_warnings</code> to see which tests, then give them a smaller size or timeout", "Increase the size of every test", "Delete the slow tests"], "answer": 1, "explanation": "<p>It means some tests finish far inside their timeout. The verbose flag names them and suggests <code>timeout=\"short\"</code> or <code>size=\"small\"</code>. Tighter timeouts catch hangs sooner.</p>"},
+  {"type": "output", "prompt": "What does <code>bazel test //... --test_size_filters=small</code> run? One label per line, sorted.", "code": "py_test(name = \"a_test\", size = \"small\", srcs = [\"a_test.py\"])\npy_test(name = \"b_test\", srcs = [\"b_test.py\"])\npy_test(name = \"c_test\", size = \"small\", srcs = [\"c_test.py\"], tags = [\"manual\"])\npy_test(name = \"d_test\", size = \"small\", timeout = \"long\", srcs = [\"d_test.py\"])", "lang": "starlark", "answer": "//pkg:a_test\n//pkg:d_test", "explanation": "<p>The package is <code>pkg</code>. <code>b_test</code> is medium by default. <code>c_test</code> is manual, so <code>//...</code> never selects it. <code>d_test</code> has a long timeout but is still size small.</p>"},
+  {"type": "single", "prompt": "You run <code>bazel test //... --test_tag_filters=manual</code>. What runs?", "options": ["Only the manual tests", "Nothing: no test matches", "The usual non-manual tests: a positive <code>manual</code> filter is ignored", "Every test, manual or not"], "answer": 2, "explanation": "<p>Wildcards drop manual targets before filters apply, and Bazel ignores <code>manual</code> as a required tag. Name manual tests explicitly, or reach them through a <code>test_suite</code>.</p>"},
+  {"type": "output", "prompt": "What does <code>bazel query 'tests(//ops:nightly)'</code> print?", "code": "py_test(name = \"db_test\", srcs = [\"db_test.py\"], tags = [\"manual\"])\npy_test(name = \"api_test\", srcs = [\"api_test.py\"], tags = [\"slow\"])\npy_test(name = \"unit_test\", size = \"small\", srcs = [\"unit_test.py\"])\n\ntest_suite(\n    name = \"nightly\",\n    tests = [\":db_test\", \":api_test\"],\n)", "lang": "starlark", "answer": "//ops:api_test\n//ops:db_test", "explanation": "<p>An explicit <code>tests</code> list is taken as written, manual members included, and query output is sorted. A suite naming a manual test runs it.</p>"},
+  {"type": "single", "prompt": "In the previous question's package, which tests does <code>bazel test //ops/...</code> run?", "options": ["<code>api_test</code> and <code>unit_test</code>", "All three, because the non-manual suite <code>:nightly</code> is matched and brings <code>db_test</code>", "Only <code>unit_test</code>", "Only <code>db_test</code>"], "answer": 1, "explanation": "<p><code>//ops/...</code> matches the suite too, and the suite expands to its members, manual or not. Tag the suite <code>manual</code> to keep <code>db_test</code> out of wildcard runs.</p>"},
+  {"type": "single", "prompt": "A test does <code>Path(__file__).parent / \"out.txt\"</code> and writes to it. Under the Linux sandbox it fails with <code>OSError: [Errno 30] Read-only file system</code>. The right fix?", "options": ["Tag the test <code>no-sandbox</code>", "Write to <code>Path(os.environ[\"TEST_TMPDIR\"]) / \"out.txt\"</code>", "Add <code>out.txt</code> to <code>data</code>", "Run with <code>--test_output=streamed</code>"], "answer": 1, "explanation": "<p><code>__file__</code> resolves into your source tree, which the sandbox mounts read-only. <code>TEST_TMPDIR</code> is the test's private scratch space. <code>no-sandbox</code> would make the test write into your checkout.</p>"},
+  {"type": "text", "prompt": "Which environment variable does Bazel set from <code>--test_filter</code>, for the test runner to read?", "answer": ["TESTBRIDGE_TEST_ONLY"], "explanation": "<p>Bazel never filters test cases itself. rules_python 2.4.6, plain unittest, and a bare <code>pytest.main()</code> all ignore it; a pytest entry point can pass it on as <code>-k</code>.</p>"},
+  {"type": "single", "prompt": "<code>bazel test //deck:deck_test --runs_per_test=10</code> reports <code>FAILED in 3 out of 10</code>. What is the best next step?", "options": ["Add <code>flaky = True</code>", "Run with <code>--flaky_test_attempts=10</code> in CI", "Find the nondeterminism (randomness, time, order, shared state) and remove it", "Raise the test's size"], "answer": 2, "explanation": "<p>Retries hide the problem and slow every run; a lucky pass would even be cached. Make the test deterministic, then confirm with <code>--runs_per_test=10</code> again.</p>"},
+  {"type": "single", "prompt": "A unittest <code>py_test</code> gets <code>shard_count = 4</code>. What happens under Bazel 9.3.2 and rules_python 2.4.6?", "options": ["Four processes each run a quarter of the test methods", "Four processes each run all the test methods", "The test fails: the runner did not touch <code>TEST_SHARD_STATUS_FILE</code>", "<code>shard_count</code> is ignored for Python"], "answer": 2, "explanation": "<p>Bazel checks that a sharded runner advertises support. Plain unittest and pytest do not, so each shard fails with <code>Sharding requested, but the test runner did not advertise support for it</code>. A runner must read <code>TEST_SHARD_INDEX</code>/<code>TEST_TOTAL_SHARDS</code> and touch the status file.</p>"},
+  {"type": "multi", "prompt": "<code>//helpers:fakes</code> has <code>testonly = True</code>. Which targets may depend on it? Select all that apply.", "options": ["A <code>py_test</code>", "A <code>py_binary</code> with <code>testonly = True</code>", "A plain <code>py_library</code> used by the production server", "Another <code>py_library</code> with <code>testonly = True</code>"], "answer": [0, 1, 3], "explanation": "<p>Tests are testonly implicitly. Any other target must set <code>testonly = True</code> itself; otherwise analysis fails with <code>non-test target ... depends on testonly target ... and doesn't have testonly attribute set</code>.</p>"}
+]}
+</script>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="recap">
+    <h2>Recap</h2>
+    <ul>
+      <li>Tests are actions keyed by their inputs. Unchanged tests report <code>(cached) PASSED</code>;
+        <code>--nocache_test_results</code> forces a run, and <code>external</code> tests are never cached.</li>
+      <li><code>size</code> (small, medium, large, enormous) sets the default timeout (60, 300, 900, 3600 s) and feeds
+        <code>--test_size_filters</code>. <code>--test_verbose_timeout_warnings</code> names oversized tests.</li>
+      <li><code>manual</code> hides a target from wildcards. <code>--test_tag_filters</code> narrows by any-of and
+        none-of, never re-adding manual tests.</li>
+      <li><code>--build_tests_only</code> builds only what the selected tests need.</li>
+      <li><code>test_suite</code> selects by tag or by explicit list; explicit members run even if manual, so tag such
+        suites <code>manual</code>.</li>
+      <li>Logs live in <code>bazel-testlogs/&lt;pkg&gt;/&lt;name&gt;/test.log</code> and <code>test.xml</code>;
+        <code>--test_output=errors</code> prints failing logs.</li>
+      <li>Tests start in the runfiles root with a fixed environment. Find files with <code>Rlocation</code>, write to
+        <code>TEST_TMPDIR</code>, pass variables with <code>--test_env</code>.</li>
+      <li><code>--test_arg</code> reaches the runner's command line; <code>--test_filter</code> becomes
+        <code>TESTBRIDGE_TEST_ONLY</code>, which Python runners must read themselves.</li>
+      <li><code>--runs_per_test</code> detects flakes; <code>flaky = True</code> only retries. Fix the nondeterminism.</li>
+      <li><code>shard_count</code> needs a runner that implements the sharding protocol; plain unittest and pytest
+        fail.</li>
+      <li>Test helpers belong in <code>testonly = True</code> libraries.</li>
+    </ul>
+    <div class="flashcards" data-title="Testing review">
+<script type="application/json">
+[
+  {"front": "What does <code>(cached) PASSED</code> mean?", "back": "None of the test's inputs changed since a passing run, so Bazel reused the result without running the test."},
+  {"front": "How do you force tests to rerun?", "back": "--nocache_test_results (or --cache_test_results=no). Tag a test external to never cache it."},
+  {"front": "Default timeouts for small, medium, large, enormous?", "back": "60, 300, 900, and 3600 seconds (short, moderate, long, eternal). medium is the default size."},
+  {"front": "What does the manual tag do?", "back": "Wildcards like //... and :all skip the target. It runs when named explicitly or through a test_suite."},
+  {"front": "<code>--test_tag_filters=-slow,-external</code>?", "back": "Run only tests tagged neither slow nor external. A plain tag means 'has any of these'; a minus means 'has none'."},
+  {"front": "Why tag a test_suite manual?", "back": "//... matches the suite, and a suite runs every test it lists, manual ones included."},
+  {"front": "Where is a test's output?", "back": "bazel-testlogs/<pkg>/<name>/test.log, plus test.xml for CI. --test_output=errors prints failing logs."},
+  {"front": "Where may a test write files?", "back": "TEST_TMPDIR (scratch) or TEST_UNDECLARED_OUTPUTS_DIR (kept in test.outputs/). The source tree is read-only in the sandbox."},
+  {"front": "How does <code>--test_filter</code> reach a Python test?", "back": "As the TESTBRIDGE_TEST_ONLY environment variable. rules_python 2.4.6 and unittest ignore it; a pytest entry point can pass it as -k."},
+  {"front": "How do you prove a test is no longer flaky?", "back": "bazel test //pkg:t --runs_per_test=10 (or more) and see it pass every run."},
+  {"front": "Why does <code>shard_count = 2</code> fail on a unittest py_test?", "back": "The runner never touches TEST_SHARD_STATUS_FILE, so Bazel refuses: it would run every test in every shard."},
+  {"front": "<code>non-test target ... depends on testonly target</code>. Fix?", "back": "Remove the dependency from production code, or mark the depending target testonly = True if it is test infrastructure."}
+]
+</script>
+    </div>
+    <h3>Going further</h3>
+    <ul>
+      <li><a href="https://bazel.build/reference/test-encyclopedia">Test encyclopedia</a> on bazel.build: the full contract between Bazel and a test runner (environment, sharding, timeouts)</li>
+      <li><a href="https://bazel.build/reference/command-line-reference">Command-line reference</a>: every <code>--test_*</code> flag</li>
+      <li><a href="https://bazel.build/reference/be/common-definitions#common.tags">Common attributes: tags</a> and <a href="https://bazel.build/reference/be/common-definitions#test.size">test attributes</a> (size, timeout, flaky, shard_count)</li>
+      <li><a href="https://bazel.build/reference/be/general#test_suite"><code>test_suite</code></a> in the Build Encyclopedia</li>
+      <li><a href="https://rules-python.readthedocs.io/en/latest/api/rules_python/python/defs.html">rules_python API: <code>py_test</code></a></li>
+      <li><a href="https://registry.bazel.build/modules/rules_python">rules_python on the Bazel Central Registry</a></li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>

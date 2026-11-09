@@ -1,0 +1,9 @@
+load("@rules_go//go:def.bzl", "go_binary")
+
+# A standalone tool: anyone in the monorepo may run it.
+go_binary(
+    name = "fmtcli",
+    srcs = ["main.go"],
+    visibility = ["//visibility:public"],
+    deps = ["//tools/fmtcli/money"],
+)

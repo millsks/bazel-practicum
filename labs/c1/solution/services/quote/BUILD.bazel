@@ -1,0 +1,44 @@
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
+
+# The service's logic, shared by the command line and the tests. The region file
+# travels with the library; the Go formatter is a data dependency of each
+# executable, because $(rlocationpath) only expands labels in the rule's own data.
+py_library(
+    name = "quote_lib",
+    srcs = ["quote.py"],
+    data = ["//data/regions:region"],
+    deps = [
+        "//libs/pricing",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+# bazel run //services/quote -- WIDGET=2 GADGET
+py_binary(
+    name = "quote",
+    srcs = ["main.py"],
+    data = ["//tools/fmtcli"],
+    env = {"FMTCLI": "$(rlocationpath //tools/fmtcli)"},
+    main = "main.py",
+    deps = [":quote_lib"],
+)
+
+py_test(
+    name = "quote_test",
+    size = "small",
+    srcs = ["quote_test.py"],
+    data = ["//tools/fmtcli"],
+    env = {"FMTCLI": "$(rlocationpath //tools/fmtcli)"},
+    deps = [":quote_lib"],
+)
+
+# Too slow for every push: run it by name, or through //:slow.
+py_test(
+    name = "exhaustive_test",
+    size = "small",
+    srcs = ["exhaustive_test.py"],
+    data = ["//tools/fmtcli"],
+    env = {"FMTCLI": "$(rlocationpath //tools/fmtcli)"},
+    tags = ["manual"],
+    deps = [":quote_lib"],
+)

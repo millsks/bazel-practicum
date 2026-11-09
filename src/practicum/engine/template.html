@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>@@TITLE@@</title>
+<meta name="description" content="@@DESCRIPTION@@">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='9.5' y='3' width='13' height='11' rx='2.5' fill='%232e9e63'/%3E%3Crect x='3' y='17' width='12.5' height='11' rx='2.5' fill='%231f7a4a'/%3E%3Crect x='16.5' y='17' width='12.5' height='11' rx='2.5' fill='%2343b97c'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Serif:ital,wght@0,500;0,600;1,500&family=IBM+Plex+Sans:ital,wght@0,400;0,600;0,700;1,400&family=IBM+Plex+Mono:wght@400;600&display=swap">
+<style>
+@@COURSE_CSS@@
+</style>
+<style>
+@@ENGINE_CSS@@
+</style>
+</head>
+<body class="engine-body" data-engine="single" data-root="">
+<header class="top"><div class="wrap">
+  <div class="brand"><b><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="9.5" y="3" width="13" height="11" rx="2.5" fill="#2e9e63"/><rect x="3" y="17" width="12.5" height="11" rx="2.5" fill="#1f7a4a"/><rect x="16.5" y="17" width="12.5" height="11" rx="2.5" fill="#43b97c"/></svg>@@TITLE@@</b>
+    <span class="right"><span class="meter" id="meter"></span><button class="theme-btn" id="theme" type="button" aria-label="Toggle dark mode"></button></span></div>
+  <div class="navscroll"><nav class="tabs" id="tabs" aria-label="Practicum sections"></nav></div>
+</div></header>
+<main class="wrap" id="view"></main>
+<div class="toast" id="toast" hidden></div>
+<script type="application/json" id="pp-data">@@DATA@@</script>
+<script>window.PP_DATA = JSON.parse(document.getElementById("pp-data").textContent); window.CURRICULUM = window.PP_DATA.curriculum;</script>
+@@SCRIPTS@@
+</body>
+</html>

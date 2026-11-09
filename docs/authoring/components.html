@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Component Gallery · Bazel Practicum</title>
+<link rel="stylesheet" href="../assets/css/course.css">
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/viz.js" defer></script>
+<script src="../assets/js/viz-bazel.js" defer></script>
+<script src="../assets/js/course.js" defer></script>
+</head>
+<body data-root="../" data-page="authoring">
+<main class="lesson">
+  <header class="lesson-hero">
+    <p class="eyebrow">Authoring · Component gallery</p>
+    <h1>Lesson Components</h1>
+    <p class="lede">Every building block a lesson page can use, working. Copy the markup from this page's source into a
+      new module; <a href="https://github.com/millsks/bazel-practicum/blob/main/docs/AUTHORING.md">AUTHORING.md</a>
+      explains the rules for each.</p>
+    <div class="lesson-meta"><span>⏱ 10 min</span><span>Prerequisites: none</span></div>
+    <ul class="objectives">
+      <li>See each component working</li>
+      <li>Copy the markup into a new module</li>
+      <li>Know which engine checks what: the simulator for sandboxes and exercises, real Bazel for labs</li>
+    </ul>
+  </header>
+
+  <section class="lesson-section" id="code">
+    <h2>Static code</h2>
+    <p>Static code uses Prism highlighting. Escape <code>&lt;</code>, <code>&gt;</code> and <code>&amp;</code> inside
+      <code>&lt;pre&gt;</code>. <code>data-label</code> names the file or says where the text came from.</p>
+    <pre data-label="app/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(name = "hello", srcs = ["hello.py"])</code></pre>
+    <pre data-label="Terminal"><code class="language-bash">pixi run bazel build //app:hello</code></pre>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">INFO: Build completed successfully, 0 total actions</code></pre>
+  </section>
+
+  <section class="lesson-section" id="sandbox">
+    <h2>Sandboxes</h2>
+    <p>A sandbox is a small workspace evaluated by the in-page simulator. Each <code>textarea.file</code> is one file;
+      <code>data-readonly</code> locks it and <code>data-hidden</code> keeps it out of the tabs. Every command in
+      <code>data-commands</code> becomes a button.</p>
+    <div class="runnable" data-title="Edit me and run a command" data-commands="bazel query //...|bazel query 'deps(//app:hello)'|bazel build //app:hello|bazel test //...">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "gallery")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="app/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
+
+py_library(name = "greet", srcs = ["greet.py"])
+
+py_binary(name = "hello", srcs = ["hello.py"], deps = [":greet"])
+
+py_test(name = "greet_test", srcs = ["greet_test.py"], deps = [":greet"])
+</textarea>
+<textarea class="file" data-path="app/greet.py" data-hidden></textarea>
+<textarea class="file" data-path="app/hello.py" data-hidden></textarea>
+<textarea class="file" data-path="app/greet_test.py" data-hidden></textarea>
+</div>
+
+    <p>With <code>data-predict</code>, the learner types a prediction before seeing the output:</p>
+    <div class="runnable" data-predict data-title="Predict the query result" data-commands="bazel query 'kind(py_library, //...)'">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "gallery")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="lib/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(name = "a", srcs = ["a.py"])
+
+py_library(name = "b", srcs = ["b.py"], deps = [":a"])
+
+filegroup(name = "data", srcs = ["a.py"])
+</textarea>
+<textarea class="file" data-path="lib/a.py" data-hidden></textarea>
+<textarea class="file" data-path="lib/b.py" data-hidden></textarea>
+</div>
+  </section>
+
+  <section class="lesson-section" id="exercise">
+    <h2>Exercises</h2>
+    <p>An exercise is a sandbox with checks: <code>test_*(bazel)</code> functions run against the learner's files. The
+      solution must pass and the starter must fail at least one check (<code>pixi run check-exercises</code>).</p>
+    <div class="exercise" data-id="demo-e1" data-title="Make the library visible">
+      <div class="exercise-prompt">
+        <p><code>//app:hello</code> depends on <code>//lib:greet</code>, but the library is private to its package.
+          Make it visible to <code>//app</code> only (not public), so <code>bazel build //app:hello</code> succeeds.</p>
+      </div>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "gallery")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="lib/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "greet",
+    srcs = ["greet.py"],
+)
+</textarea>
+<textarea class="file" data-path="app/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "hello",
+    srcs = ["hello.py"],
+    deps = ["//lib:greet"],
+)
+</textarea>
+<textarea class="file" data-path="lib/greet.py" data-hidden></textarea>
+<textarea class="file" data-path="app/hello.py" data-hidden></textarea>
+<script type="text/x-python" class="tests">
+def test_hello_builds(bazel):
+    result = bazel.build("//app:hello")
+    assert result.ok, "bazel build //app:hello fails:\n" + result.error
+
+def test_greet_is_not_public(bazel):
+    visibility = bazel.attr("//lib:greet", "visibility")
+    assert "//visibility:public" not in visibility, "make //lib:greet visible to //app only, not to everyone"
+</script>
+      <details class="hint"><summary>Hint</summary><p>A visibility label of the form <code>//pkg:__pkg__</code> names
+        one package.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="lib/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "greet",
+    srcs = ["greet.py"],
+    visibility = ["//app:__pkg__"],
+)</code></pre>
+      </details>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="lab">
+    <h2>Labs</h2>
+    <p>A lab is graded by real Bazel on the learner's machine. The widget adds the <code>pixi run start</code> and
+      <code>pixi run grade</code> commands; the workspace and checks live in <code>labs/&lt;id&gt;/</code>. This one is
+      Module 00's lab, shown here for its markup.</p>
+    <div class="lab" data-id="m00-lab1" data-title="Your first real build">
+      <div class="lab-prompt">
+        <p>Make <code>bazel run //hello:hello</code> print a greeting and <code>bazel test //...</code> pass.</p>
+        <ul class="checklist" data-id="demo-lab-steps">
+          <li>Run <code>pixi run start m00-lab1</code></li>
+          <li>Fix the BUILD file in <code>work/m00-lab1</code></li>
+          <li>Run <code>pixi run grade m00-lab1</code></li>
+        </ul>
+      </div>
+      <details class="hint"><summary>Hint</summary><p>Read the first ERROR line.</p></details>
+      <details class="solution"><summary>Show solution</summary><p>See <a href="../modules/m00-orientation.html#lab">Module 00</a>.</p></details>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="quiz">
+    <h2>Quiz</h2>
+    <div class="quiz" data-id="demo-quiz">
+<script type="application/json">
+{"title": "Demo quiz", "passScore": 0.7, "questions": [
+  {"type": "single", "prompt": "Which file pins the Bazel version?", "options": ["MODULE.bazel", ".bazelversion", ".bazelrc"], "answer": 1, "explanation": "<p>Bazelisk reads <code>.bazelversion</code> and runs that release.</p>"},
+  {"type": "multi", "prompt": "Which are native in Bazel 9 (no <code>load()</code> needed)?", "options": ["filegroup", "py_binary", "genrule", "sh_test"], "answer": [0, 2], "explanation": "<p>Bazel 9 has no autoloads: rule-set rules such as <code>py_binary</code> and <code>sh_test</code> must be loaded.</p>"},
+  {"type": "output", "prompt": "What does <code>bazel query //lib:all</code> print?", "code": "py_library(name = \"a\", srcs = [\"a.py\"])\nfilegroup(name = \"data\", srcs = [\"a.py\"])", "lang": "starlark", "answer": "//lib:a\n//lib:data", "explanation": "<p><code>:all</code> means every rule in the package, sorted; files are only in <code>:*</code>.</p>"},
+  {"type": "text", "prompt": "Which file replaced WORKSPACE?", "answer": ["MODULE.bazel"], "explanation": "<p>Bzlmod reads <code>MODULE.bazel</code>.</p>"}
+]}
+</script>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="callouts">
+    <h2>Callouts</h2>
+    <aside class="callout note"><p>A neutral note.</p></aside>
+    <aside class="callout tip"><p>A helpful tip.</p></aside>
+    <aside class="callout warn"><p>Something to watch out for.</p></aside>
+    <aside class="callout danger"><p>A mistake that breaks builds.</p></aside>
+    <aside class="callout think"><p>A question to pause on before reading on.</p></aside>
+    <aside class="callout pro"><p>A team habit: run buildifier on every BUILD file.</p></aside>
+    <aside class="callout pixi"><p>How to do it with Pixi: <code>pixi run bazel ...</code>.</p></aside>
+    <aside class="callout python"><p>From Python: you would run <code>pytest tests/</code> here.</p></aside>
+    <aside class="callout bazel"><p>Bazel 9 specifics: no WORKSPACE, no autoloads.</p></aside>
+    <aside class="callout sim"><p>Where the simulator stops: it never runs tests, so this needs a lab.</p></aside>
+    <aside class="callout note" data-title="Custom heading"><p>Any callout can take its own heading.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="layout">
+    <h2>Tabs, cards, reveal, checklist, diagram</h2>
+    <div class="tabs">
+      <div class="tab" data-label="Python"><pre><code class="language-bash">pytest tests/test_greet.py</code></pre></div>
+      <div class="tab" data-label="Bazel"><pre><code class="language-bash">pixi run bazel test //app:greet_test</code></pre></div>
+    </div>
+    <div class="two-col">
+      <div><p>Left column.</p></div>
+      <div><p>Right column.</p></div>
+    </div>
+    <div class="card-grid">
+      <div class="card"><h4>Correct</h4><p>Undeclared inputs fail.</p></div>
+      <div class="card"><h4>Cached</h4><p>Unchanged actions do not rerun.</p></div>
+    </div>
+    <details class="reveal"><summary>Reveal the answer</summary><p>Hidden until opened.</p></details>
+    <ul class="checklist" data-id="demo-check">
+      <li>Read the lesson</li>
+      <li>Do the exercises</li>
+    </ul>
+    <pre class="mermaid">
+flowchart LR
+  A[hello.py] --> B[//app:hello] --> C[bazel-bin/app/hello]
+    </pre>
+  </section>
+
+  <section class="lesson-section" id="visualizers">
+    <h2>Visualizers</h2>
+    <div class="viz" data-viz="phases"></div>
+    <div class="viz" data-viz="buildgraph" data-config='{"title": "Click a file to see what rebuilds", "nodes": [{"id": "greet.py", "kind": "file", "x": 0, "y": 0}, {"id": "hello.py", "kind": "file", "x": 0, "y": 1}, {"id": "//app:greet", "kind": "rule", "x": 1, "y": 0, "deps": ["greet.py"]}, {"id": "//app:hello", "kind": "rule", "x": 2, "y": 1, "deps": ["hello.py", "//app:greet"]}, {"id": "//app:greet_test", "kind": "test", "x": 2, "y": 0, "deps": ["//app:greet"]}]}'></div>
+  </section>
+
+  <section class="lesson-section" id="recap">
+    <h2>Flashcards</h2>
+    <div class="flashcards" data-title="Key ideas">
+<script type="application/json">
+[{"front": "What is a package?", "back": "A directory with a BUILD.bazel (or BUILD) file."},
+ {"front": "<code>//pkg:all</code> vs <code>//pkg:*</code>", "back": "Rules only, versus rules and files."}]
+</script>
+    </div>
+  </section>
+</main>
+</body>
+</html>

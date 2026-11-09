@@ -1,0 +1,28 @@
+load("@rules_python//python:pip.bzl", "compile_pip_requirements")
+
+# bazel run //:requirements.update  rewrites requirements_lock.txt from requirements.in.
+# Tagged manual so `bazel test //...` does not run the network-bound lock check.
+compile_pip_requirements(
+    name = "requirements",
+    src = "requirements.in",
+    requirements_txt = "requirements_lock.txt",
+    tags = ["manual"],
+)
+
+# The tests a developer runs before every push: small, hermetic, cached.
+test_suite(
+    name = "fast",
+    tests = [
+        "//data:catalog_golden_test",
+        "//libs/pricing:pricing_test",
+        "//services/quote:quote_test",
+        "//tools/fmtcli/money:money_test",
+    ],
+)
+
+# The slow tests, run nightly by name. Tagged manual so //... does not pull them in.
+test_suite(
+    name = "slow",
+    tags = ["manual"],
+    tests = ["//services/quote:exhaustive_test"],
+)

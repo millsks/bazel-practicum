@@ -1,0 +1,16 @@
+load("@rules_python//python:defs.bzl", "py_library")
+
+# Grader probes: targets outside //services that try to use private Python targets.
+# Each must FAIL to build with "is not visible from". Tagged manual so //... skips them.
+
+py_library(
+    name = "uses_pricing",
+    tags = ["manual"],
+    deps = ["//libs/pricing"],
+)
+
+py_library(
+    name = "uses_catalog",
+    tags = ["manual"],
+    deps = ["//data:catalog"],
+)

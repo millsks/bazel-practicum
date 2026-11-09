@@ -1,0 +1,8 @@
+# Workspace-wide Bazel options for the deploy workspace.
+
+# `--config=prod` means "production build": the prod banner, optimized.
+build:prod --//config:env=prod
+build:prod -c opt
+
+# Personal settings that should not be committed go in user.bazelrc.
+try-import %workspace%/user.bazelrc

@@ -1,0 +1,1390 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M07 · Go: A Second Language · Bazel Practicum</title>
+<link rel="stylesheet" href="../assets/css/course.css">
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/viz.js" defer></script>
+<script src="../assets/js/viz-bazel.js" defer></script>
+<script src="../assets/js/course.js" defer></script>
+</head>
+<body data-root="../" data-module="m07">
+<main class="lesson">
+  <header class="lesson-hero">
+    <p class="eyebrow">Stage 2 · Growing the Monorepo · Module 07</p>
+    <h1>Go: A Second Language</h1>
+    <p class="lede">A second language is where Bazel stops being "a slower way to run pytest" and starts paying for
+      itself. In this module you add Go to a Python workspace: one graph, one cache, one <code>bazel test //...</code>
+      for both. You learn just enough Go to read and write a small tool, then test that tool from Python.</p>
+    <div class="lesson-meta"><span>⏱ ~2.5 hours</span><span>Prerequisites: <a href="m06-configuration.html">M06</a></span></div>
+    <ul class="objectives">
+      <li>Read and write a small Go package: <code>package</code>, <code>func main</code>, imports, exported names, and <code>testing.T</code> tests</li>
+      <li>Add <code>rules_go</code> to <code>MODULE.bazel</code> and pin a hermetic Go SDK with <code>go_sdk.download</code></li>
+      <li>Write <code>go_library</code> (with <code>importpath</code>), <code>go_binary</code>, and <code>go_test</code>, and choose between <code>embed</code> and <code>deps</code> for a test</li>
+      <li>Read the errors Go targets produce: missing strict dependencies, <code>undefined</code>, and <code>GoInfo</code> provider errors</li>
+      <li>Run a Go binary from a Python test through <code>data</code>, <code>$(rlocationpath)</code>, and the runfiles library</li>
+      <li>Explain what Gazelle and <code>go_deps</code> are for, and when you will need them</li>
+    </ul>
+  </header>
+
+  <section class="lesson-section" id="why-polyglot">
+    <h2>Why a second language changes the picture</h2>
+    <aside class="callout python">
+      <p>Picture a Python service with a small Go command-line tool next to it. Without Bazel you have two worlds:
+        <code>pixi run pytest</code> for one, <code>go test ./...</code> for the other, two CI jobs, two caches, and a
+        shell script that builds the Go tool before the Python tests that call it. Nothing knows that a change to the Go
+        code should re-run those Python tests.</p>
+    </aside>
+    <p>Bazel has no special notion of "the Python part" and "the Go part". A <code>go_binary</code> is a target like a
+      <code>py_binary</code>: it has inputs, actions, and outputs, and other targets can depend on it. So the
+      workspace gets:</p>
+    <div class="card-grid">
+      <div class="card"><h4>One graph</h4><p><code>bazel query 'rdeps(//..., //textutil)'</code> finds Go and Python dependents alike.</p></div>
+      <div class="card"><h4>One cache</h4><p>Go compile actions and Python test results are keyed the same way, by input hashes, and shared the same way.</p></div>
+      <div class="card"><h4>One test command</h4><p><code>bazel test //...</code> runs <code>go_test</code> and <code>py_test</code> targets together and reports them in one list.</p></div>
+      <div class="card"><h4>Precise reruns</h4><p>Edit the Go tool, and only the tests that depend on it run again, in either language.</p></div>
+    </div>
+    <p>This module builds that workspace: a Go package <code>//textutil</code> that counts lines and words, a Go
+      command <code>//tools/wc</code> that uses it, and a Python test that runs the command and checks what it prints.
+      Click the files below to see what each edit re-runs.</p>
+    <div class="viz" data-viz="buildgraph" data-config='{"title": "A polyglot graph: Go and Python in one workspace", "nodes": [{"id": "count.go", "kind": "file", "x": 0, "y": 0}, {"id": "main.go", "kind": "file", "x": 0, "y": 1}, {"id": "count_test.go", "kind": "file", "x": 0, "y": 2}, {"id": "wc_test.py", "kind": "file", "x": 0, "y": 3}, {"id": "//textutil:textutil", "kind": "rule", "x": 1, "y": 0, "deps": ["count.go"]}, {"id": "//tools/wc:wc", "kind": "rule", "x": 1, "y": 1, "deps": ["main.go", "//textutil:textutil"]}, {"id": "//textutil:textutil_test", "kind": "test", "x": 2, "y": 2, "deps": ["count_test.go", "//textutil:textutil"]}, {"id": "//tests:wc_test", "kind": "test", "x": 2, "y": 3, "deps": ["wc_test.py", "//tools/wc:wc"]}]}'></div>
+    <aside class="callout think">
+      <p>Click <code>main.go</code>. The Go unit test stays cached, but the <em>Python</em> test re-runs. Which shell
+        script or Makefile you have seen would get that right?</p>
+    </aside>
+    <p><strong>Remember:</strong> to Bazel, languages are just rule sets. Once Go is in the graph, every Bazel
+      guarantee you learned for Python (sandboxing, caching, precise reruns, query) covers it too.</p>
+  </section>
+
+  <section class="lesson-section" id="go-basics">
+    <h2>Just enough Go for a Python developer</h2>
+    <p>You do not need to become a Go programmer to follow this module, but you need to read four things: packages,
+      <code>main</code>, imports, and tests. Go is compiled, statically typed, and has a small standard library that
+      covers everything here. Here is the library we will build, next to its Python twin.</p>
+    <div class="tabs">
+      <div class="tab" data-label="Go">
+        <pre data-label="textutil/count.go"><code class="language-go">// Package textutil counts lines and words in text.
+package textutil
+
+import "strings"
+
+// Words returns the number of whitespace-separated words in s.
+func Words(s string) int {
+	return len(strings.Fields(s))
+}
+
+// Lines returns the number of newline characters in s, like wc -l.
+func Lines(s string) int {
+	return strings.Count(s, "\n")
+}</code></pre>
+      </div>
+      <div class="tab" data-label="Python">
+        <pre data-label="textutil/count.py"><code class="language-python">"""Count lines and words in text."""
+
+
+def words(s: str) -&gt; int:
+    """Return the number of whitespace-separated words in s."""
+    return len(s.split())
+
+
+def lines(s: str) -&gt; int:
+    """Return the number of newline characters in s, like wc -l."""
+    return s.count("\n")</code></pre>
+      </div>
+    </div>
+    <dl>
+      <dt><strong>Package</strong></dt>
+      <dd>Every Go file starts with <code>package &lt;name&gt;</code>. All <code>.go</code> files in one directory belong
+        to one package and see each other's names without importing, as if a Python package were a single module.</dd>
+      <dt><strong>Exported names</strong></dt>
+      <dd>Go has no <code>__all__</code> and no leading underscore. A name starting with a <strong>capital letter</strong>
+        (<code>Words</code>) is <em>exported</em>: other packages can use it. A lowercase name (<code>words</code>) is
+        private to its package, and the compiler enforces it.</dd>
+      <dt><strong>Types</strong></dt>
+      <dd><code>func Words(s string) int</code> is Python's <code>def words(s: str) -&gt; int</code>, except the types
+        are checked at compile time. Types come <em>after</em> names.</dd>
+      <dt><strong>Formatting</strong></dt>
+      <dd>Go code is indented with tabs and formatted by <code>gofmt</code>; nobody argues about style.</dd>
+    </dl>
+    <h3>Programs: <code>package main</code> and <code>func main</code></h3>
+    <p>A Go program is a package named <code>main</code> with a function <code>main()</code>. It is Go's
+      <code>if __name__ == "__main__":</code>, except it is the only way in. Imports name a package by its
+      <strong>import path</strong>, a string like a URL:</p>
+    <pre data-label="tools/wc/main.go"><code class="language-go">// Command wc counts lines and words.
+//
+// With arguments, each argument is one line of text:
+//
+//	wc "to be or" "not to be"   prints   2 lines, 6 words
+//
+// Without arguments, it reads standard input.
+package main
+
+import (
+	"fmt"
+	"io"
+	"os"
+	"strings"
+
+	"example.com/polyglot/textutil"
+)
+
+func main() {
+	var text string
+	if len(os.Args) &gt; 1 {
+		text = strings.Join(os.Args[1:], "\n") + "\n"
+	} else {
+		data, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "wc:", err)
+			os.Exit(1)
+		}
+		text = string(data)
+	}
+	fmt.Printf("%d lines, %d words\n", textutil.Lines(text), textutil.Words(text))
+}</code></pre>
+    <ul>
+      <li><code>"fmt"</code>, <code>"io"</code>, <code>"os"</code>, <code>"strings"</code> are standard library
+        packages. <code>"example.com/polyglot/textutil"</code> is ours; you use it by its last element,
+        <code>textutil.Words(...)</code>, like <code>import textutil</code> in Python.</li>
+      <li><code>os.Args</code> is <code>sys.argv</code>. <code>:=</code> declares and assigns a new variable.</li>
+      <li>Functions return errors as values: <code>data, err := io.ReadAll(...)</code>, then
+        <code>if err != nil</code>. Go has no exceptions for ordinary failures.</li>
+    </ul>
+    <h3>Tests: <code>_test.go</code> files and <code>testing.T</code></h3>
+    <p>Go's test convention is close to pytest's: test files end in <code>_test.go</code>, and each test is a function
+      named <code>TestXxx</code> that receives a <code>*testing.T</code>. There is no <code>assert</code>; you compare and
+      call <code>t.Errorf</code>, which marks the test failed and keeps going.</p>
+    <div class="tabs">
+      <div class="tab" data-label="Go">
+        <pre data-label="textutil/count_test.go"><code class="language-go">package textutil
+
+import "testing"
+
+func TestWords(t *testing.T) {
+	cases := map[string]int{
+		"":                0,
+		"one":             1,
+		"  two  words \n": 2,
+	}
+	for in, want := range cases {
+		if got := Words(in); got != want {
+			t.Errorf("Words(%q) = %d, want %d", in, got, want)
+		}
+	}
+}</code></pre>
+      </div>
+      <div class="tab" data-label="pytest">
+        <pre data-label="textutil/test_count.py"><code class="language-python">import pytest
+
+from textutil.count import words
+
+
+@pytest.mark.parametrize("text, want", [("", 0), ("one", 1), ("  two  words \n", 2)])
+def test_words(text: str, want: int) -&gt; None:
+    assert words(text) == want</code></pre>
+      </div>
+    </div>
+    <p>Notice the first line: <code>package textutil</code>. This test lives <em>inside</em> the package it tests, so it
+      can call <code>Words</code> without a prefix (and could call lowercase helpers too). Go calls this an
+      <strong>internal test</strong>. A test file that says <code>package textutil_test</code> instead is an
+      <strong>external test</strong>: it imports <code>textutil</code> like any other user and sees only exported names.
+      This difference matters to Bazel, as you will see.</p>
+    <aside class="callout note">
+      <p>Unlike unittest in M03, you never write a <code>main</code> for tests. Go's tooling generates the test runner,
+        and rules_go does the same. A failing <code>t.Errorf</code> makes the test binary exit non-zero, which is what
+        Bazel reads.</p>
+    </aside>
+    <p><strong>Remember:</strong> one directory, one package; capitalized names are public; programs are
+      <code>package main</code>; tests are <code>TestXxx(t *testing.T)</code> in <code>_test.go</code> files.</p>
+  </section>
+
+  <section class="lesson-section" id="module-setup">
+    <h2>MODULE.bazel for Go and the hermetic SDK</h2>
+    <aside class="callout python">
+      <p>In M03, two lines in <code>MODULE.bazel</code> gave every Python target the same interpreter, whatever
+        <code>python3</code> your laptop has. Go works the same way, with a <strong>Go SDK</strong> (the compiler, linker,
+        and standard library) instead of an interpreter.</p>
+    </aside>
+    <p>Add the rule set with <code>bazel_dep</code>, then pin the SDK with rules_go's <code>go_sdk</code> module
+      extension:</p>
+    <pre data-label="MODULE.bazel"><code class="language-starlark">module(name = "polyglot")
+
+bazel_dep(name = "rules_go", version = "0.65.0")
+bazel_dep(name = "rules_python", version = "2.4.6")
+
+go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk")
+go_sdk.download(version = "1.25.3")
+
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(python_version = "3.13", is_default = True)</code></pre>
+    <p>A <strong>module extension</strong> (M04) is code in a rule set that creates repositories from tags you write
+      in <code>MODULE.bazel</code>. <code>go_sdk.download(version = ...)</code> is such a tag: it tells rules_go to
+      download that Go release from go.dev and register it as the Go <strong>toolchain</strong>.</p>
+    <aside class="callout bazel" data-title="No use_repo for the SDK">
+      <p>Unlike <code>pip.parse</code> in M04, <code>go_sdk.download</code> needs no <code>use_repo(...)</code> line. Go
+        rules find the SDK through toolchain resolution, not by repository name. The SDK repositories even get mangled
+        names (<code>rules_go++go_sdk+main___download_0_linux_amd64</code>) so nothing depends on them directly. Adding
+        <code>use_repo(go_sdk, "go_sdk")</code>, a natural guess, fails before anything builds:</p>
+    </aside>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: module extension @@rules_go+//go:extensions.bzl%go_sdk does not generate repository "go_sdk", yet it is imported as "go_sdk" in the usage at /home/claude/bazel-practicum/build/scratch-m07/ws/MODULE.bazel:6:23
+INFO: Elapsed time: 1.524s
+INFO: 0 processes.
+ERROR: Build did NOT complete successfully</code></pre>
+    <p>A tag's attributes are checked too. The attribute is <code>version</code>, not <code>go_version</code>:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: Traceback (most recent call last):
+	File "/home/claude/bazel-practicum/build/scratch-m07/ws/MODULE.bazel", line 7, column 16, in &lt;toplevel&gt;
+		go_sdk.download(go_version = "1.25.3")
+Error: in 'download' tag, unknown attribute 'go_version' provided (did you mean 'version'?)</code></pre>
+    <h3>Proof that it is hermetic</h3>
+    <p>The machine these examples ran on has a system Go installed, an older one:</p>
+    <pre data-label="Terminal (real)"><code class="language-none">$ go version
+go version go1.24.7 linux/amd64</code></pre>
+    <p>A tiny program that prints <code>runtime.Version()</code>, the Go release it was compiled with, tells a different
+      story under Bazel:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">INFO: Running command line: bazel-bin/version/version_/version
+built with go1.25.3 for linux/amd64</code></pre>
+    <p>Bazel never looked at the system <code>go</code>. You do not need Go installed at all: Pixi installs Bazelisk,
+      Bazelisk installs Bazel, and rules_go installs Go. Teammates on macOS and CI on Linux all compile with 1.25.3.</p>
+    <p>What if you leave <code>go_sdk.download</code> out? rules_go then registers its own default SDK. With rules_go
+      0.65.0 that is the version in rules_go's own <code>go.mod</code>, and the same program prints:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">INFO: Running command line: bazel-bin/version/version_/version
+built with go1.26.7 for linux/amd64</code></pre>
+    <p>Still hermetic, but your Go version would silently change whenever you upgrade rules_go. Pin it.</p>
+    <aside class="callout note">
+      <p>rules_go registers SDKs for several platforms (Linux, macOS, and Windows, on amd64 and arm64) but downloads only
+        the ones a build needs. Your first Go build also compiles the Go standard library once (a
+        <code>GoStdlib</code> action, about a minute) and caches it like any other action.</p>
+    </aside>
+    <aside class="callout pro">
+      <p>If your Go code already has a <code>go.mod</code>, <code>go_sdk.from_file(go_mod = "//:go.mod")</code> reads the
+        version from it, so <code>go build</code> and Bazel cannot drift apart. <code>go_sdk.host()</code> uses the system
+        Go instead; the rules_go docs discourage it because it is not reproducible.</p>
+    </aside>
+    <p>Try the simulator. It reads the same <code>MODULE.bazel</code> and loads the Go rules; break the
+      <code>bazel_dep</code> line to see what a BUILD file says when <code>@rules_go</code> is unknown.</p>
+    <div class="runnable" data-title="A Go-enabled workspace" data-commands="bazel query //...|bazel build //...|bazel query 'kind(go_.*, //...)' --output=label_kind">
+<textarea class="file" data-path="MODULE.bazel">
+module(name = "polyglot")
+
+bazel_dep(name = "rules_go", version = "0.65.0")
+
+go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk")
+go_sdk.download(version = "1.25.3")
+</textarea>
+<textarea class="file" data-path="version/BUILD.bazel">
+load("@rules_go//go:def.bzl", "go_binary")
+
+go_binary(
+    name = "version",
+    srcs = ["version.go"],
+)
+</textarea>
+<textarea class="file" data-path="version/version.go" data-hidden></textarea>
+</div>
+    <aside class="callout sim">
+      <p>The simulator reports the <code>use_repo</code> and <code>go_version</code> errors above, but it never
+        downloads an SDK, so it cannot show which Go version a binary was built with.</p>
+    </aside>
+    <p><strong>Remember:</strong> <code>bazel_dep(name = "rules_go", ...)</code> plus
+      <code>go_sdk.download(version = "1.25.3")</code>, no <code>use_repo</code>. The system Go is never used.</p>
+  </section>
+
+  <section class="lesson-section" id="library-binary">
+    <h2>go_library and go_binary</h2>
+    <p>rules_go's rules come from <code>@rules_go//go:def.bzl</code>. As with Python in Bazel 9, you must
+      <code>load()</code> them; without it the error is the familiar <code>name 'go_binary' is not defined (did you mean
+      'cc_binary'?)</code>.</p>
+    <pre data-label="textutil/BUILD.bazel"><code class="language-starlark">load("@rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "textutil",
+    srcs = ["count.go"],
+    importpath = "example.com/polyglot/textutil",
+    visibility = ["//visibility:public"],
+)</code></pre>
+    <pre data-label="tools/wc/BUILD.bazel"><code class="language-starlark">load("@rules_go//go:def.bzl", "go_binary")
+
+go_binary(
+    name = "wc",
+    srcs = ["main.go"],
+    visibility = ["//visibility:public"],
+    deps = ["//textutil"],
+)</code></pre>
+    <p>Most attributes look like the Python ones. One is new:</p>
+    <table>
+      <thead><tr><th>Attribute</th><th>On</th><th>What it means</th></tr></thead>
+      <tbody>
+        <tr><td><code>srcs</code></td><td>all</td><td>The <code>.go</code> files of this package (one Go package per target).</td></tr>
+        <tr><td><code>deps</code></td><td>all</td><td>Other Go targets this code imports.</td></tr>
+        <tr><td><code>importpath</code></td><td>go_library</td><td>The string other Go code writes in <code>import "..."</code> to use this library.</td></tr>
+        <tr><td><code>embed</code></td><td>all</td><td>Libraries compiled <em>into</em> this target as one package. See <a href="#go-test">go_test</a>.</td></tr>
+        <tr><td><code>data</code></td><td>all</td><td>Run-time files, exactly like Python's <code>data</code>.</td></tr>
+        <tr><td><code>args</code>, <code>env</code></td><td>binary, test</td><td>Added by <code>bazel run</code> and <code>bazel test</code>, as in M03.</td></tr>
+      </tbody>
+    </table>
+    <h3>Why <code>importpath</code> exists</h3>
+    <p>In Python under Bazel, a module's import name comes from its file path: <code>textutil/count.py</code> is
+      <code>textutil.count</code>. Go imports are strings, and by convention they look like where the code would live on
+      the internet: <code>example.com/polyglot/textutil</code>, <code>github.com/acme/tools/textutil</code>. Bazel cannot
+      derive that from the directory, so you state it. Most teams use one prefix for the whole repository plus the
+      package path.</p>
+    <p>When the Go compiler sees <code>import "example.com/polyglot/textutil"</code>, rules_go looks for a target in
+      <code>deps</code> whose <code>importpath</code> is exactly that string. Forget the <code>deps</code> entry, or
+      misspell the <code>importpath</code>, and compilation fails with Bazel's <strong>strict dependencies</strong>
+      check (absolute paths shortened to <code>&lt;output_base&gt;</code>):</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: /home/claude/bazel-practicum/build/scratch-m07/ws/tools/wc/BUILD.bazel:3:10: GoCompilePkg tools/wc/wc.a failed: (Exit 1): builder failed: error executing GoCompilePkg command (from go_binary rule target //tools/wc:wc) bazel-out/k8-opt-exec/bin/external/rules_go++go_sdk+main___download_0_linux_amd64/builder_reset/builder compilepkg -sdk external/rules_go++go_sdk+main___download_0_linux_amd64 -goroot ... (remaining 27 arguments skipped)
+Use --sandbox_debug to see verbose messages from the sandbox and retain the sandbox build root for debugging
+compilepkg: missing strict dependencies:
+	&lt;output_base&gt;/sandbox/linux-sandbox/25/execroot/_main/tools/wc/main.go: import of "example.com/polyglot/textutil"
+No dependencies were provided.
+Check that imports in Go sources match importpath attributes in deps.</code></pre>
+    <p>Read it from the bottom: "Check that imports in Go sources match importpath attributes in deps." This is an
+      <strong>execution</strong> error (the compiler ran, inside a sandbox), not an analysis error, because only the
+      compiler reads the <code>import</code> lines. The same message appears when <code>deps</code> is right but the
+      library's <code>importpath</code> says <code>example.com/polyglot/text</code>.</p>
+    <aside class="callout python">
+      <p>In M03, a forgotten Python dependency built fine and failed at run time with
+        <code>ModuleNotFoundError</code>. Go fails at <em>build</em> time. That is the payoff of a compiled language:
+        <code>bazel build //...</code> alone proves every Go import is declared.</p>
+    </aside>
+    <h3>Where the binary lands</h3>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">$ pixi run bazel run //tools/wc -- "to be or" "not to be"
+INFO: Found 1 target...
+Target //tools/wc:wc up-to-date:
+  bazel-bin/tools/wc/wc_/wc
+INFO: Elapsed time: 1.240s, Critical Path: 0.01s
+INFO: 1 process: 1 internal.
+INFO: Build completed successfully, 1 total action
+INFO: Running command line: bazel-bin/tools/wc/wc_/wc &lt;args omitted&gt;
+2 lines, 6 words</code></pre>
+    <p>Note the path: <code>bazel-bin/tools/wc/wc_/wc</code>, not <code>bazel-bin/tools/wc/wc</code>. rules_go puts each
+      binary in a directory named <code>&lt;name&gt;_</code>. Remember that; it matters when Python goes looking for it.
+      There is no launcher script either: a Go binary is one self-contained executable.</p>
+    <p>Predict the output of the first command, then run them. <code>deps</code> includes source files, and Go has no
+      runfiles library in its <code>deps</code>.</p>
+    <div class="runnable" data-predict data-title="What does the Go binary depend on?" data-commands="bazel query 'deps(//tools/wc)'|bazel query 'rdeps(//..., //textutil)'|bazel build //...">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "polyglot")
+
+bazel_dep(name = "rules_go", version = "0.65.0")
+
+go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk")
+go_sdk.download(version = "1.25.3")
+</textarea>
+<textarea class="file" data-path="textutil/BUILD.bazel">
+load("@rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "textutil",
+    srcs = ["count.go"],
+    importpath = "example.com/polyglot/textutil",
+    visibility = ["//visibility:public"],
+)
+</textarea>
+<textarea class="file" data-path="tools/wc/BUILD.bazel">
+load("@rules_go//go:def.bzl", "go_binary")
+
+go_binary(
+    name = "wc",
+    srcs = ["main.go"],
+    visibility = ["//visibility:public"],
+    deps = ["//textutil"],
+)
+</textarea>
+<textarea class="file" data-path="textutil/count.go" data-hidden></textarea>
+<textarea class="file" data-path="tools/wc/main.go" data-hidden></textarea>
+</div>
+    <p>Real <code>bazel query 'deps(//tools/wc)'</code> also lists rules_go's own implicit targets (its compiler
+      configuration and test helpers). Add <code>--noimplicit_deps</code> to hide them; real Bazel then prints exactly
+      the four labels of your own code, as the simulator does.</p>
+    <aside class="callout warn">
+      <p><code>srcs</code> of a Go target only accepts Go-toolchain files. Listing a Python file there is rejected at
+        analysis: <code>source file '//tools/wc:helper.py' is misplaced here (expected .go, .s, .S, .h, .c, .cc, .cpp,
+        .cxx, .h, .hh, .hpp, .hxx, .inc, .m, .mm, or .syso)</code>.</p>
+    </aside>
+    <p><strong>Remember:</strong> <code>go_library</code> needs an <code>importpath</code>; every Go
+      <code>import</code> of your own code needs a <code>deps</code> entry whose <code>importpath</code> matches, or the
+      compile fails with "missing strict dependencies".</p>
+  </section>
+
+  <section class="lesson-section" id="go-test">
+    <h2>go_test: <code>embed</code> or <code>deps</code>?</h2>
+    <p>A <code>go_test</code> compiles your <code>_test.go</code> files with a generated runner into a test binary.
+      How it gets the code under test depends on which kind of test file you wrote.</p>
+    <div class="two-col">
+      <div>
+        <h4>Internal test: <code>embed</code></h4>
+        <pre data-label="textutil/BUILD.bazel"><code class="language-starlark">go_test(
+    name = "textutil_test",
+    srcs = ["count_test.go"],
+    embed = [":textutil"],
+)</code></pre>
+        <p><code>count_test.go</code> says <code>package textutil</code>. It must be compiled <em>together with</em>
+          <code>count.go</code> as one package. <code>embed</code> means exactly that: "add this library's sources to
+          mine".</p>
+      </div>
+      <div>
+        <h4>External test: <code>deps</code></h4>
+        <pre data-label="ext/BUILD.bazel"><code class="language-starlark">go_test(
+    name = "ext_test",
+    srcs = ["words_test.go"],
+    deps = ["//textutil"],
+)</code></pre>
+        <p><code>words_test.go</code> says <code>package ext_test</code> and imports
+          <code>example.com/polyglot/textutil</code>. It is a separate package that uses the library, so the library is
+          a normal dependency.</p>
+      </div>
+    </div>
+    <p>The common mistake is using <code>deps</code> for an internal test. The library is then compiled as a separate
+      package, and the test file, which is <em>also</em> named <code>package textutil</code>, has no
+      <code>Words</code> of its own:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: /home/claude/bazel-practicum/build/scratch-m07/ws/textutil/BUILD.bazel:10:8: GoCompilePkg textutil/textutil_test.internal.a failed: (Exit 1): builder failed: error executing GoCompilePkg command (from go_test rule target //textutil:textutil_test) bazel-out/k8-opt-exec/bin/external/rules_go++go_sdk+main___download_0_linux_amd64/builder_reset/builder compilepkg -sdk external/rules_go++go_sdk+main___download_0_linux_amd64 -goroot ... (remaining 31 arguments skipped)
+Use --sandbox_debug to see verbose messages from the sandbox and retain the sandbox build root for debugging
+textutil/count_test.go:12:13: undefined: Words
+textutil/count_test.go:19:12: undefined: Lines
+compilepkg: error running subcommand external/rules_go++go_sdk+main___download_0_linux_amd64/pkg/tool/linux_amd64/compile: exit status 2</code></pre>
+    <p><code>undefined: Words</code> in a test file usually means "this should be <code>embed</code>". The opposite
+      mistake shows up in external tests that call a lowercase name. Go's compiler is helpful here:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ext/words_test.go:10:21: undefined: textutil.words (but have Words)</code></pre>
+    <aside class="callout tip">
+      <p>Which to write? Look at the first line of the test file. <code>package X</code>: <code>embed</code> the
+        library. <code>package X_test</code>: list it in <code>deps</code>. Gazelle (below) makes this choice for you
+        when it generates BUILD files.</p>
+    </aside>
+    <h3>Running Go tests</h3>
+    <p><code>bazel test</code> runs Go and Python tests the same way and caches both. A failing Go test with
+      <code>--test_output=errors</code>:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">FAIL: //textutil:textutil_test (Exit 1) (see &lt;output_base&gt;/execroot/_main/bazel-out/k8-fastbuild/testlogs/textutil/textutil_test/test.log)
+INFO: From Testing //textutil:textutil_test:
+==================== Test output for //textutil:textutil_test:
+--- FAIL: TestLines (0.00s)
+    count_test.go:20: Lines = 3, want 2
+FAIL
+================================================================================
+INFO: Found 1 target and 1 test target...
+INFO: Elapsed time: 1.561s, Critical Path: 0.91s
+INFO: 9 processes: 2 internal, 7 linux-sandbox.
+INFO: Build completed, 1 test FAILED, 9 total actions
+//textutil:textutil_test                                                 FAILED in 0.1s
+  &lt;output_base&gt;/execroot/_main/bazel-out/k8-fastbuild/testlogs/textutil/textutil_test/test.log
+Executed 1 out of 1 test: 1 fails locally.</code></pre>
+    <p>Flags after <code>--test_arg</code> go to the test binary. Go's verbose flag is <code>-test.v</code>, the
+      equivalent of <code>pytest -v</code>:</p>
+    <pre data-label="Terminal"><code class="language-bash">pixi run bazel test //textutil:all --test_output=all --test_arg=-test.v</code></pre>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">==================== Test output for //textutil:textutil_test:
+=== RUN   TestWords
+--- PASS: TestWords (0.00s)
+=== RUN   TestLines
+--- PASS: TestLines (0.00s)
+PASS
+================================================================================</code></pre>
+    <p>Query which tests embed a library, and which tests would run:</p>
+    <div class="runnable" data-title="Internal and external tests" data-commands="bazel query 'attr(embed, textutil, //...)'|bazel query 'labels(embed, //textutil:textutil_test)'|bazel query 'tests(//...)'|bazel test //...">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "polyglot")
+
+bazel_dep(name = "rules_go", version = "0.65.0")
+
+go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk")
+go_sdk.download(version = "1.25.3")
+</textarea>
+<textarea class="file" data-path="textutil/BUILD.bazel">
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "textutil",
+    srcs = ["count.go"],
+    importpath = "example.com/polyglot/textutil",
+    visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "textutil_test",
+    srcs = ["count_test.go"],
+    embed = [":textutil"],
+)
+</textarea>
+<textarea class="file" data-path="ext/BUILD.bazel">
+load("@rules_go//go:def.bzl", "go_test")
+
+go_test(
+    name = "ext_test",
+    srcs = ["words_test.go"],
+    deps = ["//textutil"],
+)
+</textarea>
+<textarea class="file" data-path="textutil/count.go" data-hidden></textarea>
+<textarea class="file" data-path="textutil/count_test.go" data-hidden></textarea>
+<textarea class="file" data-path="ext/words_test.go" data-hidden></textarea>
+</div>
+    <aside class="callout sim">
+      <p>The simulator cannot read Go source, so it accepts <code>deps</code> where <code>embed</code> is needed and
+        never reports <code>undefined: Words</code> or missing strict dependencies. Those come from the Go compiler,
+        which the lab runs for real.</p>
+    </aside>
+    <p><strong>Remember:</strong> <code>package X</code> test file: <code>embed = [":lib"]</code>. <code>package
+      X_test</code> test file: <code>deps = [":lib"]</code>. Pass Go test flags with <code>--test_arg</code>.</p>
+  </section>
+
+  <section class="lesson-section" id="providers">
+    <h2>Mixing languages in <code>deps</code>: the GoInfo error</h2>
+    <p>M02 introduced <strong>providers</strong>: the typed information a target hands to the targets that depend on it.
+      <code>py_library</code> provides <code>PyInfo</code> (import paths, sources). <code>go_library</code> provides
+      <code>GoInfo</code> (an import path and a compiled package). Each rule says which providers its <code>deps</code>
+      must have, and Bazel checks it during analysis.</p>
+    <p>So a Go target cannot list a Python library in <code>deps</code>, however natural it looks in a polyglot repo:</p>
+    <pre data-label="tools/wc/BUILD.bazel (wrong)"><code class="language-starlark">go_binary(
+    name = "wc",
+    srcs = ["main.go"],
+    deps = [
+        "//textutil",
+        "//pylib:helpers",   # a py_library
+    ],
+)</code></pre>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: /home/claude/bazel-practicum/build/scratch-m07/ws/tools/wc/BUILD.bazel:3:10: in deps attribute of go_binary rule //tools/wc:wc: '//pylib:helpers' does not have mandatory providers: 'GoInfo'. Since this rule was created by the macro 'go_binary_macro', the error might have been caused by the macro implementation
+ERROR: /home/claude/bazel-practicum/build/scratch-m07/ws/tools/wc/BUILD.bazel:3:10: Analysis of target '//tools/wc:wc' (config: a7a71fd) failed
+ERROR: Analysis of target '//tools/wc:wc' failed; build aborted</code></pre>
+    <p>The same check runs the other way. A Python target that lists the Go binary in <code>deps</code>:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: /home/claude/bazel-practicum/build/scratch-m07/ws/pylib/BUILD.bazel:3:11: in deps attribute of py_library rule //pylib:helpers: '//tools/wc:wc' does not have mandatory providers: 'PyInfo' or 'CcInfo'. Since this rule was created by the macro 'py_library', the error might have been caused by the macro implementation</code></pre>
+    <p>Read these errors as: "<code>deps</code> means <em>link or import this code</em>, and this target is not code in
+      my language". The "Since this rule was created by the macro" sentence is noise: <code>go_binary</code> and
+      <code>py_library</code> are macros wrapping the real rules, and Bazel mentions it on every error.</p>
+    <p>Two different fixes, depending on what you meant:</p>
+    <ul>
+      <li><strong>You wanted to call the code.</strong> Code is not shared across languages through <code>deps</code>.
+        Depend on a library in your own language (perhaps a Go port next to the Python one), or share data, a CLI, or
+        generated code (M08) instead.</li>
+      <li><strong>You wanted to run the program.</strong> Then it is a run-time file: put it in <code>data</code>.
+        <code>data</code> accepts any target, in any language, because it requires no provider. That is the next
+        section.</li>
+    </ul>
+    <p>Try it: build, read the error, then fix the BUILD file so the Go binary depends only on Go code and the Python
+      test gets the binary through <code>data</code>.</p>
+    <div class="runnable" data-title="deps is per language, data is not" data-commands="bazel build //...|bazel query 'labels(data, //tests:wc_test)'">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "polyglot")
+
+bazel_dep(name = "rules_go", version = "0.65.0")
+bazel_dep(name = "rules_python", version = "2.4.6")
+
+go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk")
+go_sdk.download(version = "1.25.3")
+</textarea>
+<textarea class="file" data-path="tools/wc/BUILD.bazel">
+load("@rules_go//go:def.bzl", "go_binary")
+
+go_binary(
+    name = "wc",
+    srcs = ["main.go"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//textutil",
+        "//pylib:helpers",
+    ],
+)
+</textarea>
+<textarea class="file" data-path="tests/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_test")
+
+py_test(
+    name = "wc_test",
+    srcs = ["wc_test.py"],
+    deps = [
+        "//tools/wc",
+        "@rules_python//python/runfiles",
+    ],
+)
+</textarea>
+<textarea class="file" data-path="textutil/BUILD.bazel" data-readonly>
+load("@rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "textutil",
+    srcs = ["count.go"],
+    importpath = "example.com/polyglot/textutil",
+    visibility = ["//visibility:public"],
+)
+</textarea>
+<textarea class="file" data-path="pylib/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "helpers",
+    srcs = ["helpers.py"],
+    visibility = ["//visibility:public"],
+)
+</textarea>
+<textarea class="file" data-path="textutil/count.go" data-hidden></textarea>
+<textarea class="file" data-path="tools/wc/main.go" data-hidden></textarea>
+<textarea class="file" data-path="tests/wc_test.py" data-hidden></textarea>
+<textarea class="file" data-path="pylib/helpers.py" data-hidden></textarea>
+</div>
+    <p><strong>Remember:</strong> <code>deps</code> carries a language's provider (<code>GoInfo</code>,
+      <code>PyInfo</code>) and stays within one language. <code>data</code> carries files and crosses any boundary.</p>
+  </section>
+
+  <section class="lesson-section" id="cross-language">
+    <h2>A Python test that runs a Go tool</h2>
+    <aside class="callout python">
+      <p>Testing a CLI from Python usually means <code>subprocess.run(["wc", ...])</code> and hoping the right
+        <code>wc</code> is on <code>PATH</code>, built from the current source. In CI that means a "build the tool first"
+        step someone must remember to keep in sync.</p>
+    </aside>
+    <p>Under Bazel the Go binary is just a run-time file of the test. Three pieces wire it up:</p>
+    <pre data-label="tests/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_test")
+
+py_test(
+    name = "wc_test",
+    srcs = ["wc_test.py"],
+    data = ["//tools/wc"],                                   # 1. ship the binary
+    env = {"WC_BIN": "$(rlocationpath //tools/wc)"},         # 2. tell the test its runfiles path
+    deps = ["@rules_python//python/runfiles"],               # 3. the library that resolves it
+)</code></pre>
+    <pre data-label="tests/wc_test.py"><code class="language-python">import os
+import subprocess
+import unittest
+
+from python.runfiles import runfiles
+
+
+def wc_path() -&gt; str:
+    path = runfiles.Create().Rlocation(os.environ["WC_BIN"])
+    assert path is not None, "WC_BIN is not a runfile; is //tools/wc in data?"
+    return path
+
+
+class WcTest(unittest.TestCase):
+    def test_counts_stdin(self) -&gt; None:
+        out = subprocess.run([wc_path()], input="a b\nc\n", capture_output=True, text=True, check=True)
+        self.assertEqual(out.stdout, "2 lines, 3 words\n")
+
+    def test_counts_arguments(self) -&gt; None:
+        out = subprocess.run([wc_path(), "to be or", "not to be"], capture_output=True, text=True, check=True)
+        self.assertEqual(out.stdout, "2 lines, 6 words\n")
+
+
+if __name__ == "__main__":
+    unittest.main()</code></pre>
+    <ol>
+      <li><strong><code>data = ["//tools/wc"]</code></strong> builds the Go binary and puts it in the test's runfiles
+        tree. The binary must be visible to <code>//tests</code>, as for any dependency.</li>
+      <li><strong><code>$(rlocationpath //tools/wc)</code></strong> is a <strong>make variable</strong>: Bazel replaces it,
+        while analyzing the test, with the binary's runfiles path. Here it expands to
+        <code>_main/tools/wc/wc_/wc</code>. <code>env</code> hands that string to the test as an environment
+        variable.</li>
+      <li><strong><code>Rlocation()</code></strong> from the rules_python runfiles library (M03) turns the runfiles path
+        into a real path on disk, from any working directory.</li>
+    </ol>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">//tests:wc_test                                                          PASSED in 0.8s
+Executed 1 out of 1 test: 1 test passes.</code></pre>
+    <h3>Why not hard-code the path?</h3>
+    <p>You could write <code>Rlocation("_main/tools/wc/wc_/wc")</code>. It works, but it bakes rules_go's private output
+      layout (that <code>wc_/</code> directory) into your Python. The obvious guess, <code>_main/tools/wc/wc</code>, is
+      wrong, and it fails in a confusing way. The rules_python library, given a well-formed path under
+      <code>_main/</code>, returned a path to a file that does not exist, and <code>subprocess</code> failed (paths
+      shortened):</p>
+    <pre data-label="bazel-testlogs/tests/wc_test/test.log (real, abridged)"><code class="language-none">ERROR: test_counts (__main__.WcTest.test_counts)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "&lt;output_base&gt;/sandbox/linux-sandbox/29/execroot/_main/bazel-out/k8-fastbuild/bin/tests/wc_test.runfiles/_main/tests/wc_test.py", line 11, in test_counts
+    out = subprocess.run([wc], input="a b\nc\n", capture_output=True, text=True, check=True)
+  ...
+FileNotFoundError: [Errno 2] No such file or directory: '&lt;output_base&gt;/sandbox/linux-sandbox/29/execroot/_main/bazel-out/k8-fastbuild/bin/tests/wc_test.runfiles/_main/tools/wc/wc'</code></pre>
+    <p><code>$(rlocationpath)</code> asks the Go rules where they put the file, so your test never needs to know. It is
+      the documented, current pattern for "a test runs a tool". The variable also has a safety check: it only accepts a
+      label the target already depends on. Drop the <code>data</code> line and analysis fails:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: /home/claude/bazel-practicum/build/scratch-m07/ws/tests/BUILD.bazel:3:8: in env[WC_BIN] attribute of py_test rule //tests:wc_test: label '//tools/wc:wc' in $(location) expression is not a declared prerequisite of this rule. Since this rule was created by the macro 'py_test', the error might have been caused by the macro implementation</code></pre>
+    <aside class="callout note" data-title="args works too">
+      <p><code>args = ["$(rlocationpath //tools/wc)"]</code> passes the same string as <code>sys.argv[1]</code>
+        instead. Real run: <code>argv[1] = _main/tools/wc/wc_/wc</code>. Use <code>env</code> when the test framework
+        owns <code>argv</code> (unittest and pytest both parse it), <code>args</code> for a plain script.</p>
+    </aside>
+    <h3>One graph, one cache</h3>
+    <p>Here is the payoff. This workspace has four tests: the Go unit test, an external Go test, and two Python tests
+      that run <code>wc</code> (the second uses <code>args</code>). After editing only <code>tools/wc/main.go</code>, a
+      change to an error message:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">//ext:ext_test                                                  (cached) PASSED in 0.0s
+//textutil:textutil_test                                        (cached) PASSED in 0.1s
+//tests:wc_args_test                                                     PASSED in 0.4s
+//tests:wc_test                                                          PASSED in 0.5s
+Executed 2 out of 4 tests: 4 tests pass.</code></pre>
+    <p>Bazel re-ran exactly the Python tests downstream of the Go binary. The Go tests did not depend on
+      <code>main.go</code>, so their results came from the cache. It can go further still: appending a comment to the
+      end of <code>count.go</code> left all four tests <code>(cached)</code>. Actions are keyed on input
+      <em>content</em>, so when a recompiled package comes out the same, nothing downstream runs again.</p>
+    <aside class="callout sim">
+      <p>The simulator checks <code>$(rlocationpath)</code> in <code>env</code> and <code>args</code> (the "not a
+        declared prerequisite" error) and prints rules_go's <code>wc_/wc</code> path for <code>bazel run</code>, but it
+        never runs the tests.</p>
+    </aside>
+    <p>Predict, then run: which targets does the Python test reach, and which of them are Go?</p>
+    <div class="runnable" data-predict data-title="The polyglot graph from the test's side" data-commands="bazel query 'kind(&quot;go_.* rule&quot;, deps(//tests:wc_test))'|bazel query 'labels(data, //tests:wc_test)'|bazel query 'rdeps(//..., //textutil)'|bazel test //...">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "polyglot")
+
+bazel_dep(name = "rules_go", version = "0.65.0")
+bazel_dep(name = "rules_python", version = "2.4.6")
+
+go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk")
+go_sdk.download(version = "1.25.3")
+
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(python_version = "3.13", is_default = True)
+</textarea>
+<textarea class="file" data-path="tests/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_test")
+
+py_test(
+    name = "wc_test",
+    srcs = ["wc_test.py"],
+    data = ["//tools/wc"],
+    env = {"WC_BIN": "$(rlocationpath //tools/wc)"},
+    deps = ["@rules_python//python/runfiles"],
+)
+</textarea>
+<textarea class="file" data-path="tools/wc/BUILD.bazel" data-readonly>
+load("@rules_go//go:def.bzl", "go_binary")
+
+go_binary(
+    name = "wc",
+    srcs = ["main.go"],
+    visibility = ["//visibility:public"],
+    deps = ["//textutil"],
+)
+</textarea>
+<textarea class="file" data-path="textutil/BUILD.bazel" data-readonly>
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "textutil",
+    srcs = ["count.go"],
+    importpath = "example.com/polyglot/textutil",
+    visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "textutil_test",
+    srcs = ["count_test.go"],
+    embed = [":textutil"],
+)
+</textarea>
+<textarea class="file" data-path="textutil/count.go" data-hidden></textarea>
+<textarea class="file" data-path="textutil/count_test.go" data-hidden></textarea>
+<textarea class="file" data-path="tools/wc/main.go" data-hidden></textarea>
+<textarea class="file" data-path="tests/wc_test.py" data-hidden></textarea>
+</div>
+    <p>A <code>data</code> edge is a real dependency edge: <code>deps(...)</code> follows it, and so does
+      <code>rdeps</code>. That is how Bazel knew to re-run the Python test.</p>
+    <h3>The other direction</h3>
+    <p>Go code can consume what Python produces, too, but not through <code>deps</code>. The usual pattern is a Python
+      program that <em>generates</em> a file (a table, a config, Go source) and a Go target that compiles or embeds it.
+      That needs generated files, which arrive in <a href="m08-genrules-macros.html">M08</a>.</p>
+    <p><strong>Remember:</strong> to run a tool from a test: <code>data = ["//tool"]</code>, pass
+      <code>$(rlocationpath //tool)</code> in <code>env</code> or <code>args</code>, resolve it with
+      <code>Rlocation()</code>. Never guess a rule set's output path.</p>
+  </section>
+
+  <section class="lesson-section" id="gazelle">
+    <h2>Gazelle and third-party Go modules (a preview)</h2>
+    <p>By now you may be thinking: every Go <code>import</code> maps to exactly one <code>deps</code> label, and the
+      <code>package</code> line decides <code>embed</code> versus <code>deps</code>. A program could write these BUILD
+      files. One does.</p>
+    <p><strong>Gazelle</strong> is a BUILD file generator from the rules_go authors. It reads your Go sources and writes
+      or updates <code>go_library</code>, <code>go_binary</code>, and <code>go_test</code> targets, including
+      <code>importpath</code>, <code>deps</code>, and <code>embed</code>. It has a Python extension too (mentioned in M03),
+      which writes <code>py_library</code> deps from your <code>import</code> statements. In large Go repositories almost
+      nobody writes Go BUILD files by hand; they run Gazelle and review the diff.</p>
+    <p>Third-party Go modules (anything in a <code>go.mod</code> <code>require</code> block) come in through Gazelle's
+      <code>go_deps</code> module extension, which reads <code>go.mod</code> and <code>go.sum</code> and creates one
+      repository per module, much like <code>pip.parse</code> does for PyPI in M04. You already have Gazelle in your
+      dependency graph: rules_go 0.65.0 depends on <code>gazelle</code> 0.51.3, which is why <code>bazel mod</code>
+      lists it.</p>
+    <aside class="callout note">
+      <p>This module writes Go BUILD files by hand on purpose: you cannot review what a generator writes until you can
+        write it yourself. Level 2 covers Gazelle and <code>go_deps</code> in depth. Everything here is standard library
+        only.</p>
+    </aside>
+    <aside class="callout pro">
+      <p>Teams that adopt Gazelle usually add a CI check that runs it and fails if the BUILD files change, the same way
+        they check formatting with buildifier. Hand edits and generated edits then never drift apart.</p>
+    </aside>
+    <p><strong>Remember:</strong> Gazelle generates Go (and Python) BUILD files from source; <code>go_deps</code>
+      brings in <code>go.mod</code> dependencies. Both are Level 2 topics.</p>
+  </section>
+
+  <section class="lesson-section" id="practice">
+    <h2>Practice</h2>
+    <p>Exercises run in the simulator: it checks rules, labels, providers, and visibility. It cannot compile Go, so the
+      lab afterwards proves the code really builds, passes its tests, and runs from Python.</p>
+
+    <div class="exercise" data-id="m07-e1" data-title="A Go library, binary, and test">
+      <div class="exercise-prompt">
+        <p>The <code>greet</code> directory has <code>greet.go</code> (<code>package greet</code>, with an exported
+          <code>Hello</code> function) and <code>greet_test.go</code> (also <code>package greet</code>). The
+          <code>cmd/hello</code> directory has <code>main.go</code>, which does
+          <code>import "example.com/practicum/greet"</code>. Neither BUILD file declares anything yet.</p>
+        <ul>
+          <li><code>//greet:greet</code>: a <code>go_library</code> with <code>importpath = "example.com/practicum/greet"</code>, usable from <code>//cmd/hello</code>.</li>
+          <li><code>//greet:greet_test</code>: a <code>go_test</code> for the internal test file.</li>
+          <li><code>//cmd/hello:hello</code>: a <code>go_binary</code> that uses the library.</li>
+        </ul>
+      </div>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "practicum")
+
+bazel_dep(name = "rules_go", version = "0.65.0")
+
+go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk")
+go_sdk.download(version = "1.25.3")
+</textarea>
+<textarea class="file" data-path="greet/BUILD.bazel">
+# Declare the greet library and its test here.
+</textarea>
+<textarea class="file" data-path="cmd/hello/BUILD.bazel">
+# Declare the hello binary here.
+</textarea>
+<textarea class="file" data-path="greet/greet.go" data-readonly>
+package greet
+
+// Hello returns a greeting for name.
+func Hello(name string) string {
+	return "Hello, " + name + "!"
+}
+</textarea>
+<textarea class="file" data-path="greet/greet_test.go" data-readonly>
+package greet
+
+import "testing"
+
+func TestHello(t *testing.T) {
+	if got := Hello("Bazel"); got != "Hello, Bazel!" {
+		t.Errorf("Hello = %q", got)
+	}
+}
+</textarea>
+<textarea class="file" data-path="cmd/hello/main.go" data-readonly>
+package main
+
+import (
+	"fmt"
+
+	"example.com/practicum/greet"
+)
+
+func main() {
+	fmt.Println(greet.Hello("Bazel"))
+}
+</textarea>
+<script type="text/x-python" class="tests">
+def test_greet_is_a_go_library(bazel):
+    t = bazel.target("//greet:greet")
+    assert t.kind == "go_library", f"//greet:greet should be a go_library, but it is a {t.kind}"
+
+def test_the_library_has_the_right_importpath(bazel):
+    ip = bazel.attr("//greet:greet", "importpath")
+    assert ip == "example.com/practicum/greet", f"main.go imports example.com/practicum/greet, so importpath must match; got {ip!r}"
+
+def test_the_test_embeds_the_library(bazel):
+    t = bazel.target("//greet:greet_test")
+    assert t.kind == "go_test", f"//greet:greet_test should be a go_test, but it is a {t.kind}"
+    embed = bazel.query("labels(embed, //greet:greet_test)")
+    assert embed == ["//greet:greet"], f"greet_test.go is in package greet (an internal test): use embed = [\":greet\"], got embed = {embed}"
+
+def test_hello_is_a_go_binary_using_the_library(bazel):
+    t = bazel.target("//cmd/hello:hello")
+    assert t.kind == "go_binary", f"//cmd/hello:hello should be a go_binary, but it is a {t.kind}"
+    deps = bazel.query("labels(deps, //cmd/hello:hello)")
+    assert deps == ["//greet:greet"], f"//cmd/hello:hello should have deps = [\"//greet\"], got {deps}"
+
+def test_everything_builds_and_the_test_is_selected(bazel):
+    result = bazel.test("//...")
+    assert result.ok, "bazel test //... fails:\n" + result.error
+    assert result.tests == ["//greet:greet_test"], f"bazel test //... would run {result.tests}"
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p>Load <code>go_library</code> and <code>go_test</code> in <code>greet/BUILD.bazel</code>, and
+          <code>go_binary</code> in <code>cmd/hello/BUILD.bazel</code>. The library needs <code>importpath</code> and a
+          <code>visibility</code> that admits <code>//cmd/hello</code>. The test file starts with <code>package
+          greet</code>, so it embeds the library.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="greet/BUILD.bazel"><code class="language-starlark">load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "greet",
+    srcs = ["greet.go"],
+    importpath = "example.com/practicum/greet",
+    visibility = ["//cmd/hello:__pkg__"],
+)
+
+go_test(
+    name = "greet_test",
+    srcs = ["greet_test.go"],
+    embed = [":greet"],
+)</code></pre>
+<pre data-path="cmd/hello/BUILD.bazel"><code class="language-starlark">load("@rules_go//go:def.bzl", "go_binary")
+
+go_binary(
+    name = "hello",
+    srcs = ["main.go"],
+    deps = ["//greet"],
+)</code></pre>
+        <p>With real Bazel, <code>bazel run //cmd/hello</code> prints <code>Hello, Bazel!</code>. Without the
+          <code>importpath</code>, the simulator is satisfied but the real compile fails with "missing strict
+          dependencies".</p>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m07-e2" data-title="Fix the test that cannot see its library">
+      <div class="exercise-prompt">
+        <p>With real Bazel, <code>bazel test //...</code> fails to compile <code>//money:money_test</code> with
+          <code>undefined: Cents</code>, a function defined in <code>money.go</code>.</p>
+        <p>The test file starts with <code>package money</code>. Meanwhile <code>//money:report_test</code>, an external
+          test in <code>package money_test</code>, compiles fine. Fix the broken target without touching the working one
+          or any Go file.</p>
+      </div>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "practicum")
+
+bazel_dep(name = "rules_go", version = "0.65.0")
+
+go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk")
+go_sdk.download(version = "1.25.3")
+</textarea>
+<textarea class="file" data-path="money/BUILD.bazel">
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "money",
+    srcs = ["money.go"],
+    importpath = "example.com/practicum/money",
+)
+
+# money_test.go: package money (internal test)
+go_test(
+    name = "money_test",
+    srcs = ["money_test.go"],
+    deps = [":money"],
+)
+
+# report_test.go: package money_test (external test)
+go_test(
+    name = "report_test",
+    srcs = ["report_test.go"],
+    deps = [":money"],
+)
+</textarea>
+<textarea class="file" data-path="money/money.go" data-hidden></textarea>
+<textarea class="file" data-path="money/money_test.go" data-hidden></textarea>
+<textarea class="file" data-path="money/report_test.go" data-hidden></textarea>
+<script type="text/x-python" class="tests">
+def test_the_internal_test_embeds_the_library(bazel):
+    embed = bazel.query("labels(embed, //money:money_test)")
+    assert embed == ["//money:money"], f"money_test.go is in package money: compile it with the library via embed = [\":money\"], got embed = {embed}"
+
+def test_the_internal_test_does_not_also_list_it_in_deps(bazel):
+    deps = bazel.query("labels(deps, //money:money_test)")
+    assert deps == [], f"an embedded library is part of the test's own package; remove it from deps (got {deps})"
+
+def test_the_external_test_is_unchanged(bazel):
+    assert bazel.query("labels(deps, //money:report_test)") == ["//money:money"], "keep deps = [\":money\"] on report_test: an external test imports the library"
+    assert bazel.query("labels(embed, //money:report_test)") == [], "report_test.go is package money_test, so it must not embed the library"
+
+def test_both_tests_are_selected(bazel):
+    result = bazel.test("//...")
+    assert result.ok, "bazel test //... fails:\n" + result.error
+    assert result.tests == ["//money:money_test", "//money:report_test"], f"bazel test //... would run {result.tests}"
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p><code>undefined: Cents</code> inside a <code>package money</code> test means the test was compiled as a
+          separate package from <code>money.go</code>. Which attribute compiles another library's sources into this
+          target?</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="money/BUILD.bazel"><code class="language-starlark">load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "money",
+    srcs = ["money.go"],
+    importpath = "example.com/practicum/money",
+)
+
+# money_test.go: package money (internal test)
+go_test(
+    name = "money_test",
+    srcs = ["money_test.go"],
+    embed = [":money"],
+)
+
+# report_test.go: package money_test (external test)
+go_test(
+    name = "report_test",
+    srcs = ["report_test.go"],
+    deps = [":money"],
+)</code></pre>
+        <p>No <code>visibility</code> is needed: both tests are in the same package as the library.</p>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m07-e3" data-title="Let a Python test run a Go tool">
+      <div class="exercise-prompt">
+        <p><code>tests/slug_test.py</code> (read-only) runs the Go tool <code>//tools/slug</code> and checks its output.
+          It finds the binary with <code>runfiles.Create().Rlocation(os.environ["SLUG_BIN"])</code>. Wire it up:</p>
+        <ul>
+          <li>The test ships the Go binary as a run-time file.</li>
+          <li>The test's environment sets <code>SLUG_BIN</code> to the binary's runfiles path, computed by Bazel (do not
+            hard-code it).</li>
+          <li>The test depends on the rules_python runfiles library.</li>
+          <li><code>bazel build //...</code> succeeds.</li>
+        </ul>
+      </div>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "practicum")
+
+bazel_dep(name = "rules_go", version = "0.65.0")
+bazel_dep(name = "rules_python", version = "2.4.6")
+
+go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk")
+go_sdk.download(version = "1.25.3")
+</textarea>
+<textarea class="file" data-path="tests/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_test")
+
+py_test(
+    name = "slug_test",
+    srcs = ["slug_test.py"],
+)
+</textarea>
+<textarea class="file" data-path="tools/slug/BUILD.bazel">
+load("@rules_go//go:def.bzl", "go_binary")
+
+go_binary(
+    name = "slug",
+    srcs = ["main.go"],
+)
+</textarea>
+<textarea class="file" data-path="tests/slug_test.py" data-readonly>
+import os
+import subprocess
+import unittest
+
+from python.runfiles import runfiles
+
+
+class SlugTest(unittest.TestCase):
+    def test_slug(self) -> None:
+        slug = runfiles.Create().Rlocation(os.environ["SLUG_BIN"])
+        out = subprocess.run([slug, "Hello, Bazel World"], capture_output=True, text=True, check=True)
+        self.assertEqual(out.stdout, "hello-bazel-world\n")
+
+
+if __name__ == "__main__":
+    unittest.main()
+</textarea>
+<textarea class="file" data-path="tools/slug/main.go" data-hidden></textarea>
+<script type="text/x-python" class="tests">
+def test_the_binary_is_a_data_dependency(bazel):
+    data = bazel.query("labels(data, //tests:slug_test)")
+    assert data == ["//tools/slug:slug"], f"labels(data, //tests:slug_test) should be //tools/slug:slug, got {data}"
+
+def test_the_binary_is_not_in_deps(bazel):
+    deps = bazel.query("labels(deps, //tests:slug_test)")
+    assert "//tools/slug:slug" not in deps, "a Go binary has no PyInfo: it belongs in data, not deps"
+
+def test_slug_bin_comes_from_rlocationpath(bazel):
+    env = bazel.attr("//tests:slug_test", "env") or {}
+    value = env.get("SLUG_BIN", "")
+    assert value.replace(" ", "") in ("$(rlocationpath//tools/slug)", "$(rlocationpath//tools/slug:slug)"), f"set env = {{\"SLUG_BIN\": \"$(rlocationpath //tools/slug)\"}}, got SLUG_BIN = {value!r}"
+
+def test_the_test_uses_the_runfiles_library(bazel):
+    deps = bazel.query("deps(//tests:slug_test, 1)")
+    assert "@rules_python//python/runfiles:runfiles" in deps, "add @rules_python//python/runfiles to deps (the test imports python.runfiles)"
+
+def test_everything_builds(bazel):
+    result = bazel.build("//...")
+    assert result.ok, "bazel build //... fails:\n" + result.error
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p>Three attributes on the <code>py_test</code>: <code>data</code>, <code>env</code>, and <code>deps</code>.
+          Then build: <code>//tools/slug</code> is private to its package, so it also needs a <code>visibility</code>
+          that admits <code>//tests</code>.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="tests/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_test")
+
+py_test(
+    name = "slug_test",
+    srcs = ["slug_test.py"],
+    data = ["//tools/slug"],
+    env = {"SLUG_BIN": "$(rlocationpath //tools/slug)"},
+    deps = ["@rules_python//python/runfiles"],
+)</code></pre>
+<pre data-path="tools/slug/BUILD.bazel"><code class="language-starlark">load("@rules_go//go:def.bzl", "go_binary")
+
+go_binary(
+    name = "slug",
+    srcs = ["main.go"],
+    visibility = ["//tests:__pkg__"],
+)</code></pre>
+        <p>Real Bazel expands <code>SLUG_BIN</code> to <code>_main/tools/slug/slug_/slug</code>. Forget
+          <code>data</code> and real Bazel stops at analysis: "label '//tools/slug:slug' in $(location) expression is
+          not a declared prerequisite of this rule".</p>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m07-e4" data-title="Untangle a polyglot deps list">
+      <div class="exercise-prompt">
+        <p>The <code>rates</code> package has a Python library and a Go library side by side. Someone wired the
+          consumers by guessing, and <code>bazel build //...</code> now fails with two provider errors (run it under
+          "Try commands").</p>
+        <ul>
+          <li><code>//cmd/convert</code>, a Go binary, imports <code>example.com/practicum/rates</code>: it must depend on the Go library.</li>
+          <li><code>//report:report</code>, a Python program, calls the <code>convert</code> binary with
+            <code>subprocess</code>: it must get it as a run-time file, not as code.</li>
+        </ul>
+        <p>Do not change <code>rates/BUILD.bazel</code>.</p>
+      </div>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "practicum")
+
+bazel_dep(name = "rules_go", version = "0.65.0")
+bazel_dep(name = "rules_python", version = "2.4.6")
+
+go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk")
+go_sdk.download(version = "1.25.3")
+</textarea>
+<textarea class="file" data-path="rates/BUILD.bazel" data-readonly>
+load("@rules_go//go:def.bzl", "go_library")
+load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "rates",
+    srcs = ["rates.py"],
+    visibility = ["//visibility:public"],
+)
+
+go_library(
+    name = "rates_go",
+    srcs = ["rates.go"],
+    importpath = "example.com/practicum/rates",
+    visibility = ["//visibility:public"],
+)
+</textarea>
+<textarea class="file" data-path="cmd/convert/BUILD.bazel">
+load("@rules_go//go:def.bzl", "go_binary")
+
+go_binary(
+    name = "convert",
+    srcs = ["main.go"],
+    visibility = ["//report:__pkg__"],
+    deps = ["//rates"],
+)
+</textarea>
+<textarea class="file" data-path="report/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "report",
+    srcs = ["report.py"],
+    deps = [
+        "//cmd/convert",
+        "//rates",
+        "@rules_python//python/runfiles",
+    ],
+)
+</textarea>
+<textarea class="file" data-path="rates/rates.py" data-hidden></textarea>
+<textarea class="file" data-path="rates/rates.go" data-hidden></textarea>
+<textarea class="file" data-path="cmd/convert/main.go" data-hidden></textarea>
+<textarea class="file" data-path="report/report.py" data-hidden></textarea>
+<script type="text/x-python" class="tests">
+def test_convert_depends_on_the_go_library(bazel):
+    deps = bazel.query("labels(deps, //cmd/convert)")
+    assert deps == ["//rates:rates_go"], f"//cmd/convert imports example.com/practicum/rates, which is //rates:rates_go; got deps = {deps}"
+
+def test_report_runs_convert_as_data(bazel):
+    data = bazel.query("labels(data, //report)")
+    assert "//cmd/convert:convert" in data, "//report:report runs the Go binary, so list //cmd/convert in its data"
+    deps = bazel.query("labels(deps, //report)")
+    assert "//cmd/convert:convert" not in deps, "a go_binary has no PyInfo: remove //cmd/convert from deps"
+
+def test_report_keeps_its_python_deps(bazel):
+    deps = bazel.query("labels(deps, //report)")
+    assert "//rates:rates" in deps, "report.py still imports the Python rates library: keep //rates in deps"
+
+def test_everything_builds(bazel):
+    result = bazel.build("//...")
+    assert result.ok, "bazel build //... fails:\n" + result.error
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p><code>//rates</code> is short for <code>//rates:rates</code>, the <em>Python</em> library. Each error names
+          the attribute and the provider it wanted: <code>GoInfo</code> for the Go binary's <code>deps</code>,
+          <code>PyInfo</code> for the Python binary's.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="cmd/convert/BUILD.bazel"><code class="language-starlark">load("@rules_go//go:def.bzl", "go_binary")
+
+go_binary(
+    name = "convert",
+    srcs = ["main.go"],
+    visibility = ["//report:__pkg__"],
+    deps = ["//rates:rates_go"],
+)</code></pre>
+<pre data-path="report/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "report",
+    srcs = ["report.py"],
+    data = ["//cmd/convert"],
+    deps = [
+        "//rates",
+        "@rules_python//python/runfiles",
+    ],
+)</code></pre>
+        <p>To find the binary at run time, <code>report</code> would also set
+          <code>env = {"CONVERT_BIN": "$(rlocationpath //cmd/convert)"}</code>, as in exercise 3.</p>
+      </details>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="lab">
+    <h2>Lab: a Go tool tested from Python</h2>
+    <p>The exercises proved the graph is well formed. Only real Bazel can show the parts that matter most for Go: the
+      compiler accepting your imports, <code>embed</code> making an internal test compile, the hermetic SDK downloading,
+      and a Python test finding and running the compiled binary through its runfiles.</p>
+
+    <div class="lab" data-id="m07-lab1" data-title="A Go tool tested from Python">
+      <div class="lab-prompt">
+        <p>The <code>wordtools</code> workspace has a Go library <code>//textutil</code> with an internal test, an empty
+          <code>tools/wc</code> package with the source of a Go word counter, and a Python test,
+          <code>//tests:wc_test</code>, that runs the counter. Make all of it work:</p>
+        <ul>
+          <li><code>bazel run //tools/wc -- "to be or" "not to be"</code> prints <code>2 lines, 6 words</code>.</li>
+          <li><code>bazel test //...</code> passes: the Go unit test, the Python test, and a grader's external Go test
+            that imports <code>example.com/wordtools/textutil</code> from another package.</li>
+          <li><code>bazel query 'kind(go_.*, //...)'</code> shows a library, a binary, and two tests.</li>
+        </ul>
+        <ul class="checklist" data-id="m07-lab1-steps">
+          <li>Run <code>pixi run start m07-lab1</code>, then <code>cd work/m07-lab1</code></li>
+          <li>Run <code>pixi run bazel test //textutil:all</code>. The first run downloads Go 1.25.3 and compiles the standard library; then read the compile error</li>
+          <li>Fix <code>//textutil:textutil_test</code> (look at the <code>package</code> line of <code>count_test.go</code>)</li>
+          <li>Declare the <code>go_binary</code> in <code>tools/wc/BUILD.bazel</code> and try <code>pixi run bazel run //tools/wc -- "to be or" "not to be"</code></li>
+          <li>Give <code>//tests:wc_test</code> the binary and its runfiles path (read <code>tests/wc_test.py</code> for the variable name)</li>
+          <li>Run <code>pixi run bazel test //...</code>, then edit <code>tools/wc/main.go</code> and run it again: which tests are <code>(cached)</code>?</li>
+          <li>From the repository root, run <code>pixi run grade m07-lab1</code></li>
+        </ul>
+      </div>
+      <details class="hint"><summary>Hint</summary>
+        <p>Three files change, all BUILD files. The library's import path is in its <code>importpath</code>; the binary
+          needs it in <code>deps</code> and must be visible to <code>//tests</code>. The Python test reads
+          <code>WC_BIN</code>; Bazel computes the value with <code>$(rlocationpath //tools/wc)</code>, which also
+          requires <code>//tools/wc</code> in <code>data</code>.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-label="textutil/BUILD.bazel"><code class="language-starlark">load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "textutil",
+    srcs = ["count.go"],
+    importpath = "example.com/wordtools/textutil",
+    visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "textutil_test",
+    srcs = ["count_test.go"],
+    embed = [":textutil"],
+)</code></pre>
+<pre data-label="tools/wc/BUILD.bazel"><code class="language-starlark">load("@rules_go//go:def.bzl", "go_binary")
+
+go_binary(
+    name = "wc",
+    srcs = ["main.go"],
+    visibility = ["//visibility:public"],
+    deps = ["//textutil"],
+)</code></pre>
+<pre data-label="tests/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_test")
+
+py_test(
+    name = "wc_test",
+    srcs = ["wc_test.py"],
+    data = ["//tools/wc"],
+    env = {"WC_BIN": "$(rlocationpath //tools/wc)"},
+    deps = ["@rules_python//python/runfiles"],
+)</code></pre>
+        <p>After editing <code>main.go</code>, only <code>//tests:wc_test</code> runs again; both Go tests report
+          <code>(cached) PASSED</code> because they do not depend on the binary.</p>
+      </details>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="quiz">
+    <h2>Quiz</h2>
+    <div class="quiz" data-id="m07-quiz">
+<script type="application/json">
+{"title": "rules_go quiz", "passScore": 0.7, "questions": [
+  {"type": "single", "prompt": "Which Go function can another package call?", "code": "package textutil\n\nfunc Words(s string) int { return len(strings.Fields(s)) }\nfunc split(s string) []string { return strings.Fields(s) }", "lang": "none", "options": ["Both: Go has no private functions", "Only <code>Words</code>: capitalized names are exported", "Only <code>split</code>: lowercase names are public", "Neither, without an <code>__all__</code> list"], "answer": 1, "explanation": "<p>In Go, a name that starts with a capital letter is exported from its package; a lowercase name is private, and the compiler enforces it: calling <code>textutil.split</code> from another package does not compile.</p>"},
+  {"type": "single", "prompt": "Which MODULE.bazel lines pin Go 1.25.3 for every Go target?", "options": ["<code>go_sdk = use_extension(\"@rules_go//go:extensions.bzl\", \"go_sdk\")</code> and <code>go_sdk.download(version = \"1.25.3\")</code>", "The same two lines plus <code>use_repo(go_sdk, \"go_sdk\")</code>", "<code>bazel_dep(name = \"go\", version = \"1.25.3\")</code>", "Nothing: Bazel uses the <code>go</code> on PATH"], "answer": 0, "explanation": "<p>The <code>go_sdk</code> extension registers the SDK as a toolchain; no <code>use_repo</code> is needed. Adding <code>use_repo(go_sdk, \"go_sdk\")</code> fails with <code>module extension ... does not generate repository \"go_sdk\"</code>.</p>"},
+  {"type": "single", "prompt": "Your laptop has Go 1.24 installed system-wide. The workspace pins <code>go_sdk.download(version = \"1.25.3\")</code>. Which Go compiles <code>//tools/wc</code>?", "options": ["1.24, from PATH", "1.25.3, downloaded by rules_go", "Whichever is newer", "The build fails until you install 1.25.3"], "answer": 1, "explanation": "<p>The SDK is hermetic: rules_go downloads it into Bazel's cache and toolchain resolution picks it. The system Go is never consulted, and you do not need one installed.</p>"},
+  {"type": "single", "prompt": "<code>main.go</code> says <code>import \"example.com/shop/money\"</code>. The <code>go_binary</code> lists <code>deps = [\"//money\"]</code>, but <code>//money</code> has <code>importpath = \"example.com/shop/currency\"</code>. What happens?", "options": ["It builds: Bazel matches deps by label", "Analysis fails: no such target", "Compilation fails: missing strict dependencies ... import of \"example.com/shop/money\"", "It builds but crashes at run time"], "answer": 2, "explanation": "<p>rules_go matches each <code>import</code> to a dependency by <code>importpath</code>. No dependency provides <code>example.com/shop/money</code>, so the compile action fails with \"Check that imports in Go sources match importpath attributes in deps.\"</p>"},
+  {"type": "single", "prompt": "<code>count_test.go</code> begins with <code>package textutil</code>. Which <code>go_test</code> is right?", "options": ["<code>go_test(name = \"t\", srcs = [\"count_test.go\"], deps = [\":textutil\"])</code>", "<code>go_test(name = \"t\", srcs = [\"count_test.go\"], embed = [\":textutil\"])</code>", "<code>go_test(name = \"t\", srcs = [\"count_test.go\", \"count.go\"], deps = [\":textutil\"])</code>", "<code>go_test(name = \"t\", srcs = [\"count_test.go\"], data = [\":textutil\"])</code>"], "answer": 1, "explanation": "<p>An internal test is part of the package it tests, so it must be compiled together with the library: <code>embed</code>. With <code>deps</code> the library is a separate package and the compile fails with <code>undefined: Words</code>. Listing <code>count.go</code> in two targets' <code>srcs</code> would also compile it twice.</p>"},
+  {"type": "multi", "prompt": "A test file starts with <code>package textutil_test</code>. Which statements are true? Select all that apply.", "options": ["It is an external test", "It should list the library in <code>deps</code>", "It can call lowercase helpers of <code>textutil</code>", "It imports the library by its import path", "It must use <code>embed</code>"], "answer": [0, 1, 3], "explanation": "<p>A <code>_test</code> package is a separate package that uses the library like any client: by import path, through <code>deps</code>, and only its exported names.</p>"},
+  {"type": "single", "prompt": "Does this analyze?", "code": "go_binary(\n    name = \"wc\",\n    srcs = [\"main.go\"],\n    deps = [\"//textutil\", \"//pylib:helpers\"],  # helpers is a py_library\n)", "lang": "starlark", "options": ["Yes: deps can be any target", "No: '//pylib:helpers' does not have mandatory providers: 'GoInfo'", "No: missing strict dependencies", "Yes, but the Python file is ignored"], "answer": 1, "explanation": "<p>Each rule declares which providers its <code>deps</code> must have. Go's <code>deps</code> need <code>GoInfo</code>, which only Go targets provide. This is caught at analysis, before anything compiles.</p>"},
+  {"type": "single", "prompt": "A <code>py_test</code> runs the Go binary <code>//tools/wc</code> with <code>subprocess</code>. Where does <code>//tools/wc</code> go?", "options": ["<code>deps</code>", "<code>srcs</code>", "<code>data</code>", "<code>embed</code>"], "answer": 2, "explanation": "<p>A program the test runs is a run-time file. <code>data</code> requires no provider, so it accepts targets in any language, and puts the binary in the test's runfiles. <code>deps</code> would fail with a <code>PyInfo</code> provider error.</p>"},
+  {"type": "text", "prompt": "In the workspace from this module, what string does <code>$(rlocationpath //tools/wc)</code> expand to?", "answer": ["_main/tools/wc/wc_/wc"], "explanation": "<p>The repository (<code>_main</code>), the package, and rules_go's output layout: binaries live in a <code>&lt;name&gt;_</code> directory. That last part is exactly why you let Bazel compute the path instead of hard-coding it.</p>"},
+  {"type": "single", "prompt": "<code>env = {\"WC_BIN\": \"$(rlocationpath //tools/wc)\"}</code> is set, but <code>data</code> is empty. What does real Bazel do?", "options": ["Sets WC_BIN to an empty string", "Analysis fails: label '//tools/wc:wc' in $(location) expression is not a declared prerequisite of this rule", "Builds //tools/wc automatically", "The test fails at run time with FileNotFoundError"], "answer": 1, "explanation": "<p>Location variables may only name labels the target already depends on, so the mistake is caught during analysis. Add <code>data = [\"//tools/wc\"]</code>.</p>"},
+  {"type": "output", "prompt": "What does <code>bazel query 'kind(go_.*, //...)'</code> print?", "code": "# textutil/BUILD.bazel\ngo_library(name = \"textutil\", srcs = [\"count.go\"], importpath = \"example.com/p/textutil\")\ngo_test(name = \"textutil_test\", srcs = [\"count_test.go\"], embed = [\":textutil\"])\n\n# tools/wc/BUILD.bazel\ngo_binary(name = \"wc\", srcs = [\"main.go\"], deps = [\"//textutil\"])\n\n# tests/BUILD.bazel\npy_test(name = \"wc_test\", srcs = [\"wc_test.py\"], data = [\"//tools/wc\"])", "lang": "starlark", "answer": "//textutil:textutil\n//textutil:textutil_test\n//tools/wc:wc", "explanation": "<p><code>kind</code> matches the rule class by regular expression, so <code>go_.*</code> picks up <code>go_library</code>, <code>go_test</code>, and <code>go_binary</code> but not the <code>py_test</code>. Output is sorted by label.</p>"},
+  {"type": "single", "prompt": "You edit only <code>tools/wc/main.go</code> and run <code>bazel test //...</code>. The Go unit test of <code>//textutil</code> and the Python <code>//tests:wc_test</code> both passed before. What runs?", "options": ["Both tests", "Only the Go unit test", "Only <code>//tests:wc_test</code>; the Go unit test is <code>(cached)</code>", "Neither: tests never re-run without bazel clean"], "answer": 2, "explanation": "<p>The Python test depends on <code>//tools/wc</code> through <code>data</code>, so it is downstream of <code>main.go</code>. The <code>//textutil</code> test is not. One graph across languages gives precise reruns.</p>"},
+  {"type": "single", "prompt": "What is Gazelle?", "options": ["Go's package manager", "A tool that generates and updates BUILD files from Go (and Python) sources", "A replacement for rules_go", "The Go test runner rules_go uses"], "answer": 1, "explanation": "<p>Gazelle reads imports and <code>package</code> lines and writes <code>go_library</code>, <code>go_test</code>, <code>deps</code>, and <code>embed</code> for you. Its <code>go_deps</code> extension brings in <code>go.mod</code> dependencies. Level 2 covers both.</p>"},
+  {"type": "single", "prompt": "Where does <code>bazel build //tools/wc</code> put the Go executable?", "options": ["<code>bazel-bin/tools/wc/wc</code>", "<code>bazel-bin/tools/wc/wc_/wc</code>", "<code>$GOPATH/bin/wc</code>", "<code>tools/wc/wc</code> in your source tree"], "answer": 1, "explanation": "<p>rules_go writes each binary into a <code>&lt;name&gt;_</code> directory under <code>bazel-bin</code>. Use <code>bazel run</code>, or <code>$(rlocationpath)</code> from another target, instead of depending on that layout.</p>"}
+]}
+</script>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="recap">
+    <h2>Recap</h2>
+    <ul>
+      <li>A second language is where Bazel shines: one graph, one cache, and one <code>bazel test //...</code> across Go and Python, with precise reruns.</li>
+      <li>Go basics: one directory is one package; capitalized names are exported; programs are <code>package main</code> with <code>func main()</code>; tests are <code>TestXxx(t *testing.T)</code> in <code>_test.go</code> files.</li>
+      <li><code>bazel_dep(name = "rules_go", version = "0.65.0")</code> plus <code>go_sdk.download(version = "1.25.3")</code> gives a hermetic Go; no <code>use_repo</code>, no system Go.</li>
+      <li><code>go_library</code> needs an <code>importpath</code>; every import of your own code needs a matching <code>deps</code> entry, or the compile fails with "missing strict dependencies".</li>
+      <li>Internal tests (<code>package X</code>) <code>embed</code> the library; external tests (<code>package X_test</code>) list it in <code>deps</code>.</li>
+      <li><code>deps</code> is per language (<code>GoInfo</code>, <code>PyInfo</code>); <code>data</code> crosses languages.</li>
+      <li>To run a Go tool from Python: <code>data = ["//tool"]</code>, <code>env = {"BIN": "$(rlocationpath //tool)"}</code>, and <code>Rlocation()</code> from the runfiles library.</li>
+      <li>Gazelle generates Go and Python BUILD files; <code>go_deps</code> brings in third-party Go modules. Both come in Level 2.</li>
+    </ul>
+    <div class="flashcards" data-title="rules_go review">
+<script type="application/json">
+[
+  {"front": "How does Go mark a name public?", "back": "A capital first letter (Words). Lowercase names are private to the package."},
+  {"front": "Which two MODULE.bazel lines pin the Go SDK?", "back": "go_sdk = use_extension(\"@rules_go//go:extensions.bzl\", \"go_sdk\") and go_sdk.download(version = \"1.25.3\"). No use_repo."},
+  {"front": "What does <code>importpath</code> do?", "back": "It is the string other Go code writes in import \"...\" to use this go_library. rules_go matches imports to deps by it."},
+  {"front": "\"missing strict dependencies ... import of X\" means?", "back": "No target in deps has importpath X: add the dependency or fix the importpath."},
+  {"front": "<code>embed</code> or <code>deps</code> for a go_test?", "back": "Test file in package X (internal): embed = [\":lib\"]. In package X_test (external): deps = [\":lib\"]."},
+  {"front": "<code>undefined: Words</code> in an internal test usually means?", "back": "The library is in deps instead of embed, so the test is compiled as a separate package."},
+  {"front": "\"does not have mandatory providers: 'GoInfo'\" means?", "back": "A non-Go target (such as a py_library) is in a Go target's deps. deps stays within one language."},
+  {"front": "How does a py_test get a Go binary?", "back": "data = [\"//tools/wc\"]; env = {\"WC_BIN\": \"$(rlocationpath //tools/wc)\"}; runfiles.Create().Rlocation(os.environ[\"WC_BIN\"])."},
+  {"front": "Why not hard-code <code>_main/tools/wc/wc</code>?", "back": "rules_go puts the binary at _main/tools/wc/wc_/wc. $(rlocationpath) asks the rule instead of guessing its layout."},
+  {"front": "How do you pass <code>-test.v</code> to a Go test?", "back": "bazel test //pkg:all --test_arg=-test.v --test_output=all"},
+  {"front": "What is Gazelle?", "back": "A BUILD file generator for Go (and Python) from the rules_go authors. go_deps, its extension, imports go.mod dependencies."}
+]
+</script>
+    </div>
+    <h3>Going further</h3>
+    <ul>
+      <li><a href="https://github.com/bazel-contrib/rules_go">rules_go on GitHub</a>, and its <a href="https://github.com/bazel-contrib/rules_go/blob/master/docs/go/core/rules.md">rule reference</a> (<code>go_library</code>, <code>go_binary</code>, <code>go_test</code>)</li>
+      <li><a href="https://github.com/bazel-contrib/rules_go/blob/master/docs/go/core/bzlmod.md">Go with Bzlmod</a>: the <code>go_sdk</code> extension and its tags</li>
+      <li><a href="https://github.com/bazel-contrib/rules_go/blob/master/docs/go/core/embedding.md">Embedding</a> in rules_go: how <code>embed</code> works</li>
+      <li><a href="https://go.dev/doc/tutorial/getting-started">Go tutorial: Get started with Go</a> and <a href="https://go.dev/doc/tutorial/add-a-test">Add a test</a> on go.dev</li>
+      <li><a href="https://bazel.build/reference/be/make-variables#predefined_label_variables">Predefined label variables</a> (<code>$(rlocationpath)</code> and friends) on bazel.build</li>
+      <li><a href="https://bazel.build/extending/rules#runfiles">Runfiles</a> on bazel.build</li>
+      <li><a href="https://github.com/bazel-contrib/bazel-gazelle">Gazelle</a>, for when you are ready to generate BUILD files</li>
+      <li><a href="https://registry.bazel.build/modules/rules_go">rules_go on the Bazel Central Registry</a></li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>

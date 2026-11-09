@@ -1,0 +1,6 @@
+# Keep action outputs and test results in a cache that survives `bazel clean`
+# (and is shared by every workspace on this machine).
+build --disk_cache=~/.cache/bazel-disk
+
+# Show the output of failing tests.
+test --test_output=errors

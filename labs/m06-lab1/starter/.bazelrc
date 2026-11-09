@@ -1,0 +1,5 @@
+# Workspace-wide Bazel options for the deploy workspace.
+# Add a named configuration here so that `--config=prod` means "production build".
+
+# Personal settings that should not be committed go in user.bazelrc.
+try-import %workspace%/user.bazelrc

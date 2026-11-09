@@ -1,0 +1,13 @@
+load("@rules_python//python:pip.bzl", "compile_pip_requirements")
+
+# bazel run //:requirements.update  rewrites requirements_lock.txt from requirements.in.
+# Tagged manual so `bazel test //...` does not run the network-bound lock check.
+compile_pip_requirements(
+    name = "requirements",
+    src = "requirements.in",
+    requirements_txt = "requirements_lock.txt",
+    tags = ["manual"],
+)
+
+# TODO(M3): a test_suite named "fast" (the four fast tests in the monorepo) and a
+#           test_suite named "slow" (the exhaustive test) that //... does not run.

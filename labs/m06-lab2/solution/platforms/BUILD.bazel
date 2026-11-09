@@ -1,0 +1,24 @@
+# A constraint the standard @platforms module does not know about: does the machine have a GPU?
+constraint_setting(
+    name = "accelerator",
+    default_constraint_value = ":cpu_only",
+)
+
+constraint_value(
+    name = "cpu_only",
+    constraint_setting = ":accelerator",
+    visibility = ["//visibility:public"],
+)
+
+constraint_value(
+    name = "gpu",
+    constraint_setting = ":accelerator",
+    visibility = ["//visibility:public"],
+)
+
+# This machine's platform, plus a GPU.
+platform(
+    name = "gpu_host",
+    parents = ["@platforms//host"],
+    constraint_values = [":gpu"],
+)

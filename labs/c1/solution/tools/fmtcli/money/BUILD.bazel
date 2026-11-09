@@ -1,0 +1,16 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "money",
+    srcs = ["money.go"],
+    importpath = "example.com/harbor/tools/fmtcli/money",
+    visibility = ["//tools/fmtcli:__pkg__"],
+)
+
+# An internal test (package money): compiled together with the library.
+go_test(
+    name = "money_test",
+    size = "small",
+    srcs = ["money_test.go"],
+    embed = [":money"],
+)

@@ -1,0 +1,8 @@
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+sh_test(
+    name = "page_test",
+    srcs = ["page_test.sh"],
+    args = ["$(rootpath //docs:page)"],
+    data = ["//docs:page"],
+)

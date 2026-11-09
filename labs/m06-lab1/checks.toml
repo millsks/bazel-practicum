@@ -1,0 +1,43 @@
+[[check]]
+name = "the default build prints the dev banner"
+command = ["run", "//app:banner"]
+stdout_equals = "Welcome to DEV: data resets nightly."
+message = "Run `pixi run bazel run //app:banner` in work/m06-lab1. With no flags, only banners/dev.txt should be in the runfiles."
+
+[[check]]
+name = "--//config:env=prod prints the production banner"
+command = ["run", "//app:banner", "--//config:env=prod"]
+stdout_equals = "Welcome to PRODUCTION."
+message = "Declare string_flag(name = \"env\") in config/BUILD.bazel, a config_setting with flag_values = {\":env\": \"prod\"}, and select() the data file on it."
+
+[[check]]
+name = "--//config:env=staging prints the staging banner"
+command = ["run", "//app:banner", "--//config:env=staging"]
+stdout_equals = "Welcome to STAGING: release candidates only."
+message = "Add a config_setting for staging and a branch for it in the select()."
+
+[[check]]
+name = "the flag rejects values it does not know"
+command = ["build", "//app:banner", "--//config:env=qa"]
+expect = "failure"
+output_contains = ["invalid value 'qa'"]
+message = "List the allowed values on the string_flag: values = [\"dev\", \"staging\", \"prod\"]."
+
+[[check]]
+name = "--config=prod from .bazelrc selects the production banner"
+command = ["run", "//app:banner", "--config=prod"]
+stdout_equals = "Welcome to PRODUCTION."
+message = "Add `build:prod --//config:env=prod` to .bazelrc."
+
+[[check]]
+name = "--config=prod also builds optimized"
+command = ["cquery", "//app:banner", "--config=prod", "--output=files"]
+stdout_contains = ["bazel-out/k8-opt/bin/app/banner"]
+message = "Add `build:prod -c opt` to .bazelrc so production builds use compilation mode opt."
+
+[[check]]
+name = "cquery shows only the production banner under --config=prod"
+command = ["cquery", "labels(data, //app:banner)", "--config=prod"]
+stdout_contains = ["//app:banners/prod.txt"]
+stdout_lacks = ["dev.txt", "staging.txt"]
+message = "cquery resolves select(); with --config=prod only banners/prod.txt should be a data dependency."

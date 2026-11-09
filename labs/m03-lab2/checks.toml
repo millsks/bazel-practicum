@@ -1,0 +1,20 @@
+[[check]]
+name = "the textstats package analyzes"
+command = ["build", "//libs/textstats:all"]
+message = "Run `pixi run bazel build //libs/textstats:all` and read the first ERROR line. Which file does py_test look for when `main` is not set?"
+
+[[check]]
+name = "the textstats tests pass"
+command = ["test", "//libs/textstats:all", "--test_output=errors"]
+message = "If the log says `No module named 'textstats'`, sys.path does not contain libs/textstats/src yet. Which py_library attribute adds it?"
+
+[[check]]
+name = "another package can use textstats"
+command = ["test", "//grading:textstats_api_test", "--test_output=errors"]
+message = "The grader adds //grading:textstats_api_test, which depends on //libs/textstats. Make the library visible outside its package."
+
+[[check]]
+name = "bazel run //apps/wordcount prints word statistics"
+command = ["run", "//apps/wordcount"]
+stdout_equals = "5 words, 4 unique"
+message = "Run `pixi run bazel run //apps/wordcount` in work/m03-lab2."

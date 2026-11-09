@@ -1,0 +1,4 @@
+# Build settings for the deploy workspace.
+#
+# Declare a string_flag named "env" here (values dev, staging, prod; default dev),
+# plus one config_setting per non-default value for //app to select() on.

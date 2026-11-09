@@ -1,0 +1,829 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Capstone 1 · Polyglot Monorepo · Bazel Practicum</title>
+<link rel="stylesheet" href="../assets/css/course.css">
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/viz.js" defer></script>
+<script src="../assets/js/viz-bazel.js" defer></script>
+<script src="../assets/js/course.js" defer></script>
+</head>
+<body data-root="../" data-module="c1">
+<main class="lesson">
+  <header class="lesson-hero">
+    <p class="eyebrow">Stage 2 · Growing the Monorepo · Capstone 1</p>
+    <h1>Capstone 1: Polyglot Monorepo</h1>
+    <p class="lede">Harbor Supply is a small company with one repository: a Python pricing library, a quote service
+      that uses it, a Go tool that formats money, and a product catalog that becomes Python code at build time.
+      Somebody started moving it to Bazel and stopped halfway. You finish the job, and real Bazel grades every part
+      of Level 1 along the way.</p>
+    <div class="lesson-meta"><span>⏱ ~6–8 hours</span><span>Prerequisites: <a href="../modules/m01-workspaces-targets.html">M01</a> to <a href="../modules/m09-query-debugging.html">M09</a></span></div>
+    <ul class="objectives">
+      <li>Lay out a monorepo as Bazel packages with deliberate, narrow visibility, and prove the boundaries hold</li>
+      <li>Declare every rule set in <code>MODULE.bazel</code>, and pull a PyPI package through <code>pip.parse</code> with a hashed lock</li>
+      <li>Ship data and a Go binary to Python code through runfiles, <code>data</code>, and <code>$(rlocationpath)</code></li>
+      <li>Keep tests sized, cached, and grouped, with a slow test that <code>//...</code> skips</li>
+      <li>Choose data at build time with a <code>string_flag</code>, <code>select()</code>, and <code>.bazelrc</code> configs</li>
+      <li>Generate Python code with <code>run_binary</code> and guard it with a <code>diff_test</code> golden file</li>
+      <li>Use <code>bazel query</code> to prove the dependency graph has the shape the design says it has</li>
+    </ul>
+  </header>
+
+  <section class="lesson-section" id="scenario">
+    <h2>The scenario</h2>
+    <aside class="callout python">
+      <p>Today Harbor's repository works the way many Python repositories do. The service imports the library through
+        an editable install. A <code>Makefile</code> runs <code>go build</code> before the Python tests that call the
+        Go tool. A script turns <code>catalog.csv</code> into <code>catalog.py</code>, and somebody remembers to run it
+        (usually). A <code>REGION</code> environment variable picks US or EU prices at run time. Nothing stops the
+        reporting script from importing the pricing internals, and nobody knows which tests a catalog change can
+        break.</p>
+    </aside>
+    <p>After the move to Bazel, all of that is in one graph. You will be able to say, with a command and not a
+      guess:</p>
+    <ul>
+      <li>which packages may use the pricing library (only services), and get a build error if anything else tries;</li>
+      <li>that the catalog module is always regenerated when the CSV or the generator changes, and never checked in;</li>
+      <li>that the Python quote test gets the Go binary it needs, built for this machine, with no <code>Makefile</code>;</li>
+      <li>that a US build and an EU build differ in exactly one data file, chosen at build time;</li>
+      <li>which tests a change to <code>catalog.csv</code> affects (four Python tests, no Go test).</li>
+    </ul>
+    <p>The application code is small and already written. Your work is almost all Bazel: <code>MODULE.bazel</code>,
+      <code>.bazelrc</code>, and BUILD files. When you need to change a <code>.py</code> or <code>.go</code> file,
+      something is wrong in a BUILD file instead.</p>
+
+    <h3>What the finished program does</h3>
+    <p><code>//services/quote</code> prices an order with <code>//libs/pricing</code>, asks the Go tool to format each
+      amount in the region's currency, and prints a table. Here it is in the reference solution, in the default
+      region and then with <code>--config=eu</code>:</p>
+<pre data-label="Terminal"><code class="language-bash">pixi run bazel run //services/quote -- WIDGET=2 GADGET
+pixi run bazel run //services/quote --config=eu -- WIDGET=2 GADGET GIZMO=3</code></pre>
+<pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">Quote for region us (USD)
+
+item      qty    unit    total
+------  -----  ------  -------
+Gadget      1  $12.50   $12.50
+Widget      2   $4.99    $9.98
+
+subtotal  $22.48
+tax 8%    $1.80
+total     $24.28
+
+Quote for region eu (EUR)
+
+item      qty        unit         total
+------  -----  ----------  ------------
+Gadget      1   EUR 12,50     EUR 12,50
+Gizmo       3  EUR 999,99  EUR 2.999,97
+Widget      2    EUR 4,99      EUR 9,98
+
+subtotal  EUR 3.022,45
+tax 20%   EUR 604,49
+total     EUR 3.626,94</code></pre>
+    <p>(Bazel's own <code>INFO</code> lines go to stderr and are not shown.) The table comes from
+      <a href="https://pypi.org/project/tabulate/"><code>tabulate</code></a>, a small pure-Python package from PyPI.
+      The currency formatting comes from Go. The prices come from a module Bazel generates from a CSV file. The tax
+      rate comes from a JSON file chosen by a build flag.</p>
+  </section>
+
+  <section class="lesson-section" id="starting-point">
+    <h2>The starting point</h2>
+    <p>Start the capstone like any lab. It copies the starter workspace into <code>work/c1/</code>:</p>
+<pre data-label="Terminal"><code class="language-bash">pixi run start c1
+cd work/c1
+pixi run bazel build //...</code></pre>
+    <p>Here is what you get. Files marked <em>done</em> need no changes; everything else needs work.</p>
+<pre data-label="work/c1/"><code class="language-none">.bazelversion                9.3.2 (done)
+.bazelrc                     a ci config; TODO: an eu config
+MODULE.bazel                 rules_python only; TODO: rules_go, bazel_skylib, Go SDK, pip hub
+BUILD.bazel                  the lock-file updater; TODO: the //:fast and //:slow suites
+requirements.in              tabulate and pytest (done)
+requirements_lock.txt        a placeholder: generate it
+config/BUILD.bazel           TODO: the region flag
+data/
+  catalog.csv                the product catalog (done)
+  BUILD.bazel                a genrule that fails, a public py_library; TODO: diff_test
+  regions/us.json, eu.json   tax rate and currency per region (done)
+  regions/BUILD.bazel        TODO: the region.json target
+libs/pricing/
+  pricing.py, pricing_test.py, pytest_main.py   (done)
+  BUILD.bazel                public, missing deps, a test that runs no tests
+services/quote/
+  quote.py, main.py, quote_test.py, exhaustive_test.py   (done)
+  BUILD.bazel                no main, no data, wrong sizes, nothing manual
+tools/catalog_gen/
+  catalog_gen.py             the CSV-to-Python generator (done)
+  BUILD.bazel                a private py_binary
+tools/fmtcli/
+  main.go, money/money.go, money/money_test.go  (done)
+  BUILD.bazel, money/BUILD.bazel                TODO: comments only</code></pre>
+    <p>The first build already fails, in two instructive ways:</p>
+<pre data-label="Terminal"><code class="language-bash">pixi run bazel build //... --keep_going</code></pre>
+<pre data-label="Real output (Bazel 9.3.2): bazel build //... --keep_going in the starter; paths shortened"><code class="language-none">ERROR: /work/harbor/services/quote/BUILD.bazel:10:10: in py_binary rule //services/quote:quote:
+Error in fail: corresponding default 'quote.py' does not appear in srcs. Add it or override default file name with a 'main' attribute
+ERROR: /work/harbor/services/quote/BUILD.bazel:10:10: Analysis of target '//services/quote:quote' (config: a7a71fd) failed
+ERROR: /work/harbor/data/BUILD.bazel:4:8: in genrule rule //data:catalog_gen: Visibility error:
+target '//tools/catalog_gen:catalog_gen' is not visible from
+target '//data:catalog_gen'
+ERROR: /work/harbor/data/BUILD.bazel:4:8: Analysis of target '//data:catalog_gen' (config: a7a71fd) failed
+ERROR: command succeeded, but not all targets were analyzed
+ERROR: Build did NOT complete successfully</code></pre>
+    <p>(Without <code>--keep_going</code>, Bazel stops at the first of them.) The Go packages hold only comments
+      for now, so nothing loads <code>rules_go</code> yet; the moment you declare a Go target, Bazel reports
+      <code>No repository visible as '@rules_go'</code> until <code>MODULE.bazel</code> has its
+      <code>bazel_dep</code>. One more surprise is waiting in <code>.bazelrc</code>:
+      <code>bazel query //... --config=ci</code> fails with <code>Config value 'ci' is not defined in any .rc
+      file</code>.</p>
+    <aside class="callout tip"><p>Read <code>quote.py</code> and <code>main.py</code> before you fix the second
+      error. The service's logic is a library (<code>quote.py</code>, used by both tests), and <code>main.py</code> is
+      only the command line. Adding <code>quote.py</code> to the binary's <code>srcs</code> would make the error go
+      away and the design worse.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="spec">
+    <h2>The specification</h2>
+    <p>The grader checks these requirements with real Bazel. They are numbered so the milestones and hints can refer
+      to them.</p>
+
+    <h3>The packages</h3>
+    <table>
+      <thead><tr><th>Target</th><th>Kind</th><th>Visible to</th><th>Role</th></tr></thead>
+      <tbody>
+        <tr><td><code>//libs/pricing</code></td><td><code>py_library</code></td><td>every package under <code>//services</code></td><td>Order parsing, totals, tax, tables. Depends on <code>//data:catalog</code> and <code>@pypi//tabulate</code>.</td></tr>
+        <tr><td><code>//libs/pricing:pricing_test</code></td><td><code>py_test</code></td><td>private</td><td>pytest tests of the library (5 tests).</td></tr>
+        <tr><td><code>//services/quote:quote_lib</code></td><td><code>py_library</code></td><td>private</td><td>The service's logic (<code>quote.py</code>). Ships <code>//data/regions:region</code> as data.</td></tr>
+        <tr><td><code>//services/quote</code></td><td><code>py_binary</code></td><td>private</td><td>The command line (<code>main.py</code>). Runs <code>//tools/fmtcli</code>.</td></tr>
+        <tr><td><code>//services/quote:quote_test</code></td><td><code>py_test</code></td><td>private</td><td>Fast service tests; run the Go tool.</td></tr>
+        <tr><td><code>//services/quote:exhaustive_test</code></td><td><code>py_test</code></td><td>private</td><td>Slow: every product combination. Manual.</td></tr>
+        <tr><td><code>//tools/fmtcli</code></td><td><code>go_binary</code></td><td>public</td><td>Formats cents as money: <code>fmtcli EUR 123456</code> prints <code>EUR 1.234,56</code>.</td></tr>
+        <tr><td><code>//tools/fmtcli/money</code></td><td><code>go_library</code></td><td><code>//tools/fmtcli</code> only</td><td>The formatting code. Import path <code>example.com/harbor/tools/fmtcli/money</code>.</td></tr>
+        <tr><td><code>//tools/fmtcli/money:money_test</code></td><td><code>go_test</code></td><td>private</td><td>Internal test (package <code>money</code>).</td></tr>
+        <tr><td><code>//tools/catalog_gen</code></td><td><code>py_binary</code></td><td><code>//data</code> only</td><td>The code generator: CSV in, Python out.</td></tr>
+        <tr><td><code>//data:catalog_gen</code></td><td><code>run_binary</code></td><td>private</td><td>Runs the generator: <code>catalog.csv</code> → <code>catalog.py</code>.</td></tr>
+        <tr><td><code>//data:catalog</code></td><td><code>py_library</code></td><td><code>//libs/pricing</code> only</td><td>The generated module, imported as <code>data.catalog</code>.</td></tr>
+        <tr><td><code>//data:catalog_golden_test</code></td><td><code>diff_test</code></td><td>private</td><td>Generated <code>catalog.py</code> vs. checked-in <code>catalog.golden.py</code>.</td></tr>
+        <tr><td><code>//data/regions:region</code></td><td><code>copy_file</code></td><td>every package under <code>//services</code></td><td><code>region.json</code>: a copy of <code>us.json</code> or <code>eu.json</code>.</td></tr>
+        <tr><td><code>//config:region</code></td><td><code>string_flag</code></td><td>private</td><td>Values <code>us</code> (default) and <code>eu</code>.</td></tr>
+        <tr><td><code>//config:eu</code></td><td><code>config_setting</code></td><td>public</td><td>True when the region flag is <code>eu</code>.</td></tr>
+        <tr><td><code>//:fast</code>, <code>//:slow</code></td><td><code>test_suite</code></td><td>private</td><td>The four fast tests; the exhaustive test (suite is manual).</td></tr>
+      </tbody>
+    </table>
+    <p>The dependency graph you are aiming for, without tests:</p>
+<pre class="mermaid">flowchart LR
+  quote["//services/quote"] --> qlib["//services/quote:quote_lib"]
+  quote -. data .-> fmt["//tools/fmtcli"]
+  fmt --> money["//tools/fmtcli/money"]
+  qlib --> pricing["//libs/pricing"]
+  qlib -. data .-> region["//data/regions:region"]
+  region --> flag["//config:eu / //config:region"]
+  pricing --> catalog["//data:catalog"]
+  pricing --> tab["@pypi//tabulate"]
+  catalog --> gen["//data:catalog_gen"]
+  gen --> csv["catalog.csv"]
+  gen -. tool .-> cgen["//tools/catalog_gen"]</pre>
+
+    <h3>Requirements</h3>
+    <ol>
+      <li><strong>Modules.</strong> <code>MODULE.bazel</code> has a <code>bazel_dep</code> for every rule set a BUILD
+        file loads from: <code>rules_python</code> 2.4.6, <code>rules_go</code> 0.65.0, <code>bazel_skylib</code> 1.9.2.
+        Python 3.13 and Go 1.25.3 are hermetic toolchains.</li>
+      <li><strong>Packages.</strong> Every target in the table exists with the kind shown. <code>bazel build //...</code>
+        succeeds.</li>
+      <li><strong>Visibility.</strong> Each target is visible exactly as the table says. The grader adds a package
+        outside <code>//services</code> that must <em>fail</em> to use <code>//libs/pricing</code>,
+        <code>//data:catalog</code>, and <code>//tools/fmtcli/money</code>, and a second package under
+        <code>//services</code> that must succeed in using <code>//libs/pricing</code>.</li>
+      <li><strong>PyPI.</strong> <code>requirements_lock.txt</code> is generated by
+        <code>bazel run //:requirements.update</code>, with sha256 hashes. The hub is named <code>harbor_pypi</code>
+        and visible as <code>@pypi</code>. <code>//libs/pricing</code> depends on <code>@pypi//tabulate</code>; the
+        pytest test depends on <code>@pypi//pytest</code> and actually collects its 5 tests.</li>
+      <li><strong>Runfiles.</strong> The quote binary and both quote tests find <code>region.json</code> and the Go
+        tool in their runfiles, never through a relative path. They read the Go tool's location from the
+        <code>FMTCLI</code> environment variable, set with <code>$(rlocationpath //tools/fmtcli)</code>.</li>
+      <li><strong>Tests.</strong> Every test has a <code>size</code> that does not trigger Bazel's "too big" hint.
+        <code>bazel test //...</code> passes, and a second run is all <code>(cached) PASSED</code>. The exhaustive test
+        is the only manual test; <code>//:fast</code> lists the four fast tests; <code>//:slow</code> runs the
+        exhaustive test and is itself skipped by <code>//...</code>.</li>
+      <li><strong>Configuration.</strong> <code>--//config:region=eu</code> and <code>--config=eu</code> build an EU
+        quote; unknown regions are rejected; <code>--config=ci</code> builds with <code>-c opt</code>, prints logs only
+        for failing tests, and is accepted by <code>bazel query</code> as well.</li>
+      <li><strong>Go.</strong> <code>bazel run //tools/fmtcli -- EUR 123456 -75</code> prints
+        <code>EUR 1.234,56</code> and <code>-EUR 0,75</code>. The Go test is internal and uses <code>embed</code>.</li>
+      <li><strong>Generated code.</strong> <code>data/catalog.py</code> is never checked in. It is generated by a
+        <code>run_binary</code> whose <code>tool</code> is <code>//tools/catalog_gen</code>, and a
+        <code>diff_test</code> compares it with the reviewed <code>data/catalog.golden.py</code>.</li>
+      <li><strong>Graph shape.</strong> Only services, the pricing tests, and the two suites depend on
+        <code>//libs/pricing</code>. The pricing library does not depend on the region flag. The Go tool has no Python
+        in its graph. A change to <code>catalog.csv</code> affects the Python tests and the golden test, and no Go
+        test.</li>
+    </ol>
+
+    <h3>Sketch it first</h3>
+    <p>Before you edit files locally, try the visibility part of the design in the simulator. The pricing library
+      below is public, so the reporting tool in <code>//tools/report</code> can use it. Narrow the visibility so that
+      both services still build and the reporting tool does not. Then ask the graph who depends on pricing.</p>
+    <div class="runnable" data-title="Who may use the pricing library?" data-commands="bazel build //services/...|bazel build //tools/report|bazel query 'rdeps(//..., //libs/pricing)'">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "harbor")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+bazel_dep(name = "rules_go", version = "0.65.0")
+bazel_dep(name = "bazel_skylib", version = "1.9.2")
+</textarea>
+<textarea class="file" data-path="libs/pricing/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "pricing",
+    srcs = ["pricing.py"],
+    visibility = ["//visibility:public"],
+    deps = ["//data:catalog"],
+)
+</textarea>
+<textarea class="file" data-path="data/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_library")
+
+# In the real capstone, catalog.py is generated by a run_binary.
+py_library(
+    name = "catalog",
+    srcs = ["catalog.py"],
+    visibility = ["//libs/pricing:__pkg__"],
+)
+</textarea>
+<textarea class="file" data-path="services/quote/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_binary", "py_library")
+
+py_library(
+    name = "quote_lib",
+    srcs = ["quote.py"],
+    deps = ["//libs/pricing"],
+)
+
+py_binary(
+    name = "quote",
+    srcs = ["main.py"],
+    main = "main.py",
+    deps = [":quote_lib"],
+)
+</textarea>
+<textarea class="file" data-path="services/invoice/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "invoice",
+    srcs = ["invoice.py"],
+    deps = ["//libs/pricing"],
+)
+</textarea>
+<textarea class="file" data-path="tools/report/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_binary")
+
+# Should NOT be allowed to reach into pricing.
+py_binary(
+    name = "report",
+    srcs = ["report.py"],
+    deps = ["//libs/pricing"],
+)
+</textarea>
+<textarea class="file" data-path="libs/pricing/pricing.py" data-hidden></textarea>
+<textarea class="file" data-path="data/catalog.py" data-hidden></textarea>
+<textarea class="file" data-path="services/quote/quote.py" data-hidden></textarea>
+<textarea class="file" data-path="services/quote/main.py" data-hidden></textarea>
+<textarea class="file" data-path="services/invoice/invoice.py" data-hidden></textarea>
+<textarea class="file" data-path="tools/report/report.py" data-hidden></textarea>
+    </div>
+    <details class="reveal"><summary>Reveal: the narrowest visibility that works</summary>
+      <p><code>visibility = ["//services:__subpackages__"]</code>. It covers <code>//services/quote</code>,
+        <code>//services/invoice</code>, and any service added later, and nothing in <code>//tools</code>.
+        <code>["//services/quote:__pkg__"]</code> is narrower but breaks the invoice service (and the grader's extra
+        service package). The pricing test needs nothing: a package can always use its own targets.</p>
+    </details>
+  </section>
+
+  <section class="lesson-section" id="milestones">
+    <h2>Milestones</h2>
+    <p>Work in this order: each milestone needs the ones before it. The grader names every check after its milestone
+      (<code>M1:</code>, <code>M2:</code>, …), so you can grade at any time and look only at the lines for the
+      milestone you are on. Try each step for a while before you open the hints.</p>
+
+    <div class="milestone">
+      <h3>Milestone 1: modules, packages, and visibility</h3>
+      <p>Requirements 1 to 3. Skills from <a href="../modules/m01-workspaces-targets.html">M01</a>,
+        <a href="../modules/m02-build-graph.html">M02</a>, and <a href="../modules/m04-bzlmod-pypi.html">M04</a>.
+        Add the missing modules, then fix visibility from the bottom of the graph up.</p>
+      <ul class="checklist" data-id="c1-m1">
+        <li><code>MODULE.bazel</code> has <code>bazel_dep</code> for <code>rules_go</code> and <code>bazel_skylib</code>, and <code>go_sdk.download(version = "1.25.3")</code></li>
+        <li><code>//tools/catalog_gen</code> is visible to <code>//data</code> only</li>
+        <li><code>//services/quote</code> is a <code>py_binary</code> with <code>main = "main.py"</code>, built on <code>//services/quote:quote_lib</code></li>
+        <li><code>//libs/pricing</code> is visible to <code>//services:__subpackages__</code>; <code>//data:catalog</code> to <code>//libs/pricing:__pkg__</code></li>
+        <li><code>pixi run bazel build //...</code> succeeds (Go packages can wait for milestone 5)</li>
+      </ul>
+      <details class="hint"><summary>Hint: why is the generator not visible?</summary>
+        <p>A <code>py_binary</code> with no <code>visibility</code> is private to its own package. Something in
+          <code>//data</code> runs it, so <code>//data</code> needs to see it:
+          <code>visibility = ["//data:__pkg__"]</code>. Do not make it public: nothing else has a reason to run the
+          generator.</p>
+      </details>
+      <details class="hint"><summary>Hint: the quote binary and main.py</summary>
+        <p>Without <code>main</code>, a <code>py_binary</code> named <code>quote</code> looks for <code>quote.py</code>
+          in its <code>srcs</code>. Here the entry point is <code>main.py</code>, so say so with
+          <code>main = "main.py"</code>. The logic stays in <code>:quote_lib</code>, which both tests also use.</p>
+      </details>
+    </div>
+
+    <div class="milestone">
+      <h3>Milestone 2: PyPI and runfiles</h3>
+      <p>Requirements 4 and 5. Skills from <a href="../modules/m03-rules-python.html">M03</a> and
+        <a href="../modules/m04-bzlmod-pypi.html">M04</a>.</p>
+      <ul class="checklist" data-id="c1-m2">
+        <li><code>pip.parse</code> creates the <code>harbor_pypi</code> hub, aliased with <code>use_repo(pip, pypi = "harbor_pypi")</code></li>
+        <li><code>requirements_lock.txt</code> is generated by <code>pixi run bazel run //:requirements.update</code></li>
+        <li><code>//libs/pricing</code> depends on <code>//data:catalog</code> and <code>@pypi//tabulate</code></li>
+        <li><code>//libs/pricing:pricing_test</code> runs pytest through <code>pytest_main.py</code> and reports <code>5 passed</code></li>
+        <li><code>pixi run bazel run //services/quote -- WIDGET=2 GADGET</code> prints the US quote shown above</li>
+      </ul>
+      <details class="hint"><summary>Hint: generating the lock</summary>
+        <p>Add <code>pip.parse</code> and <code>use_repo</code> first, with the placeholder lock in place. The
+          <code>//:requirements</code> target needs no hub, so <code>bazel run //:requirements.update</code> works
+          even before the lock exists, and rewrites <code>requirements_lock.txt</code> in your source tree (it uses
+          <code>BUILD_WORKSPACE_DIRECTORY</code>). Never hand-edit the lock.</p>
+      </details>
+      <details class="hint"><summary>Hint: a test that passes but runs nothing</summary>
+        <p>If <code>pricing_test</code> passes in a fraction of a second with no pytest summary in
+          <code>--test_output=all</code>, Bazel ran <code>pricing_test.py</code> as a script: it defined five
+          functions and exited 0. Make <code>pytest_main.py</code> the <code>main</code>, put it in
+          <code>srcs</code>, pass the test file with <code>args = ["$(rootpath pricing_test.py)"]</code>, and depend
+          on <code>@pypi//pytest</code>. This is the pattern from <a href="../modules/m04-bzlmod-pypi.html">M04</a>.</p>
+      </details>
+      <details class="hint"><summary>Hint: label '//tools/fmtcli:fmtcli' is not a declared prerequisite</summary>
+        <p>The quote code reads the Go tool's runfiles path from <code>FMTCLI</code>. If you set
+          <code>env = {"FMTCLI": "$(rlocationpath //tools/fmtcli)"}</code> but put the tool in the
+          <em>library's</em> <code>data</code>, analysis fails:</p>
+<pre data-label="Real output (Bazel 9.3.2), path shortened"><code class="language-none">ERROR: /work/harbor/services/quote/BUILD.bazel:26:8: in env[FMTCLI] attribute of py_test rule //services/quote:quote_test: label '//tools/fmtcli:fmtcli' in $(location) expression is not a declared prerequisite of this rule. Since this rule was created by the macro 'py_test', the error might have been caused by the macro implementation</code></pre>
+        <p><code>$(rlocationpath)</code> only expands labels in the <em>same rule's</em> attributes. Put
+          <code>data = ["//tools/fmtcli"]</code> on each executable that sets <code>FMTCLI</code>. The region file is
+          different: <code>quote.py</code> finds it at the fixed path <code>_main/data/regions/region.json</code>, so
+          it can live in <code>quote_lib</code>'s <code>data</code> and every user of the library gets it. (You need
+          milestones 4 and 5 before the binary actually runs.)</p>
+      </details>
+    </div>
+
+    <div class="milestone">
+      <h3>Milestone 3: tests at scale</h3>
+      <p>Requirement 6. Skills from <a href="../modules/m05-testing.html">M05</a>.</p>
+      <ul class="checklist" data-id="c1-m3">
+        <li>Every test is <code>size = "small"</code>, and <code>bazel test //...</code> shows no "too big" hint</li>
+        <li><code>//services/quote:exhaustive_test</code> is tagged <code>manual</code>; no other test is</li>
+        <li>The root <code>BUILD.bazel</code> has <code>test_suite</code>s <code>fast</code> (four tests) and <code>slow</code> (manual)</li>
+        <li>A second <code>pixi run bazel test //...</code> is all <code>(cached) PASSED</code></li>
+      </ul>
+      <details class="hint"><summary>Hint: the suite that runs a manual test</summary>
+        <p>A <code>test_suite</code> runs every test it names, manual or not. That is why <code>//:slow</code> can run
+          the exhaustive test, and also why <code>//...</code> runs it if the suite itself is not tagged
+          <code>manual</code>: the wildcard matches the suite, and the suite brings its test along.</p>
+      </details>
+      <details class="hint"><summary>Hint: the tests are not cached</summary>
+        <p>A test result is cached when nothing it depends on changed: sources, data, flags, and environment. If the
+          second run re-runs a test, look for something that changes between runs: a <code>--nocache_test_results</code>
+          in a <code>.bazelrc</code>, or a different <code>--config</code>. Changing flags between the two runs changes
+          the configuration, which is a different cache key.</p>
+      </details>
+    </div>
+
+    <div class="milestone">
+      <h3>Milestone 4: a region flag and named configs</h3>
+      <p>Requirement 7. Skills from <a href="../modules/m06-configuration.html">M06</a> and
+        <a href="../modules/m08-genrules-macros.html">M08</a> (<code>copy_file</code>).</p>
+      <ul class="checklist" data-id="c1-m4">
+        <li><code>//config:region</code> is a <code>string_flag</code> with values <code>us</code> and <code>eu</code>; <code>//config:eu</code> is a public <code>config_setting</code></li>
+        <li><code>//data/regions:region</code> is a <code>copy_file</code> whose <code>src</code> is a <code>select()</code> and whose <code>out</code> is <code>region.json</code></li>
+        <li><code>.bazelrc</code> has <code>common:eu</code> and a <code>ci</code> config that <code>bazel query</code> accepts</li>
+        <li><code>pixi run bazel run //services/quote --config=eu -- WIDGET=2 GADGET</code> prints a quote in EUR</li>
+      </ul>
+      <details class="hint"><summary>Hint: why copy_file and not select() in data?</summary>
+        <p>In <a href="../modules/m06-configuration.html">M06</a> the <code>select()</code> went straight into a
+          binary's <code>data</code>, and the program looked for each possible file. Here the program reads one fixed
+          name, <code>region.json</code>. <code>copy_file</code> (from
+          <code>@bazel_skylib//rules:copy_file.bzl</code>) produces that name, and the <code>select()</code> decides
+          what goes into it. Python code never needs to know which regions exist.</p>
+      </details>
+      <details class="hint"><summary>Hint: Config value 'ci' is not defined</summary>
+        <p><code>build:ci ...</code> lines apply to <code>build</code> and the commands that inherit from it
+          (<code>test</code>, <code>run</code>, <code>cquery</code>), but not to <code>query</code>. Write
+          <code>common:ci -c opt</code> so every command accepts <code>--config=ci</code>, and keep
+          <code>test:ci --test_output=errors</code> for the test-only part.</p>
+      </details>
+    </div>
+
+    <div class="milestone">
+      <h3>Milestone 5: the Go tool</h3>
+      <p>Requirement 8. Skills from <a href="../modules/m07-rules-go.html">M07</a>.</p>
+      <ul class="checklist" data-id="c1-m5">
+        <li><code>//tools/fmtcli/money</code> is a <code>go_library</code> with the right <code>importpath</code>, visible to <code>//tools/fmtcli</code> only</li>
+        <li><code>//tools/fmtcli/money:money_test</code> embeds the library</li>
+        <li><code>//tools/fmtcli</code> is a public <code>go_binary</code></li>
+        <li><code>pixi run bazel test //services/quote:quote_test</code> passes: Python runs Go</li>
+      </ul>
+      <details class="hint"><summary>Hint: what the import path must be</summary>
+        <p>Read the <code>import</code> block of <code>tools/fmtcli/main.go</code>. The string it imports is the
+          library's <code>importpath</code>, exactly. A mismatch gives a "missing strict dependencies" error naming the
+          import.</p>
+      </details>
+    </div>
+
+    <div class="milestone">
+      <h3>Milestone 6: generated data and a golden file</h3>
+      <p>Requirement 9. Skills from <a href="../modules/m08-genrules-macros.html">M08</a>.</p>
+      <ul class="checklist" data-id="c1-m6">
+        <li><code>//data:catalog_gen</code> is a <code>run_binary</code> with <code>tool = "//tools/catalog_gen"</code></li>
+        <li><code>bazel-bin/data/catalog.py</code> lists all four products</li>
+        <li><code>data/catalog.golden.py</code> is checked in, and <code>//data:catalog_golden_test</code> is a passing <code>diff_test</code></li>
+        <li>You changed a price in <code>catalog.csv</code>, watched the golden test fail, and changed it back</li>
+      </ul>
+      <details class="hint"><summary>Hint: from genrule to run_binary</summary>
+        <p>The starter's genrule puts the generator in <code>srcs</code>; a program you run belongs in
+          <code>tools</code> (genrule) or <code>tool</code> (<code>run_binary</code>), so Bazel builds it for the
+          machine that runs the build. <code>run_binary</code> needs no shell: each <code>args</code> entry is one
+          argument, with <code>$(location catalog.csv)</code> and <code>$(location catalog.py)</code> for the paths.</p>
+      </details>
+      <details class="hint"><summary>Hint: creating the golden file</summary>
+        <p>Build <code>//data:catalog_gen</code>, read <code>bazel-bin/data/catalog.py</code>, and when you are
+          happy with it, copy it to <code>data/catalog.golden.py</code>. Files in <code>bazel-bin</code> are read-only,
+          so run <code>chmod u+w data/catalog.golden.py</code> after copying. In a real repository you would add an
+          <code>update_golden</code> binary, as in <a href="../modules/m08-genrules-macros.html">M08</a>.</p>
+      </details>
+    </div>
+
+    <div class="milestone">
+      <h3>Milestone 7: prove the graph</h3>
+      <p>Requirement 10. Skills from <a href="../modules/m09-query-debugging.html">M09</a>. No new BUILD code is
+        needed if milestones 1 to 6 are right. Run each query yourself before you grade, and explain the output.</p>
+      <ul class="checklist" data-id="c1-m7">
+        <li><code>bazel query 'rdeps(//..., //libs/pricing)'</code> lists only services, the pricing test, and the suites</li>
+        <li><code>bazel query 'somepath(//libs/pricing, //config:region)'</code> is empty</li>
+        <li><code>bazel query 'kind("py_.*", deps(//tools/fmtcli))'</code> is empty</li>
+        <li><code>bazel query 'kind(".*_test rule", rdeps(//..., //data:catalog.csv))'</code> lists no Go test</li>
+      </ul>
+<pre data-label="Real output (Bazel 9.3.2), reference solution"><code class="language-none">$ bazel query 'rdeps(//..., //libs/pricing)'
+//:fast
+//:slow
+//libs/pricing:pricing
+//libs/pricing:pricing_test
+//services/quote:exhaustive_test
+//services/quote:quote
+//services/quote:quote_lib
+//services/quote:quote_test
+
+$ bazel query 'kind(".*_test rule", rdeps(//..., //data:catalog.csv))'
+//data:catalog_golden_test
+//libs/pricing:pricing_test
+//services/quote:exhaustive_test
+//services/quote:quote_test
+
+$ bazel query 'somepath(//services/quote, //data:catalog.csv)'
+//services/quote:quote
+//services/quote:quote_lib
+//libs/pricing:pricing
+//data:catalog
+//data:catalog.py
+//data:catalog_gen
+//data:catalog.csv</code></pre>
+      <details class="hint"><summary>Hint: the pricing library depends on the region flag</summary>
+        <p>If <code>somepath(//libs/pricing, //config:region)</code> prints a path, something in the library's graph
+          reads <code>region.json</code> or contains a <code>select()</code>. The region belongs to the service. The
+          library takes the tax percent as an argument (<code>pricing.tax(cents, percent)</code>), and the service
+          passes in the value it read from <code>region.json</code>.</p>
+      </details>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="lab">
+    <h2>Grading with real Bazel</h2>
+    <p>The simulator can check your package layout, but only real Bazel can show pytest collecting tests, Go
+      compiling, a generator running, a golden file matching, and a test result coming from the cache. The capstone is
+      graded as one lab with 40 checks.</p>
+
+    <div class="lab" data-id="c1" data-title="Capstone 1: Polyglot Monorepo">
+      <div class="lab-prompt">
+        <p>Finish the Harbor monorepo so that it meets the <a href="#spec">specification</a>. The grader copies your
+          <code>work/c1/</code> into <code>build/labs/c1-work/</code>, adds three packages of its own
+          (<code>//grading/outsider</code> and <code>//grading/outsider_go</code>, which must fail to use private
+          targets, and <code>//services/grading</code>, a second service that must be able to use the pricing
+          library), and runs the checks in order. The first grading run downloads the Python and Go toolchains and the
+          PyPI wheels and compiles the Go standard library, so it takes a few minutes. Later runs take about a
+          minute.</p>
+        <ul class="checklist" data-id="c1-steps">
+          <li>Run <code>pixi run start c1</code>, then <code>cd work/c1</code></li>
+          <li>Work through milestones 1 to 7, running <code>pixi run bazel build //...</code> and <code>pixi run bazel test //...</code> as you go</li>
+          <li>From the repository root, run <code>pixi run grade c1</code>, and read the first failing check of the earliest milestone</li>
+          <li>Repeat until all 40 checks pass</li>
+          <li>Do the <a href="#review">self-review</a>, then compare your BUILD files with <code>labs/c1/solution/</code></li>
+        </ul>
+      </div>
+      <details class="hint"><summary>Hint: reading a failed check</summary>
+        <p>Each failed check prints what it expected, a hint, and the first new <code>ERROR</code> lines. Many later
+          checks fail only because an early one does (nothing works until <code>MODULE.bazel</code> is right), so fix
+          the earliest failure first and grade again. To run a check by hand, copy its command from
+          <code>labs/c1/checks.toml</code> and run it with <code>pixi run bazel ...</code> in <code>work/c1</code>.</p>
+      </details>
+      <details class="hint"><summary>Hint: one check fails only when graded</summary>
+        <p>The grader's packages are not in your copy. If the visibility checks pass locally but fail when graded,
+          your visibility is probably too narrow: <code>//services/quote:__pkg__</code> works for the quote service and
+          fails for <code>//services/grading</code>. If the check that says "expected the command to fail" fails, your
+          visibility is too wide.</p>
+      </details>
+    </div>
+
+    <h3>What passing looks like</h3>
+<pre data-label="Real output (pixi run grade c1, reference solution; log header lines omitted)"><code class="language-none">Capstone 1: Polyglot Monorepo
+  ✓ M1: MODULE.bazel declares every rule set the BUILD files load
+  ✓ M1: the whole monorepo builds
+  ✓ M1: the monorepo has the required targets
+  ✓ M1: //libs/pricing is not visible outside //services
+  ✓ M1: every package under //services may use //libs/pricing
+  ✓ M1: the generated catalog library is private to //libs/pricing
+  ✓ M1: the Go money package is private to the fmtcli tool
+  ✓ M2: requirements_lock.txt was generated with hashes
+  ✓ M2: the lock pins tabulate
+  ✓ M2: the pip hub is named after the module and aliased to @pypi
+  ✓ M2: //libs/pricing depends on the generated catalog and on tabulate
+  ✓ M2: pricing_test runs pytest and collects all five tests
+  ✓ M2: bazel run //services/quote prints a US quote
+  ✓ M3: bazel test //... passes
+  ✓ M3: every test is sized, and a second run comes from the cache
+  ✓ M3: //... skips the exhaustive test
+  ✓ M3: the exhaustive test is the only manual test
+  ✓ M3: //:fast holds the four fast tests
+  ✓ M3: //:slow runs the exhaustive test
+  ✓ M4: --//config:region=eu prints an EU quote
+  ✓ M4: --config=eu from .bazelrc does the same
+  ✓ M4: the region flag rejects unknown regions
+  ✓ M4: cquery shows only eu.json under --config=eu
+  ✓ M4: --config=ci builds optimized
+  ✓ M4: --config=ci also works with bazel query
+  ✓ M4: bazel test //... --config=ci passes
+  ✓ M5: the Go code is a library, a binary, and a test
+  ✓ M5: the internal Go test embeds the library
+  ✓ M5: bazel run //tools/fmtcli formats euros
+  ✓ M5: the Python test ships the Go tool as data
+  ✓ M6: the catalog module is generated, not checked in
+  ✓ M6: run_binary runs the catalog generator
+  ✓ M6: the generated catalog lists every product
+  ✓ M6: a diff_test guards the generated catalog
+  ✓ M6: the golden file matches the generator
+  ✓ M7: only services, the pricing tests, and the suites depend on //libs/pricing
+  ✓ M7: the pricing library is region-agnostic
+  ✓ M7: the quote binary reaches the CSV through the generator
+  ✓ M7: the Go tool has no Python in its graph
+  ✓ M7: a catalog change re-runs the Python tests but no Go test
+
+40/40 checks passed. Lab complete.</code></pre>
+    <p>The visibility checks expect a failure. Here is what Bazel prints for the grader's outsider package, and the
+      cached second test run from milestone 3:</p>
+<pre data-label="Real output (Bazel 9.3.2), path shortened"><code class="language-none">ERROR: /work/harbor/grading/outsider/BUILD.bazel:7:11: in py_library rule //grading/outsider:uses_pricing: Visibility error:
+target '//libs/pricing:pricing' is not visible from
+target '//grading/outsider:uses_pricing'
+Recommendation: modify the visibility declaration if you think the dependency is legitimate. For more info see https://bazel.build/concepts/visibility</code></pre>
+<pre data-label="Real output (Bazel 9.3.2): the second bazel test //..."><code class="language-none">INFO: Found 11 targets and 4 test targets...
+INFO: Elapsed time: 1.607s, Critical Path: 0.00s
+INFO: 1 process: 4 action cache hit, 1 internal.
+INFO: Build completed successfully, 1 total action
+//data:catalog_golden_test                                      (cached) PASSED in 0.1s
+//libs/pricing:pricing_test                                     (cached) PASSED in 1.1s
+//services/quote:quote_test                                     (cached) PASSED in 0.6s
+//tools/fmtcli/money:money_test                                 (cached) PASSED in 0.1s
+
+Executed 0 out of 4 tests: 4 tests pass.</code></pre>
+    <aside class="callout note"><p>The first <code>bazel test //...</code> in a fresh copy of the solution took about
+      64 seconds on the machine these outputs come from, most of it compiling the Go standard library. The second
+      took under two seconds.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="design-notes">
+    <h2>Design notes</h2>
+    <p>The spec makes several choices for you. Each one is a trade-off you will meet again in real repositories.</p>
+
+    <h3>Package boundaries</h3>
+    <p>A Bazel package is a directory with a BUILD file, and it is the unit of visibility. The layout follows who owns
+      what and who may use it: <code>libs/</code> for code shared by services, <code>services/</code> for things that
+      run, <code>tools/</code> for developer and build tools, <code>data/</code> for data and the code generated from
+      it, <code>config/</code> for build settings. A finer split (one package per directory, as here) costs a few more
+      BUILD files and buys precise visibility and smaller rebuilds. A coarser split (one BUILD file at
+      <code>libs/</code>) is less work today and makes every target in it visible to every other.</p>
+    <p><code>//tools/fmtcli/money</code> is its own package even though only one binary uses it. That separation is
+      what lets the grader prove that nothing else imports it, and it is where a second Go tool would come from if
+      the library ever went public.</p>
+
+    <h3>Visibility: narrow by default, widen on purpose</h3>
+    <ul>
+      <li><strong>Use package patterns for groups, labels for single users.</strong>
+        <code>//services:__subpackages__</code> means "any service, now or later". <code>//libs/pricing:__pkg__</code>
+        on the catalog means "exactly one user". A new service needs no BUILD change; a new user of the catalog needs
+        a reviewed one.</li>
+      <li><strong>Make the API public, not its parts.</strong> <code>//tools/fmtcli</code> is public because anyone
+        may <em>run</em> the tool. Its <code>money</code> package is private, so the binary's command line is the only
+        contract.</li>
+      <li><strong>Tests live next to their code.</strong> A test in the same package needs no visibility at all. The
+        grader's <code>//services/grading</code> package is a test of the visibility rule itself.</li>
+      <li><strong>In a larger repository</strong> you would name groups with <code>package_group</code> and refer to
+        them in <code>visibility</code>, so "who counts as a service" is written down once.</li>
+    </ul>
+
+    <h3>Where generated code lives</h3>
+    <p><code>catalog.py</code> exists only in <code>bazel-bin/data/</code>. It is never checked in, so it cannot drift
+      from the CSV, and nobody reviews generated diffs by accident. Python still imports it as
+      <code>data.catalog</code>, because in the runfiles tree Bazel merges source files and generated files under the
+      same package path. The cost is that an editor without Bazel integration cannot find the module.</p>
+    <p>The golden file is the deliberate exception. It is a reviewed snapshot: when the generator or the CSV changes,
+      the <code>diff_test</code> fails, and a person looks at the new output before updating the golden. That turns a
+      silent behavior change into a visible code review. The price is one extra step on every intended change.</p>
+
+    <h3>Choosing the region at build time</h3>
+    <p>The old repository read a <code>REGION</code> environment variable at run time. A build flag is better for
+      Harbor: the US and EU builds are different artifacts with different cache keys, <code>cquery</code> shows what
+      each one contains, and nobody can ship a US build that silently reads EU prices. A run-time setting is better
+      when one artifact must serve both regions; that is a product decision, not a Bazel one.</p>
+    <p>The <code>select()</code> sits as close to the data as possible, in <code>//data/regions</code>. The pricing
+      library takes a tax rate as an argument and never sees the flag, which keeps it cached once for both regions,
+      and is exactly what <code>somepath(//libs/pricing, //config:region)</code> verifies. Try it in the simulator:</p>
+    <div class="runnable" data-title="One flag, one data file" data-commands="bazel cquery 'labels(src, //data/regions:region)'|bazel cquery 'labels(src, //data/regions:region)' --config=eu|bazel query 'somepath(//services/quote, //config:region)'|bazel query 'somepath(//libs/pricing, //config:region)'|bazel build //services/quote --//config:region=apac">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "harbor")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+bazel_dep(name = "bazel_skylib", version = "1.9.2")
+</textarea>
+<textarea class="file" data-path=".bazelrc">
+common:eu --//config:region=eu
+common:ci -c opt
+test:ci --test_output=errors
+</textarea>
+<textarea class="file" data-path="config/BUILD.bazel">
+load("@bazel_skylib//rules:common_settings.bzl", "string_flag")
+
+string_flag(
+    name = "region",
+    build_setting_default = "us",
+    values = ["us", "eu"],
+)
+
+config_setting(
+    name = "eu",
+    flag_values = {":region": "eu"},
+    visibility = ["//visibility:public"],
+)
+</textarea>
+<textarea class="file" data-path="data/regions/BUILD.bazel">
+load("@bazel_skylib//rules:copy_file.bzl", "copy_file")
+
+copy_file(
+    name = "region",
+    src = select({
+        "//config:eu": "eu.json",
+        "//conditions:default": "us.json",
+    }),
+    out = "region.json",
+    visibility = ["//services:__subpackages__"],
+)
+</textarea>
+<textarea class="file" data-path="libs/pricing/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "pricing",
+    srcs = ["pricing.py"],
+    visibility = ["//services:__subpackages__"],
+)
+</textarea>
+<textarea class="file" data-path="services/quote/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_binary", "py_library")
+
+py_library(
+    name = "quote_lib",
+    srcs = ["quote.py"],
+    data = ["//data/regions:region"],
+    deps = ["//libs/pricing"],
+)
+
+py_binary(
+    name = "quote",
+    srcs = ["main.py"],
+    main = "main.py",
+    deps = [":quote_lib"],
+)
+</textarea>
+<textarea class="file" data-path="data/regions/us.json" data-hidden></textarea>
+<textarea class="file" data-path="data/regions/eu.json" data-hidden></textarea>
+<textarea class="file" data-path="libs/pricing/pricing.py" data-hidden></textarea>
+<textarea class="file" data-path="services/quote/quote.py" data-hidden></textarea>
+<textarea class="file" data-path="services/quote/main.py" data-hidden></textarea>
+    </div>
+    <p>Real Bazel rejects the unknown region during analysis:</p>
+<pre data-label="Real output (Bazel 9.3.2), paths shortened"><code class="language-none">ERROR: /work/harbor/config/BUILD.bazel:4:12: in string_flag rule //config:region:
+Error in fail: Error setting //config:region: invalid value 'apac'. Allowed values are ["us", "eu"]</code></pre>
+
+    <h3>Configs in .bazelrc</h3>
+    <p><code>--config=ci</code> is the one flag the CI pipeline passes, so what "a CI build" means lives in the
+      repository and is reviewed like code. It uses <code>common:</code> so that every command accepts it, including
+      <code>bazel query</code> in a CI script. Region and CI are separate configs on purpose: CI can run
+      <code>--config=ci --config=eu</code>, and a developer can try <code>--config=eu</code> without an optimized
+      build.</p>
+
+    <h3>Smaller choices</h3>
+    <ul>
+      <li><strong>The hub is <code>harbor_pypi</code>, aliased to <code>@pypi</code>.</strong> rules_python 2.4.6
+        reserves the hub name <code>pypi</code>; naming hubs after the module also keeps them unique when modules are
+        combined.</li>
+      <li><strong>The Go tool is <code>data</code>, not <code>deps</code>.</strong> Python cannot import a Go binary;
+        it runs one. Run-time files are <code>data</code>.</li>
+      <li><strong><code>FMTCLI</code> is set on each executable.</strong> <code>$(rlocationpath)</code> only expands
+        labels in the same rule, so the binary and each test repeat two lines. A macro would remove the repetition
+        (see the stretch goals).</li>
+      <li><strong>The exhaustive test is manual, not <code>size = "large"</code>.</strong> Size describes how much a
+        test needs; <code>manual</code> decides when it runs. Wildcards skip it, and the <code>//:slow</code> suite
+        names it.</li>
+    </ul>
+  </section>
+
+  <section class="lesson-section" id="review">
+    <h2>Self-review</h2>
+    <p>Passing the grader means the build is right. Before you call the capstone done, review your BUILD files as a
+      teammate would review a pull request.</p>
+    <ul class="checklist" data-id="c1-review">
+      <li>No target is <code>//visibility:public</code> except <code>//tools/fmtcli</code> and <code>//config:eu</code>, and you can say why each of those is</li>
+      <li>No <code>TODO</code> markers are left in BUILD files, <code>MODULE.bazel</code>, or <code>.bazelrc</code></li>
+      <li>Every <code>load()</code> is used, and every rule set loaded from has a <code>bazel_dep</code></li>
+      <li>You never edited <code>requirements_lock.txt</code> or <code>bazel-bin</code> output by hand</li>
+      <li>You can explain why <code>region.json</code> is in <code>quote_lib</code>'s <code>data</code> but the Go tool is in each executable's <code>data</code></li>
+      <li>You can predict which tests re-run after editing <code>money.go</code>, <code>catalog.csv</code>, and <code>pricing.py</code>, and you checked with <code>rdeps</code></li>
+      <li>BUILD files are formatted consistently (attributes sorted, one item per line in long lists), as <code>buildifier</code> would</li>
+    </ul>
+    <table>
+      <thead><tr><th>Area</th><th>Works</th><th>Well designed</th></tr></thead>
+      <tbody>
+        <tr><td>Visibility</td><td>The grader's checks pass</td><td>Every target has the narrowest visibility that serves a named user</td></tr>
+        <tr><td>Dependencies</td><td>Everything builds</td><td>Each <code>deps</code> entry matches an import; nothing is there "just in case"</td></tr>
+        <tr><td>Tests</td><td>All pass and cache</td><td>Sizes, tags, and suites say how and when each test runs</td></tr>
+        <tr><td>Configuration</td><td>EU and CI builds work</td><td>The flag is read in one place, as close to the data as possible</td></tr>
+        <tr><td>Generated code</td><td>The golden test passes</td><td>You can regenerate and bless the golden in one command (stretch)</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="lesson-section" id="stretch">
+    <h2>Stretch goals</h2>
+    <p>None of these are graded. Several add targets or tests, so try them on a copy of <code>work/c1</code> or after
+      you have passed.</p>
+    <ul>
+      <li><strong>A pytest macro.</strong> Write <code>tools/bazel/pytest.bzl</code> with a
+        <code>py_pytest_test</code> macro that adds <code>pytest_main.py</code>, <code>main</code>,
+        <code>args</code>, and <code>@pypi//pytest</code> for you (<a href="../modules/m08-genrules-macros.html">M08</a>).</li>
+      <li><strong>A quote test macro.</strong> Remove the repeated <code>data</code> and <code>env</code> for
+        <code>FMTCLI</code> with a macro for "executables that run the Go formatter".</li>
+      <li><strong>Bless the golden in one command.</strong> Add <code>//data:update_golden</code>, a
+        <code>py_binary</code> that copies the generated file over the golden with
+        <code>BUILD_WORKSPACE_DIRECTORY</code>.</li>
+      <li><strong>A second service.</strong> Add <code>//services/invoice</code> that uses the pricing library without
+        any BUILD change outside its own package. Then check how <code>rdeps</code> changes.</li>
+      <li><strong>Name the group.</strong> Replace <code>//services:__subpackages__</code> with a
+        <code>package_group</code> named <code>//libs:services</code> and use it everywhere.</li>
+      <li><strong>Test both regions.</strong> Make <code>bazel test //... --config=eu</code> assert EUR in
+        <code>quote_test</code>, and run both regions in CI. How does the cache behave when you alternate?</li>
+      <li><strong>Inspect an action.</strong> Use <code>bazel aquery 'mnemonic("RunBinary", //data:catalog_gen)'</code>
+        to see the exact command line <code>run_binary</code> produces.</li>
+      <li><strong>Share a cache.</strong> Add <code>--disk_cache</code> in <code>user.bazelrc</code>, delete
+        <code>bazel-*</code> output with <code>bazel clean</code>, and watch the next build come back from the
+        cache.</li>
+    </ul>
+  </section>
+
+  <section class="lesson-section" id="recap">
+    <h2>Recap</h2>
+    <ul>
+      <li>Packages and visibility turn an architecture diagram into rules the build enforces.</li>
+      <li><code>MODULE.bazel</code> names every rule set and toolchain; <code>pip.parse</code> and a hashed lock make
+        PyPI dependencies reproducible.</li>
+      <li>Programs find data and other programs through runfiles, with <code>data</code> and
+        <code>$(rlocationpath)</code>.</li>
+      <li>Sizes, <code>manual</code>, and <code>test_suite</code> decide how tests run; unchanged tests come from the
+        cache.</li>
+      <li>A <code>string_flag</code> and one <code>select()</code> near the data choose build variants;
+        <code>.bazelrc</code> configs name them.</li>
+      <li>Generated code lives in <code>bazel-bin</code>; a <code>diff_test</code> against a golden file makes changes
+        to it reviewable.</li>
+      <li><code>rdeps</code>, <code>somepath</code>, and <code>kind</code> answer "what depends on this?" and "what does
+        this change affect?" with facts.</li>
+    </ul>
+    <p>That is Level 1. The <a href="../reference/roadmap.html">roadmap</a> shows what comes next: toolchains, remote
+      caching and execution, and writing your own rules.</p>
+    <p>Going further: <a href="https://bazel.build/concepts/visibility">Visibility</a> ·
+      <a href="https://bazel.build/extending/config">Configurations</a> ·
+      <a href="https://rules-python.readthedocs.io/">rules_python docs</a> ·
+      <a href="https://github.com/bazel-contrib/rules_go">rules_go</a> ·
+      <a href="https://registry.bazel.build/">Bazel Central Registry</a></p>
+  </section>
+</main>
+</body>
+</html>

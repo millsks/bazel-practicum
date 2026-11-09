@@ -1,0 +1,25 @@
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "stock",
+    srcs = ["stock.py"],
+    deps = ["//common:text"],
+)
+
+py_test(
+    name = "stock_test",
+    size = "small",
+    srcs = ["stock_test.py"],
+    deps = [":stock"],
+)
+
+# Talks to the real warehouse API: run it on purpose, never from //...
+py_test(
+    name = "warehouse_live_test",
+    srcs = ["warehouse_live_test.py"],
+    tags = [
+        "external",
+        "manual",
+    ],
+    deps = [":stock"],
+)

@@ -1,0 +1,2 @@
+# docs/guides is its own package. Its files belong to //docs/guides, not to //docs.
+exports_files(["setup.md"])

@@ -1,0 +1,44 @@
+[[check]]
+name = "the docs package loads"
+command = ["query", "//docs:all"]
+message = "Bazel could not load docs/BUILD.bazel (or tools/docs.bzl). Read the first ERROR line; a fail(\"TODO ...\") means markdown_toc is not written yet."
+
+[[check]]
+name = "both tables of contents come from markdown_toc"
+command = ["query", "attr(generator_function, markdown_toc, //docs:all)"]
+stdout_lines = ["//docs:faq", "//docs:faq_gen", "//docs:guide", "//docs:guide_gen"]
+message = "Every target in //docs should be created by markdown_toc: call it twice (name = \"guide\" and name = \"faq\") and remove the hand-written rules."
+
+[[check]]
+name = "the generator is a genrule named <name>_gen"
+command = ["query", "kind(genrule, //docs:all)"]
+stdout_lines = ["//docs:faq_gen", "//docs:guide_gen"]
+message = "markdown_toc should create a genrule called name + \"_gen\"."
+
+[[check]]
+name = "the tool is in tools, not srcs"
+command = ["query", "labels(tools, //docs:faq_gen)"]
+stdout_contains = ["//tools:toc"]
+message = "A binary the command runs goes in the genrule's tools, so Bazel builds it for the exec configuration."
+
+[[check]]
+name = "both tables of contents build"
+command = ["build", "//docs:all"]
+message = "Run `pixi run bazel build //docs:all` in work/m08-lab2 and read the first ERROR line."
+
+[[check]]
+name = "the FAQ's table of contents is in bazel-bin"
+file_contains = { "bazel-bin/docs/faq.toc.md" = "  - Where are the outputs?" }
+message = "bazel-bin/docs/faq.toc.md should list the FAQ's headings. The output must be named name + \".toc.md\"."
+
+[[check]]
+name = "the generated files match the goldens"
+command = ["test", "//grading:all", "--test_output=errors"]
+message = "The grader's diff_tests compare //docs:guide and //docs:faq with its golden files. Each filegroup must hold exactly the generated .toc.md file, and be visible to //grading:__subpackages__."
+
+[[check]]
+name = "the macro's genrule output stays private"
+command = ["build", "//grading/peek:peek"]
+expect = "failure"
+output_contains = ["is not visible from"]
+message = "Only the filegroup should take the caller's visibility. Give the genrule visibility = [\"//visibility:private\"], so its output is reachable only through the filegroup."

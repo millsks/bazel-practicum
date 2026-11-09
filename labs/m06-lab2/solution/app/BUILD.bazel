@@ -1,0 +1,11 @@
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "device",
+    srcs = ["device.py"],
+    data = select({
+        "//platforms:gpu": ["gpu.txt"],
+        "//conditions:default": ["cpu.txt"],
+    }),
+    deps = ["@rules_python//python/runfiles"],
+)

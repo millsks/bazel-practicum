@@ -1,0 +1,2 @@
+# TODO: declare a go_binary named "wc" for main.go.
+# It imports example.com/wordtools/textutil, and //tests needs to use it.

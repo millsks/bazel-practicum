@@ -1,0 +1,8 @@
+load("@rules_python//python:defs.bzl", "py_binary")
+
+# cli.py imports lib.greet, but nothing here says so yet.
+# Create the //lib package, then add it to deps.
+py_binary(
+    name = "cli",
+    srcs = ["cli.py"],
+)

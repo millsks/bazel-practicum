@@ -1,0 +1,18 @@
+load("@skylib//rules:write_file.bzl", "write_file")
+
+write_file(
+    name = "title",
+    out = "title.txt",
+    content = ["Getting started"],
+)
+
+genrule(
+    name = "page",
+    srcs = [
+        "@textkit//:banner",
+        ":title",
+    ],
+    outs = ["page.txt"],
+    cmd = "cat $(location @textkit//:banner) $(location :title) > $@",
+    visibility = ["//tests:__pkg__"],
+)

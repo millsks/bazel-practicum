@@ -1,0 +1,8 @@
+load("@rules_python//python:defs.bzl", "py_test")
+
+# Added by the grader: a test in another package that uses textstats as a client would.
+py_test(
+    name = "textstats_api_test",
+    srcs = ["textstats_api_test.py"],
+    deps = ["//libs/textstats"],
+)

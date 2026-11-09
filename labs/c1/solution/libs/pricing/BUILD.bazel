@@ -1,0 +1,27 @@
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+# The pricing library. Services may use it; nothing else may.
+py_library(
+    name = "pricing",
+    srcs = ["pricing.py"],
+    visibility = ["//services:__subpackages__"],
+    deps = [
+        "//data:catalog",
+        "@pypi//tabulate",
+    ],
+)
+
+py_test(
+    name = "pricing_test",
+    size = "small",
+    srcs = [
+        "pricing_test.py",
+        "pytest_main.py",
+    ],
+    args = ["$(rootpath pricing_test.py)"],
+    main = "pytest_main.py",
+    deps = [
+        ":pricing",
+        "@pypi//pytest",
+    ],
+)

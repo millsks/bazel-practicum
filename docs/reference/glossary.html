@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Glossary · Bazel Practicum</title>
+<link rel="stylesheet" href="../assets/css/course.css">
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/viz.js" defer></script>
+<script src="../assets/js/viz-bazel.js" defer></script>
+<script src="../assets/js/course.js" defer></script>
+</head>
+<body data-root="../" data-page="ref-glossary">
+<main class="lesson">
+  <header class="lesson-hero">
+    <p class="eyebrow">Reference · Glossary</p>
+    <h1>Glossary</h1>
+    <p class="lede">The terms this course uses, in plain language, each linked to the section that teaches it.
+      Definitions describe Bazel 9.3 with Bzlmod.</p>
+    <div class="lesson-meta"><span>⏱ Look things up as you go</span><span>Alphabetical, grouped for the table of contents</span></div>
+  </header>
+
+  <section class="lesson-section" id="a-c">
+    <h2>A–C</h2>
+    <dl>
+      <dt><strong>Action</strong></dt>
+      <dd>One command Bazel runs during execution, with exactly declared inputs and outputs, such as a compile step,
+        a genrule's command, or a test run. <a href="../modules/m02-build-graph.html#actions">M02</a></dd>
+      <dt><strong>Action key</strong> (action cache key)</dt>
+      <dd>A hash of an action's command line, environment, and input contents. Same key means Bazel can reuse the
+        stored result instead of running the action. <a href="../modules/m02-build-graph.html#actions">M02</a></dd>
+      <dt><strong>Analysis phase</strong></dt>
+      <dd>The second phase of a build: each target's rule runs in a configuration, checks its dependencies (existence,
+        visibility, providers), and declares actions. Nothing executes yet. <a href="../modules/m02-build-graph.html#phases">M02</a></dd>
+      <dt><strong>Apparent repository name</strong></dt>
+      <dd>The name your module uses for a dependency, such as <code>@rules_python</code> (or a <code>repo_name</code>
+        you chose). Compare <em>canonical repository name</em>. <a href="../modules/m04-bzlmod-pypi.html#repo-names">M04</a></dd>
+      <dt><strong>aquery</strong></dt>
+      <dd>The action query: lists the actions behind targets, with mnemonics, command lines, inputs, and outputs.
+        <a href="../modules/m09-query-debugging.html#aquery">M09</a></dd>
+      <dt><strong>Bazel Central Registry</strong> (BCR)</dt>
+      <dd>The default registry of Bazel modules at registry.bazel.build, where <code>bazel_dep</code> versions come
+        from. <a href="../modules/m04-bzlmod-pypi.html#versions">M04</a></dd>
+      <dt><strong>.bazelrc</strong></dt>
+      <dd>A file of default options per command (<code>build</code>, <code>test</code>, <code>common</code>, ...) and
+        named configs such as <code>build:ci</code> used with <code>--config=ci</code>.
+        <a href="../modules/m06-configuration.html#bazelrc">M06</a></dd>
+      <dt><strong>.bazelversion</strong></dt>
+      <dd>A file holding the Bazel release a workspace uses. Bazelisk reads it and runs that version.
+        <a href="../modules/m00-orientation.html#three-files">M00</a></dd>
+      <dt><strong>Bazelisk</strong></dt>
+      <dd>A launcher that downloads and runs the Bazel version in <code>.bazelversion</code>. Pixi installs it; this
+        repository wraps it as <code>bazel</code>. <a href="../modules/m00-orientation.html#labs">M00</a></dd>
+      <dt><strong>bazel-bin, bazel-out, bazel-testlogs</strong></dt>
+      <dd>Convenience symlinks Bazel creates in the workspace, pointing into its output tree: built files, all outputs
+        by configuration, and test logs. Never commit them. <a href="../modules/m00-orientation.html#reading-output">M00</a>,
+        <a href="../modules/m05-testing.html#test-output">M05</a></dd>
+      <dt><strong>bazel_dep</strong></dt>
+      <dd>The <code>MODULE.bazel</code> call that declares a dependency on another module at a minimum version.
+        <a href="../modules/m04-bzlmod-pypi.html#module-file">M04</a></dd>
+      <dt><strong>BUILD file</strong> (<code>BUILD.bazel</code> or <code>BUILD</code>)</dt>
+      <dd>The Starlark file that declares a package's targets. Its directory becomes a package.
+        <a href="../modules/m01-workspaces-targets.html#build-files">M01</a></dd>
+      <dt><strong>Build setting</strong></dt>
+      <dd>A user-defined flag, such as bazel_skylib's <code>string_flag</code> or <code>bool_flag</code>, set on the
+        command line as <code>--//config:env=prod</code> and read by <code>select()</code>.
+        <a href="../modules/m06-configuration.html#build-settings">M06</a></dd>
+      <dt><strong>Bzlmod</strong></dt>
+      <dd>Bazel's module system for external dependencies, driven by <code>MODULE.bazel</code>. It replaced
+        <code>WORKSPACE</code>, which Bazel 9 removed. <a href="../modules/m04-bzlmod-pypi.html#module-file">M04</a></dd>
+      <dt><strong>Cached test result</strong></dt>
+      <dd>A test whose inputs did not change is not run again; Bazel reports <code>(cached) PASSED</code>.
+        <a href="../modules/m05-testing.html#cached-tests">M05</a></dd>
+      <dt><strong>Canonical repository name</strong></dt>
+      <dd>The unique name Bazel uses internally, such as <code>@@rules_python+</code>. It appears in error messages;
+        do not write it in BUILD files. <a href="../modules/m04-bzlmod-pypi.html#repo-names">M04</a></dd>
+      <dt><strong>Configuration</strong></dt>
+      <dd>The set of build options that affect outputs (compilation mode, platform, build settings). The same target
+        built in two configurations produces two outputs. <a href="../modules/m06-configuration.html#configuration">M06</a></dd>
+      <dt><strong>config_setting</strong></dt>
+      <dd>A target that matches a configuration (by option values, build settings, or constraints) and serves as a
+        key in <code>select()</code>. <a href="../modules/m06-configuration.html#select">M06</a></dd>
+      <dt><strong>Constraint</strong> (constraint_setting, constraint_value)</dt>
+      <dd>A dimension of a platform, such as OS or CPU, and one value of it, such as <code>@platforms//os:linux</code>.
+        <a href="../modules/m06-configuration.html#platforms">M06</a></dd>
+      <dt><strong>cquery</strong></dt>
+      <dd>The configured query: like <code>query</code>, but with <code>select()</code> resolved for the flags you
+        pass. <a href="../modules/m06-configuration.html#cquery">M06</a>, <a href="../modules/m09-query-debugging.html#cquery">M09</a></dd>
+      <dt><strong>Cycle</strong> (dependency cycle)</dt>
+      <dd>Targets that depend on each other in a loop; analysis fails. Break it by extracting the shared part into its
+        own target. <a href="../modules/m02-build-graph.html#cycles">M02</a></dd>
+    </dl>
+  </section>
+
+  <section class="lesson-section" id="d-g">
+    <h2>D–G</h2>
+    <dl>
+      <dt><strong><code>data</code></strong></dt>
+      <dd>The attribute for files a program or test reads at run time; they are placed in its runfiles.
+        <a href="../modules/m02-build-graph.html#edges">M02</a>, <a href="../modules/m03-rules-python.html#runfiles">M03</a></dd>
+      <dt><strong><code>deps</code></strong></dt>
+      <dd>The attribute for code dependencies (libraries). The dependency must provide what the rule expects, such as
+        <code>PyInfo</code>. <a href="../modules/m02-build-graph.html#edges">M02</a></dd>
+      <dt><strong>dev_dependency</strong></dt>
+      <dd>A <code>bazel_dep</code> or extension use that only applies when your module is the root, such as test
+        tooling. <a href="../modules/m04-bzlmod-pypi.html#dev-and-overrides">M04</a></dd>
+      <dt><strong>diff_test</strong></dt>
+      <dd>bazel_skylib's test that passes when two files are identical; the basis of the golden-file pattern.
+        <a href="../modules/m08-genrules-macros.html#golden">M08</a></dd>
+      <dt><strong>Disk cache</strong></dt>
+      <dd>A local directory, set with <code>--disk_cache=PATH</code>, that stores action results across clean builds
+        and workspaces. <a href="../modules/m02-build-graph.html#incremental">M02</a></dd>
+      <dt><strong>embed</strong></dt>
+      <dd>The rules_go attribute that compiles a <code>go_test</code> together with a library's sources, so internal
+        tests can see unexported names. <a href="../modules/m07-rules-go.html#go-test">M07</a></dd>
+      <dt><strong>Execution phase</strong></dt>
+      <dd>The third phase: Bazel runs the actions whose outputs are needed and not already cached.
+        <a href="../modules/m02-build-graph.html#phases">M02</a></dd>
+      <dt><strong>exports_files</strong></dt>
+      <dd>Makes source files in a package usable (visible) from other packages. In Bazel 9, files are private to their
+        package otherwise. <a href="../modules/m02-build-graph.html#source-files">M02</a></dd>
+      <dt><strong>Flaky test</strong></dt>
+      <dd>A test that sometimes passes and sometimes fails with the same inputs. <code>flaky = True</code> retries it;
+        <code>--runs_per_test</code> helps find it. <a href="../modules/m05-testing.html#flaky">M05</a></dd>
+      <dt><strong>Gazelle</strong></dt>
+      <dd>A BUILD-file generator for Go (and, with extensions, Python), covered in Level 2.
+        <a href="../modules/m07-rules-go.html#gazelle">M07</a></dd>
+      <dt><strong>Generated file</strong></dt>
+      <dd>A file target produced by a rule (for example a genrule's <code>outs</code>); it lives under
+        <code>bazel-bin</code> and is used by label like any file. <a href="../modules/m01-workspaces-targets.html#targets">M01</a>,
+        <a href="../modules/m08-genrules-macros.html#genrule">M08</a></dd>
+      <dt><strong>genrule</strong></dt>
+      <dd>A native rule that runs a shell command with declared <code>srcs</code>, <code>tools</code>, and
+        <code>outs</code>. <a href="../modules/m08-genrules-macros.html#genrule">M08</a></dd>
+      <dt><strong>glob()</strong></dt>
+      <dd>A BUILD-file function that lists files matching patterns in the current package; it never crosses into a
+        subpackage. <a href="../modules/m01-workspaces-targets.html#boundary">M01</a></dd>
+      <dt><strong>Golden file</strong></dt>
+      <dd>A checked-in expected output that a <code>diff_test</code> compares against a generated file.
+        <a href="../modules/m08-genrules-macros.html#golden">M08</a></dd>
+      <dt><strong>GoInfo</strong></dt>
+      <dd>The provider rules_go targets return; <code>go_*</code> rules require it in <code>deps</code> and
+        <code>embed</code>. <a href="../modules/m07-rules-go.html#providers">M07</a></dd>
+    </dl>
+  </section>
+
+  <section class="lesson-section" id="h-m">
+    <h2>H–M</h2>
+    <dl>
+      <dt><strong>Hermeticity</strong></dt>
+      <dd>Builds that depend only on declared inputs and pinned tools, so they produce the same result anywhere.
+        <a href="../modules/m02-build-graph.html#hermeticity">M02</a></dd>
+      <dt><strong>Hub</strong> (pip hub)</dt>
+      <dd>The repository that <code>pip.parse</code> creates, exposing one target per pinned distribution, used as
+        <code>@pypi//requests</code>. <a href="../modules/m04-bzlmod-pypi.html#pip">M04</a></dd>
+      <dt><strong><code>imports</code></strong></dt>
+      <dd>The rules_python attribute that adds directories to the import path, for example <code>["src"]</code> for
+        a src layout. <a href="../modules/m03-rules-python.html#src-layout">M03</a></dd>
+      <dt><strong>Incompatible target</strong></dt>
+      <dd>A target whose <code>target_compatible_with</code> constraints the target platform does not satisfy; wildcard
+        builds skip it. <a href="../modules/m06-configuration.html#platforms">M06</a></dd>
+      <dt><strong>Label</strong></dt>
+      <dd>A target's name: <code>@repo//package/path:name</code>. <code>//pkg</code> means <code>//pkg:pkg</code>;
+        <code>:name</code> is relative to the current package. <a href="../modules/m01-workspaces-targets.html#labels">M01</a></dd>
+      <dt><strong>Loading phase</strong></dt>
+      <dd>The first phase: Bazel evaluates <code>MODULE.bazel</code>, BUILD files, and loaded <code>.bzl</code> files to
+        build the target graph. <a href="../modules/m02-build-graph.html#phases">M02</a></dd>
+      <dt><strong>load()</strong></dt>
+      <dd>Imports symbols from a <code>.bzl</code> file into a BUILD or <code>.bzl</code> file. Bazel 9 requires it for
+        every rule-set rule. <a href="../modules/m00-orientation.html#three-files">M00</a></dd>
+      <dt><strong>Lock file</strong> (requirements)</dt>
+      <dd>A fully pinned, hashed requirements file that <code>pip.parse</code> reads; generate it with
+        <code>compile_pip_requirements</code>. <a href="../modules/m04-bzlmod-pypi.html#lock-file">M04</a></dd>
+      <dt><strong>Macro</strong></dt>
+      <dd>A Starlark function in a <code>.bzl</code> file that declares targets. Legacy macros are plain functions;
+        symbolic macros use <code>macro()</code>. <a href="../modules/m08-genrules-macros.html#macros">M08</a></dd>
+      <dt><strong>Make variables</strong></dt>
+      <dd>Placeholders such as <code>$(location ...)</code>, <code>$(rlocationpath ...)</code>, and <code>$@</code> that
+        Bazel expands in <code>cmd</code>, <code>args</code>, and <code>env</code>.
+        <a href="../modules/m08-genrules-macros.html#make-variables">M08</a></dd>
+      <dt><strong><code>manual</code> tag</strong></dt>
+      <dd>Excludes a target from wildcard patterns like <code>//...</code>; it still runs when named, or through a
+        <code>test_suite</code> that lists it. <a href="../modules/m05-testing.html#tags">M05</a></dd>
+      <dt><strong>Minimal Version Selection</strong> (MVS)</dt>
+      <dd>Bzlmod's resolution rule: each module gets the highest of the minimum versions anyone asked for.
+        <a href="../modules/m04-bzlmod-pypi.html#versions">M04</a></dd>
+      <dt><strong>Module</strong></dt>
+      <dd>A versioned unit of Bazel code with a <code>MODULE.bazel</code> file: your workspace, or a dependency such as
+        <code>rules_python</code>. <a href="../modules/m04-bzlmod-pypi.html#module-file">M04</a></dd>
+      <dt><strong>Module extension</strong></dt>
+      <dd>Code in a dependency that creates repositories from tags in your <code>MODULE.bazel</code>, such as
+        rules_python's <code>pip</code>; bring its repositories into scope with <code>use_repo</code>.
+        <a href="../modules/m04-bzlmod-pypi.html#extensions">M04</a></dd>
+      <dt><strong>MODULE.bazel</strong></dt>
+      <dd>The file at the workspace root that names the module and declares its dependencies.
+        <a href="../modules/m01-workspaces-targets.html#workspace">M01</a></dd>
+      <dt><strong>MODULE.bazel.lock</strong></dt>
+      <dd>A generated file recording resolved module versions and extension results; commit it in real projects.
+        <a href="../modules/m04-bzlmod-pypi.html#module-lock">M04</a></dd>
+    </dl>
+  </section>
+
+  <section class="lesson-section" id="o-r">
+    <h2>O–R</h2>
+    <dl>
+      <dt><strong>Override</strong></dt>
+      <dd><code>single_version_override</code>, <code>local_path_override</code>, <code>git_override</code>, and
+        <code>archive_override</code> change where or which version of a module comes from; only the root module's
+        overrides apply. <a href="../modules/m04-bzlmod-pypi.html#dev-and-overrides">M04</a></dd>
+      <dt><strong>Package</strong></dt>
+      <dd>A directory with a BUILD file, plus everything below it that is not another package.
+        <a href="../modules/m01-workspaces-targets.html#build-files">M01</a></dd>
+      <dt><strong>package_group</strong></dt>
+      <dd>A named set of packages used in <code>visibility</code>. <a href="../modules/m02-build-graph.html#visibility">M02</a></dd>
+      <dt><strong>Platform</strong></dt>
+      <dd>A set of constraint values describing a machine. <code>--platforms</code> selects the target platform.
+        <a href="../modules/m06-configuration.html#platforms">M06</a></dd>
+      <dt><strong>Provider</strong></dt>
+      <dd>Structured information a target passes to its dependents, such as <code>PyInfo</code> or <code>GoInfo</code>.
+        Rules require certain providers in certain attributes. <a href="../modules/m02-build-graph.html#providers">M02</a></dd>
+      <dt><strong>PyInfo</strong></dt>
+      <dd>The provider Python rules return and require in <code>deps</code>. A <code>filegroup</code> in
+        <code>deps</code> fails because it lacks it. <a href="../modules/m02-build-graph.html#providers">M02</a></dd>
+      <dt><strong>query</strong></dt>
+      <dd>Answers questions about the loading-phase graph with functions such as <code>deps</code>,
+        <code>rdeps</code>, <code>somepath</code>, and <code>kind</code>. It shows both branches of every
+        <code>select()</code>. <a href="../modules/m09-query-debugging.html#language">M09</a></dd>
+      <dt><strong>rdeps</strong></dt>
+      <dd>The query function for reverse dependencies: what in a universe depends on a target. The basis of
+        affected-test selection. <a href="../modules/m09-query-debugging.html#rdeps">M09</a></dd>
+      <dt><strong>Remote cache</strong></dt>
+      <dd>A shared server storing action results, so CI and teammates reuse each other's work. Level 2 covers it.
+        <a href="roadmap.html">Roadmap</a></dd>
+      <dt><strong>Repository</strong> (repo)</dt>
+      <dd>A tree of Bazel packages: the main repository (your workspace) or an external one created for a module or
+        extension. <a href="../modules/m04-bzlmod-pypi.html#repo-names">M04</a></dd>
+      <dt><strong>Rule</strong></dt>
+      <dd>A kind of target, such as <code>py_library</code> or <code>go_test</code>. Rules come from rule sets that you
+        <code>load()</code>, or are native (<code>genrule</code>, <code>filegroup</code>, ...).
+        <a href="../modules/m00-orientation.html#vocabulary">M00</a></dd>
+      <dt><strong>run_binary</strong></dt>
+      <dd>bazel_skylib's rule that runs a binary target as a build action without a shell; preferred over a genrule for
+        that job. <a href="../modules/m08-genrules-macros.html#skylib">M08</a></dd>
+      <dt><strong>Runfiles</strong></dt>
+      <dd>The tree of files a binary or test needs at run time (its code and <code>data</code>), found with the runfiles
+        library. <a href="../modules/m03-rules-python.html#runfiles">M03</a></dd>
+    </dl>
+  </section>
+
+  <section class="lesson-section" id="s-z">
+    <h2>S–Z</h2>
+    <dl>
+      <dt><strong>Sandbox</strong> (sandboxing)</dt>
+      <dd>Running each action in a directory that contains only its declared inputs, so undeclared dependencies fail.
+        <a href="../modules/m02-build-graph.html#hermeticity">M02</a></dd>
+      <dt><strong>select()</strong></dt>
+      <dd>Chooses an attribute value by configuration, keyed by <code>config_setting</code>s or constraints, with
+        <code>//conditions:default</code> as the fallback. <a href="../modules/m06-configuration.html#select">M06</a></dd>
+      <dt><strong>Sharding</strong></dt>
+      <dd>Splitting one test target across several processes with <code>shard_count</code>; the test runner must
+        support it. <a href="../modules/m05-testing.html#sharding">M05</a></dd>
+      <dt><strong>Size</strong> (test size)</dt>
+      <dd><code>small</code>, <code>medium</code> (default), <code>large</code>, or <code>enormous</code>: sets a
+        test's default timeout and resource estimate. <a href="../modules/m05-testing.html#size-timeout">M05</a></dd>
+      <dt><strong>somepath, allpaths</strong></dt>
+      <dd>Query functions that show one or all dependency paths between targets: the answer to "why does X depend on
+        Y?" <a href="../modules/m09-query-debugging.html#paths">M09</a></dd>
+      <dt><strong>Source file</strong></dt>
+      <dd>A file in the workspace used as a target, such as <code>//hello:hello.py</code>.
+        <a href="../modules/m01-workspaces-targets.html#targets">M01</a></dd>
+      <dt><strong>Starlark</strong></dt>
+      <dd>The Python-like language of BUILD, <code>.bzl</code>, and <code>MODULE.bazel</code> files: deterministic, with no
+        f-strings, <code>while</code>, <code>try</code>, or <code>import</code>. BUILD files also forbid <code>def</code>
+        and top-level <code>for</code>/<code>if</code>. <a href="../modules/m00-orientation.html#vocabulary">M00</a>,
+        <a href="../modules/m08-genrules-macros.html#macros">M08</a></dd>
+      <dt><strong>Subpackage</strong></dt>
+      <dd>A directory with its own BUILD file inside another package; labels and globs cannot reach into it.
+        <a href="../modules/m01-workspaces-targets.html#boundary">M01</a></dd>
+      <dt><strong>Target</strong></dt>
+      <dd>Something in a package Bazel can build or use: a rule, a source file, or a generated file.
+        <a href="../modules/m01-workspaces-targets.html#targets">M01</a></dd>
+      <dt><strong>Target pattern</strong></dt>
+      <dd>A way to name many targets: <code>//...</code>, <code>//pkg/...</code>, <code>//pkg:all</code>,
+        <code>//pkg:*</code>, and exclusions after <code>--</code>. <a href="../modules/m01-workspaces-targets.html#patterns">M01</a></dd>
+      <dt><strong>test_suite</strong></dt>
+      <dd>A native rule that groups tests by list or by tag. <a href="../modules/m05-testing.html#test-suite">M05</a></dd>
+      <dt><strong>testonly</strong></dt>
+      <dd>Marks a target as usable only by tests and other <code>testonly</code> targets.
+        <a href="../modules/m02-build-graph.html#testonly">M02</a>, <a href="../modules/m05-testing.html#testonly">M05</a></dd>
+      <dt><strong>TEST_TMPDIR</strong></dt>
+      <dd>The writable scratch directory Bazel gives each test; write there, never next to your sources.
+        <a href="../modules/m05-testing.html#test-env">M05</a></dd>
+      <dt><strong>Toolchain</strong></dt>
+      <dd>A pinned tool (a Python interpreter, the Go SDK) that Bazel selects for a platform, so builds do not use
+        whatever is installed. <a href="../modules/m03-rules-python.html#toolchain">M03</a>,
+        <a href="../modules/m07-rules-go.html#module-setup">M07</a></dd>
+      <dt><strong><code>tools</code></strong></dt>
+      <dd>The genrule attribute for programs the command runs; they are built for the execution platform, unlike
+        <code>srcs</code>. <a href="../modules/m08-genrules-macros.html#tools">M08</a></dd>
+      <dt><strong>use_repo</strong></dt>
+      <dd>Brings repositories created by a module extension into your module's scope, such as
+        <code>use_repo(pip, pypi = "weather_pypi")</code>. <a href="../modules/m04-bzlmod-pypi.html#extensions">M04</a></dd>
+      <dt><strong>Visibility</strong></dt>
+      <dd>Who may depend on a target: private by default, or <code>//visibility:public</code>,
+        <code>//pkg:__pkg__</code>, <code>//pkg:__subpackages__</code>, or a <code>package_group</code>.
+        <a href="../modules/m02-build-graph.html#visibility">M02</a></dd>
+      <dt><strong>WORKSPACE</strong></dt>
+      <dd>The pre-Bzlmod file for external dependencies. Disabled by default in Bazel 8 and removed in Bazel 9; seeing
+        it marks an old tutorial. <a href="../modules/m00-orientation.html#three-files">M00</a></dd>
+      <dt><strong>Workspace</strong></dt>
+      <dd>The directory tree Bazel builds, rooted where <code>MODULE.bazel</code> lives.
+        <a href="../modules/m01-workspaces-targets.html#workspace">M01</a></dd>
+    </dl>
+  </section>
+</main>
+</body>
+</html>

@@ -1,0 +1,33 @@
+[[check]]
+name = "the script runs under bazel run"
+command = ["run", "//tools:affected_tests", "--", "billing/invoice.py"]
+message = "Bazel refuses to run inside its own output tree. cd to \"$BUILD_WORKSPACE_DIRECTORY\" before calling bazel query."
+
+[[check]]
+name = "a library change selects exactly its tests"
+command = ["run", "//tools:affected_tests", "--", "billing/invoice.py"]
+stdout_lines = ["//billing:invoice_test"]
+message = "Print only tests: wrap the rdeps() in tests(), or intersect it with kind(test, //...)."
+
+[[check]]
+name = "a template change selects only the render test"
+command = ["run", "//tools:affected_tests", "--", "web/templates/receipt.html"]
+stdout_lines = ["//web:render_test"]
+message = "Data files are edges too: rdeps() follows data, so the template reaches //web:render_test through //common:render."
+
+[[check]]
+name = "manual tests are left out"
+command = ["run", "//tools:affected_tests", "--", "common/text.py"]
+stdout_lines = ["//billing:invoice_test", "//common:text_test", "//inventory:stock_test"]
+message = "//inventory:warehouse_live_test is tagged manual, so `bazel test //...` never runs it. Subtract attr(tags, manual, //...)."
+
+[[check]]
+name = "files outside any package are skipped, not fatal"
+command = ["run", "//tools:affected_tests", "--", "README.md", "inventory/stock.py"]
+stdout_lines = ["//inventory:stock_test"]
+message = "README.md is in no package, so plain `bazel query` fails with \"couldn't determine target from filename\". Use --keep_going, and treat exit code 3 (partial success) as success."
+
+[[check]]
+name = "every regular test still passes"
+command = ["test", "//...", "--test_output=errors"]
+message = "Run `pixi run bazel test //...`: the script change should not affect the tests."

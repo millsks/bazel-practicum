@@ -1,0 +1,37 @@
+[[check]]
+name = "the generated module builds"
+command = ["build", "//palette:constants_gen"]
+message = "Run `pixi run bazel build //palette:constants_gen` in work/m08-lab1 and read the first ERROR line. A binary you run belongs in genrule's tools (or run_binary's tool), not in srcs."
+
+[[check]]
+name = "the generated module contains every color"
+file_contains = { "bazel-bin/palette/constants.py" = "TEAL = \"#008080\"" }
+message = "bazel-bin/palette/constants.py should define TEAL. Build //palette:constants_gen and look at the file."
+
+[[check]]
+name = "the generator runs through run_binary"
+command = ["query", "kind(run_binary, //palette:all)"]
+stdout_contains = ["//palette:constants_gen"]
+message = "Replace the genrule with a run_binary (from @bazel_skylib//rules:run_binary.bzl) of the same name."
+
+[[check]]
+name = "run_binary's tool is the generator"
+command = ["query", "labels(tool, //palette:constants_gen)"]
+stdout_contains = ["//tools:gen_constants"]
+message = "Set tool = \"//tools:gen_constants\" on //palette:constants_gen."
+
+[[check]]
+name = "the test imports the generated module and passes"
+command = ["test", "//palette:constants_test", "--test_output=errors"]
+message = "constants_test imports palette.constants, which is generated. Fix the generator target first."
+
+[[check]]
+name = "a diff_test guards the golden file"
+command = ["query", "kind(diff_test, //palette:all)"]
+stdout_contains = ["//palette:constants_golden_test"]
+message = "Add diff_test(name = \"constants_golden_test\", file1 = \":constants.py\", file2 = \"constants.golden.py\")."
+
+[[check]]
+name = "every test passes, including the golden comparison"
+command = ["test", "//...", "--test_output=errors"]
+message = "If constants_golden_test fails, the golden is out of date: review the diff, then run `pixi run bazel run //palette:update_golden` to bless it."

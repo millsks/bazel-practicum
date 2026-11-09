@@ -1,0 +1,8 @@
+load("@rules_python//python:defs.bzl", "py_binary")
+
+# A code generator: turns a CSV of NAME,value rows into a Python constants module.
+py_binary(
+    name = "gen_constants",
+    srcs = ["gen_constants.py"],
+    visibility = ["//visibility:public"],
+)

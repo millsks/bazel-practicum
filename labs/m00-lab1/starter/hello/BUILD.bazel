@@ -1,0 +1,14 @@
+# Bazel 9 does not load Python rules automatically. Something is missing above this line.
+
+py_library(
+    name = "greeting",
+    srcs = ["greeting.py"],
+)
+
+py_binary(
+    name = "hello",
+    srcs = ["hello.py"],
+    deps = [":greeting"],
+)
+
+# TODO: add a py_test named "greeting_test" for greeting_test.py that depends on :greeting.

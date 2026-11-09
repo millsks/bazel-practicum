@@ -1,0 +1,57 @@
+[workspace]
+authors = ["Kevin Mills <millsks@gmail.com>"]
+channels = ["conda-forge"]
+name = "bazel-practicum"
+platforms = ["osx-arm64", "osx-64", "linux-64", "win-64"]
+version = "0.1.0"
+
+[dependencies]
+python = "3.14.*"
+structlog = ">=26.1.0,<27"
+# Bazelisk downloads the Bazel version each workspace pins in .bazelversion (9.3.2 throughout the course).
+bazelisk = ">=1.29,<2"
+
+[pypi-dependencies]
+bazel-practicum = { path = ".", editable = true }
+
+[feature.dev.dependencies]
+pytest = ">=9,<10"
+pytest-cov = ">=7,<8"
+mypy = ">=2,<3"
+ruff = ">=0.15,<1"
+pre-commit = ">=4,<5"
+git-cliff = ">=2,<3"
+python-build = ">=1,<2"
+hatchling = ">=1,<2"
+
+[environments]
+default = { features = ["dev"], solve-group = "default" }
+
+[activation]
+scripts = ["scripts/activate.sh"]
+
+[target.win-64.activation]
+scripts = ["scripts/activate.bat"]
+
+[tasks]
+bootstrap = "pre-commit install --install-hooks && pre-commit install --hook-type commit-msg"
+fmt = "ruff format ."
+lint = "ruff check ."
+check = "mypy src/"
+test = "pytest tests/unit/"
+test-integration = "pytest tests/integration/"
+cov = "pytest tests/unit/ --cov=src --cov-report=term-missing --cov-fail-under=90"
+build = "python -m build --no-isolation"
+changelog = "git cliff -o CHANGELOG.md"
+pre-commit-all = "pre-commit run --all-files"
+ci = { depends-on = ["pre-commit-all", "build", "check", "lint", "check-site", "check-exercises", "cov"] }
+
+# Learner workflow
+serve = "practicum serve"
+labs = "practicum labs"
+start = "practicum start"
+grade = "practicum grade"
+check-site = "practicum check-site"
+check-exercises = "practicum check-exercises"
+check-labs = "practicum check-labs"
+bundle = "practicum bundle"

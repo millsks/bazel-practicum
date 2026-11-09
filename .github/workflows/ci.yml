@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  test:
+    name: Lint, types, and unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Pixi
+        uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          pixi-version: latest
+
+      - name: Ruff
+        run: pixi run lint
+
+      - name: Ruff format
+        run: pixi run ruff format --check src tests docs/assets/py
+
+      - name: mypy
+        run: pixi run check
+
+      - name: Unit tests with coverage gate
+        run: pixi run cov
+
+  site:
+    name: Site, exercises, and single-file bundle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Pixi
+        uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          pixi-version: latest
+
+      - name: Check site
+        run: pixi run check-site
+
+      - name: Check exercises and sandboxes
+        run: pixi run check-exercises
+
+      - name: Build the single-file edition
+        run: pixi run bundle
+
+      - name: Upload the single-file edition
+        uses: actions/upload-artifact@v4
+        with:
+          name: bazel-practicum-html
+          path: dist/bazel-practicum.html
+          if-no-files-found: error
+
+  labs:
+    name: Labs (real Bazel)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Pixi
+        uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          pixi-version: latest
+
+      - name: Cache Bazel and Bazelisk
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/bazel
+            ~/.cache/bazelisk
+          key: bazel-${{ runner.os }}-${{ hashFiles('labs/**/MODULE.bazel', 'labs/**/.bazelversion') }}
+          restore-keys: |
+            bazel-${{ runner.os }}-
+
+      - name: Grade every lab's solution and starter
+        run: pixi run check-labs

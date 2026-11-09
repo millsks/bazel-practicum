@@ -1,0 +1,3 @@
+id = "m04-lab2"
+title = "bazel_dep, repo_name, overrides, and dev dependencies"
+module = "m04"

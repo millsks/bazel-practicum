@@ -1,0 +1,24 @@
+module(name = "harbor")
+
+# One bazel_dep per rule set the BUILD files load from.
+bazel_dep(name = "rules_python", version = "2.4.6")
+bazel_dep(name = "rules_go", version = "0.65.0")
+bazel_dep(name = "bazel_skylib", version = "1.9.2")
+
+# The hermetic Python interpreter every py_* target uses.
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(python_version = "3.13", is_default = True)
+
+# PyPI packages, pinned with hashes in requirements_lock.txt.
+# rules_python reserves hub_name = "pypi", so the hub is named after the module and aliased.
+pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
+pip.parse(
+    hub_name = "harbor_pypi",
+    python_version = "3.13",
+    requirements_lock = "//:requirements_lock.txt",
+)
+use_repo(pip, pypi = "harbor_pypi")
+
+# The hermetic Go SDK for //tools/fmtcli.
+go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk")
+go_sdk.download(version = "1.25.3")

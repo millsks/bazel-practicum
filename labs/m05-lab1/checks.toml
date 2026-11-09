@@ -1,0 +1,32 @@
+[[check]]
+name = "the workspace builds"
+command = ["build", "//..."]
+message = "Run `pixi run bazel build //...` in work/m05-lab1 and read the first ERROR line."
+
+[[check]]
+name = "the deck tests pass ten times in a row"
+command = ["test", "//deck:all", "--runs_per_test=10", "--test_output=errors"]
+message = "A test that depends on unseeded randomness fails some of the time. Pass a seeded random.Random to shuffle() in the test, so every run sees the same shuffles."
+
+[[check]]
+name = "the test is fixed, not retried"
+command = ["query", "attr(flaky, 1, //...)"]
+stdout_lines = []
+message = "Do not hide the problem with flaky = True: make the test deterministic and remove the attribute."
+
+[[check]]
+name = "shuffle() uses the generator it is given"
+command = ["test", "//grading:seeded_shuffle_test", "--test_output=errors"]
+message = "The grader calls shuffle(cards, random.Random(7)) twice and expects the same order. Add an rng parameter (default None) and shuffle with it."
+
+[[check]]
+name = "every test is sized small"
+command = ["test", "//..."]
+output_lacks = ["There were tests whose specified size is too big"]
+message = "Bazel suggests a smaller size for a test that finishes far inside its timeout. Set size = \"small\" on //deck:deck_test."
+
+[[check]]
+name = "a second run comes from the cache"
+command = ["test", "//deck:all"]
+stdout_contains = ["(cached) PASSED"]
+message = "Run `pixi run bazel test //deck:all` twice; the second run should say (cached) PASSED."

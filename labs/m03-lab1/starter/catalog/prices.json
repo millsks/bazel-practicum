@@ -1,0 +1,5 @@
+{
+  "apple": {"price": 0.5, "count": 12},
+  "bread": {"price": 3.25, "count": 2},
+  "coffee": {"price": 11.0, "count": 3}
+}

@@ -1,0 +1,15 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "textutil",
+    srcs = ["count.go"],
+    importpath = "example.com/wordtools/textutil",
+    visibility = ["//visibility:public"],
+)
+
+# count_test.go is in package textutil (an internal test). Does it compile?
+go_test(
+    name = "textutil_test",
+    srcs = ["count_test.go"],
+    deps = [":textutil"],
+)

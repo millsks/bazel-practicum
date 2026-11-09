@@ -1,0 +1,5 @@
+# Added while chasing a flaky test last spring. Nobody remembers why it is still here.
+test --nocache_test_results
+
+# Show the output of failing tests.
+test --test_output=errors

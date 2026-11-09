@@ -1,0 +1,4 @@
+# Direct PyPI dependencies of this workspace. Ranges are fine here:
+# the lock file is where exact versions and hashes live.
+pytest>=9
+python-dateutil>=2.9

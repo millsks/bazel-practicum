@@ -1,0 +1,13 @@
+load("@bazel_skylib//rules:diff_test.bzl", "diff_test")
+
+diff_test(
+    name = "guide_toc_test",
+    file1 = "//docs:guide",
+    file2 = "guide.toc.golden.md",
+)
+
+diff_test(
+    name = "faq_toc_test",
+    file1 = "//docs:faq",
+    file2 = "faq.toc.golden.md",
+)

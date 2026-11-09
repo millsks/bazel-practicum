@@ -1,0 +1,13 @@
+load("//tools:docs.bzl", "markdown_toc")
+
+markdown_toc(
+    name = "guide",
+    src = "guide.md",
+    visibility = ["//grading:__subpackages__"],
+)
+
+markdown_toc(
+    name = "faq",
+    src = "faq.md",
+    visibility = ["//grading:__subpackages__"],
+)

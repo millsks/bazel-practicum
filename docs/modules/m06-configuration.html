@@ -1,0 +1,1401 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M06 · Configuration, Flags &amp; select() · Bazel Practicum</title>
+<link rel="stylesheet" href="../assets/css/course.css">
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/viz.js" defer></script>
+<script src="../assets/js/viz-bazel.js" defer></script>
+<script src="../assets/js/course.js" defer></script>
+</head>
+<body data-root="../" data-module="m06">
+<main class="lesson">
+  <header class="lesson-hero">
+    <p class="eyebrow">Stage 2 · Growing the Monorepo · Module 06</p>
+    <h1>Configuration, Flags &amp; select()</h1>
+    <p class="lede">The same BUILD files have to produce a debug build on your laptop, an optimized build in CI, and a
+      production build with production settings. Bazel does this with <em>configurations</em>: sets of build options
+      that are decided before anything runs. This module shows how to set them in <code>.bazelrc</code>, define your
+      own flags, branch on them with <code>select()</code>, and describe the machines you build for with platforms.</p>
+    <div class="lesson-meta"><span>⏱ ~2.5 hours</span><span>Prerequisites: <a href="m05-testing.html">M05</a></span></div>
+    <ul class="objectives">
+      <li>Explain what a configuration is, and read it in <code>bazel-out/k8-opt</code> and in <code>cquery</code>'s configuration hash</li>
+      <li>Organize a <code>.bazelrc</code> with <code>common</code>, <code>build</code>, and <code>test</code> lines, named <code>--config</code>s, and a <code>try-import</code>ed personal file</li>
+      <li>Write <code>config_setting</code>s on <code>values</code>, <code>define_values</code>, and <code>flag_values</code>, and choose attribute values with <code>select()</code></li>
+      <li>Diagnose "doesn't match this configuration" and "Illegal ambiguous match" errors, and know which attributes cannot be configured</li>
+      <li>Define your own flags with bazel_skylib's <code>string_flag</code> and <code>bool_flag</code>, and say why they beat <code>--define</code></li>
+      <li>Describe target machines with constraints and <code>platform()</code>, and skip targets with <code>target_compatible_with</code></li>
+      <li>Use <code>cquery</code> to see what a <code>select()</code> resolves to, and keep environment variables out of your build</li>
+    </ul>
+  </header>
+
+  <section class="lesson-section" id="configuration">
+    <h2>What a configuration is</h2>
+    <aside class="callout python">
+      <p>A Python project switches behavior at <em>run time</em>. Django reads <code>DJANGO_SETTINGS_MODULE</code>, a
+        Flask app reads <code>os.environ["APP_ENV"]</code>, and pytest reads <code>pytest.ini</code> and its command
+        line. The same installed code behaves differently depending on what is set when it starts.</p>
+    </aside>
+    <p>Bazel switches behavior at <em>build time</em>. A <strong>configuration</strong> is the full set of build options
+      that can change what a build produces: the compilation mode, the target platform, every custom flag, and many
+      more. Bazel fixes the configuration before analysis, then builds every target in it.</p>
+    <p>The most common option is <code>--compilation_mode</code>, usually written <code>-c</code>. It has three values:</p>
+    <table>
+      <thead><tr><th>Mode</th><th>Meaning</th><th>Typical use</th></tr></thead>
+      <tbody>
+        <tr><td><code>fastbuild</code></td><td>The default: build quickly, little optimization</td><td>Day-to-day development</td></tr>
+        <tr><td><code>dbg</code></td><td>Keep debug information</td><td>Running native code under a debugger</td></tr>
+        <tr><td><code>opt</code></td><td>Optimize, strip asserts in C/C++</td><td>Release builds and benchmarks</td></tr>
+      </tbody>
+    </table>
+    <p>For pure Python code the mode changes little by itself. It matters for compiled extensions (C, Go), and above
+      all it is something your BUILD files can branch on. Anything else is rejected before Bazel starts:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: While parsing option -c fast: Not a valid compilation mode: 'fast' (should be fastbuild, dbg or opt)</code></pre>
+    <h3>Configurations are directories</h3>
+    <p>Because different options can produce different files, Bazel keeps each configuration's outputs apart. Build the
+      same target twice, once with <code>-c opt</code> and once without, and look in <code>bazel-out</code>:</p>
+    <pre data-label="Terminal"><code class="language-bash">pixi run bazel build //app:banner
+pixi run bazel build //app:banner -c opt
+pixi run bazel build //app:banner -c dbg
+ls bazel-out</code></pre>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">_tmp
+k8-dbg
+k8-fastbuild
+k8-opt
+stable-status.txt
+volatile-status.txt</code></pre>
+    <p>The directory name is <code>&lt;cpu&gt;-&lt;mode&gt;</code>. <code>k8</code> is Bazel's historical name for
+      x86-64 Linux; other machines show another prefix. Switching modes does not delete the other directory, so switching
+      back is fast. <code>bazel-bin</code> points into whichever configuration you built last.</p>
+    <h3>Configurations have IDs</h3>
+    <p>Every configuration also has a hash. You saw one already in M03's analysis error,
+      <code>Analysis of target '//app:server' (config: a7a71fd) failed</code>. <code>bazel cquery</code>
+      (<em>configured</em> query, see <a href="#cquery">below</a>) prints it after each target:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">$ bazel cquery //app:banner
+//app:banner (a7a71fd)
+$ bazel cquery //app:banner -c opt
+//app:banner (bf3a44e)</code></pre>
+    <p>Same target, two configurations, two hashes. <code>bazel config</code> lists the configurations the server
+      currently holds, and <code>bazel config &lt;hash&gt;</code> dumps every option in one (hundreds of lines; search it
+      for the option you care about):</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">Available configurations:
+04bf134dfa57115b01daa56bd3a30421a6e74b1819e002496a26c94ed0087067 k8-opt-exec (exec)
+3030ed4c810cf3435d066294fa495e650fe75173e4b4ef410ea56cb683458569 fastbuild-noconfig (test-trimmed)
+498bb92da760dd79755822c370202df896e233a5c94f8b74d237c0f41b576e8f k8-opt
+bf3a44eb59a38421358926558b1f02de09809e935f67c7349f4148d5d8c644dc k8-opt (test-trimmed)</code></pre>
+    <p>Note <code>k8-opt-exec (exec)</code>: tools that run <em>during</em> the build (compilers, code generators) are
+      built in a separate <strong>exec configuration</strong>, optimized by default, even when your own code is
+      <code>fastbuild</code>.</p>
+    <p>Changing an option also costs something. Bazel keeps one analyzed graph in memory, and a new configuration
+      throws it away:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">WARNING: Build option --compilation_mode has changed, discarding analysis cache (this can be expensive, see https://bazel.build/advanced/performance/iteration-speed).</code></pre>
+    <aside class="callout tip">
+      <p>That warning is why teams put their usual options in a file instead of typing them differently each time. Next
+        section.</p>
+    </aside>
+    <p><strong>Remember:</strong> a configuration is the set of options that can change outputs. Each one gets its own
+      <code>bazel-out/&lt;cpu&gt;-&lt;mode&gt;</code> tree and a hash that <code>cquery</code> prints.</p>
+  </section>
+
+  <section class="lesson-section" id="bazelrc">
+    <h2>.bazelrc: options you do not want to type</h2>
+    <aside class="callout python">
+      <p>You keep pytest options in <code>[tool.pytest.ini_options]</code> so nobody has to remember
+        <code>-ra --strict-markers</code>. Pixi tasks do the same for whole commands.</p>
+    </aside>
+    <p>A <strong><code>.bazelrc</code></strong> file holds default options for Bazel commands. Each line starts with the
+      command it applies to, followed by options exactly as you would type them:</p>
+    <pre data-label=".bazelrc"><code class="language-ini"># Every command that accepts the option
+common --//config:verbose=false
+
+# build, and every command that inherits from it
+build --compilation_mode=fastbuild
+
+# Only when you pass --config=prod
+build:prod --//config:env=prod
+build:prod -c opt
+
+# Only for bazel test
+test --test_output=errors
+
+# Personal settings, if the file exists
+try-import %workspace%/user.bazelrc</code></pre>
+    <h3>Which lines apply to which command</h3>
+    <p>Commands inherit options from each other. <code>test</code>, <code>run</code>, and <code>cquery</code> all build,
+      so they read <code>build</code> lines too. <code>common</code> lines apply to every command (Bazel skips options a
+      command does not support). <code>query</code> does not build, so it does <em>not</em> read <code>build</code>
+      lines.</p>
+    <table>
+      <thead><tr><th>Command</th><th>Reads lines for</th></tr></thead>
+      <tbody>
+        <tr><td><code>build</code></td><td><code>common</code>, <code>build</code></td></tr>
+        <tr><td><code>run</code></td><td><code>common</code>, <code>build</code>, <code>run</code></td></tr>
+        <tr><td><code>test</code></td><td><code>common</code>, <code>build</code>, <code>test</code></td></tr>
+        <tr><td><code>cquery</code></td><td><code>common</code>, <code>build</code>, <code>test</code>, <code>cquery</code></td></tr>
+        <tr><td><code>query</code></td><td><code>common</code>, <code>query</code></td></tr>
+      </tbody>
+    </table>
+    <p>That <code>cquery</code> row is easy to miss: a line <code>test --//config:env=prod</code> changed what
+      <code>bazel cquery</code> resolved in our test workspace, because cquery inherits from <code>test</code>.</p>
+    <h3>Named configs: <code>--config=name</code></h3>
+    <p>A line like <code>build:prod ...</code> is a <strong>named config</strong>. It does nothing until you pass
+      <code>--config=prod</code>; then Bazel splices those options in at that point on the command line. One short flag
+      stands for a bundle of options, and CI and laptops can share the same bundles.</p>
+    <p>Pass <code>--announce_rc</code> to see what Bazel read. Trimmed to the workspace file's lines (this machine's
+      personal rc lines are left out):</p>
+    <pre data-label="Real output (Bazel 9.3.2), workspace path shortened"><code class="language-none">INFO: Reading rc options for 'build' from /…/ws/.bazelrc:
+  Inherited 'common' options: --//config:verbose=false
+INFO: Reading rc options for 'build' from /…/ws/.bazelrc:
+  'build' options: --compilation_mode=fastbuild
+INFO: Found applicable config definition build:prod in file /…/ws/.bazelrc: --//config:env=prod -c opt</code></pre>
+    <p>Asking for a config nobody defined is an error:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: Config value 'qa' is not defined in any .rc file</code></pre>
+    <p>You get the same error from <code>bazel query //... --config=prod</code> when only <code>build:prod</code> exists,
+      because query never reads <code>build</code> lines. Write <code>common:prod</code> if a config must work with
+      <code>query</code> too.</p>
+    <h3>Which value wins</h3>
+    <p>When the same option is set several times, the last one wins. Bazel lays the options out in this order:</p>
+    <ol>
+      <li><code>common</code> lines, then lines for the inherited commands (<code>build</code>, then <code>test</code>...),
+        then the command's own lines. A <code>build</code> line beats a <code>common</code> line for the same option, even
+        if the <code>common</code> line comes later in the file.</li>
+      <li>Within one section, later lines beat earlier lines.</li>
+      <li>The command line comes last, so it beats every rc file. A <code>--config=prod</code> expands <em>where you
+        wrote it</em>: <code>--config=prod --//config:env=staging</code> ends with staging, while
+        <code>--//config:env=staging --config=prod</code> ends with prod. Both verified in Bazel 9.3.2.</li>
+    </ol>
+    <h3>Which files</h3>
+    <p>Bazel reads up to three rc files, in this order: the system file (<code>/etc/bazel.bazelrc</code> on Linux), the
+      <strong>workspace</strong> file (<code>.bazelrc</code> next to <code>MODULE.bazel</code>), and the
+      <strong>home</strong> file (<code>~/.bazelrc</code>). Bazel 9.3.2's own startup log lists them:</p>
+    <pre data-label="Real output (Bazel 9.3.2), workspace path shortened"><code class="language-none">Looking for the following rc files: /etc/bazel.bazelrc,/…/ws/.bazelrc,/root/.bazelrc</code></pre>
+    <p>So your personal <code>~/.bazelrc</code> is read after the workspace file and can override it. Commit the
+      workspace file; it is part of the build.</p>
+    <p>For settings that belong to one person but one repository (a disk cache path, <code>--config=mine</code>),
+      teams add <code>try-import %workspace%/user.bazelrc</code> to the workspace file and list
+      <code>user.bazelrc</code> in <code>.gitignore</code>. <code>%workspace%</code> expands to the workspace root.
+      <code>try-import</code> skips a missing file silently; plain <code>import</code> stops Bazel cold:</p>
+    <pre data-label="Real output (Bazel 9.3.2), workspace path shortened"><code class="language-none">[FATAL 02:56:10.534 src/main/cpp/blaze.cc:1275] Nonexistent path in import declaration in config file '/…/ws/.bazelrc': 'import %workspace%/missing.bazelrc' (are you in your source checkout/WORKSPACE?)</code></pre>
+    <p>Predict what the first command prints, then try the others. The <code>.bazelrc</code> tab is editable.</p>
+    <div class="runnable" data-predict data-title="Named configs in .bazelrc" data-commands="bazel cquery 'labels(data, //app:banner)' --config=ci|bazel cquery 'labels(data, //app:banner)'|bazel cquery 'labels(data, //app:banner)' --config=ci --//config:env=dev|bazel query 'labels(data, //app:banner)'|bazel build //app:banner --config=release">
+<textarea class="file" data-path=".bazelrc">
+# Shared by everyone who clones the repository
+build --//config:env=dev
+
+build:ci --//config:env=staging
+build:ci -c opt
+
+try-import %workspace%/user.bazelrc
+</textarea>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "deploy")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+bazel_dep(name = "bazel_skylib", version = "1.9.2")
+</textarea>
+<textarea class="file" data-path="config/BUILD.bazel" data-readonly>
+load("@bazel_skylib//rules:common_settings.bzl", "string_flag")
+
+string_flag(
+    name = "env",
+    build_setting_default = "dev",
+    values = ["dev", "staging", "prod"],
+)
+
+config_setting(
+    name = "staging",
+    flag_values = {":env": "staging"},
+    visibility = ["//visibility:public"],
+)
+</textarea>
+<textarea class="file" data-path="app/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "banner",
+    srcs = ["banner.py"],
+    data = select({
+        "//config:staging": ["staging.txt"],
+        "//conditions:default": ["dev.txt"],
+    }),
+)
+</textarea>
+<textarea class="file" data-path="app/banner.py" data-hidden></textarea>
+<textarea class="file" data-path="app/dev.txt" data-hidden></textarea>
+<textarea class="file" data-path="app/staging.txt" data-hidden></textarea>
+</div>
+    <aside class="callout pro">
+      <p>Common team habits: a <code>build:ci</code> config used only by CI (<code>--config=ci</code> in the pipeline),
+        <code>test --test_output=errors</code> for everyone, <code>common --enable_platform_specific_config</code> so
+        <code>build:linux</code> and <code>build:macos</code> lines apply automatically per OS, and
+        <code>try-import %workspace%/user.bazelrc</code> as the last line. Keep secrets out of every rc file.</p>
+    </aside>
+    <p><strong>Remember:</strong> <code>.bazelrc</code> lines are <code>command[:name] options</code>. Commands inherit
+      (<code>test</code> and <code>cquery</code> read <code>build</code>; <code>query</code> does not), named configs
+      expand where <code>--config</code> appears, and the last value wins.</p>
+  </section>
+
+  <section class="lesson-section" id="select">
+    <h2>config_setting and select()</h2>
+    <aside class="callout python">
+      <p>In Python you would write <code>if settings.DEBUG: ...</code> and decide while the program runs. In a BUILD file
+        there is no running program and no <code>if</code> statement at the top level. The branching has to be a value
+        Bazel can resolve itself, once the configuration is known.</p>
+    </aside>
+    <p>That value is <strong><code>select()</code></strong>. It maps <strong>conditions</strong> to attribute values,
+      and Bazel picks the branch whose condition matches the current configuration. A condition is a label, usually of a
+      <strong><code>config_setting</code></strong>: a native rule (no <code>load()</code> needed) that matches when a set
+      of options has particular values.</p>
+    <pre data-label="config/BUILD.bazel"><code class="language-starlark">config_setting(
+    name = "opt",
+    values = {"compilation_mode": "opt"},
+    visibility = ["//visibility:public"],
+)</code></pre>
+    <pre data-label="app/BUILD.bazel"><code class="language-starlark">py_binary(
+    name = "server",
+    srcs = ["server.py"],
+    data = select({
+        "//config:opt": ["logging_quiet.ini"],
+        "//conditions:default": ["logging_debug.ini"],
+    }),
+)</code></pre>
+    <p><code>//conditions:default</code> is the built-in "nothing else matched" branch. A <code>config_setting</code>
+      matches when <em>all</em> of its entries match. It has three main ways to say what to match:</p>
+    <div class="card-grid">
+      <div class="card"><h4><code>values</code></h4><p>Built-in options, named without dashes: <code>{"compilation_mode": "opt"}</code>.</p></div>
+      <div class="card"><h4><code>define_values</code></h4><p>Old-style <code>--define key=value</code> pairs: <code>{"env": "prod"}</code>. See <a href="#build-settings">why to avoid it</a>.</p></div>
+      <div class="card"><h4><code>flag_values</code></h4><p>Custom flags by label: <code>{"//config:env": "prod"}</code>. The modern choice.</p></div>
+    </div>
+    <p>A fourth, <code>constraint_values</code>, matches the target platform and comes up <a href="#platforms">with
+      platforms</a>.</p>
+    <p>Predict what the first command returns, then run them all. Notice that <code>query</code> and
+      <code>cquery</code> disagree.</p>
+    <div class="runnable" data-predict data-title="select() on compilation mode" data-commands="bazel cquery 'labels(data, //app:server)' -c opt|bazel cquery 'labels(data, //app:server)'|bazel cquery 'labels(data, //app:server)' -c dbg|bazel query 'labels(data, //app:server)'">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "web")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="config/BUILD.bazel">
+config_setting(
+    name = "opt",
+    values = {"compilation_mode": "opt"},
+    visibility = ["//visibility:public"],
+)
+</textarea>
+<textarea class="file" data-path="app/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "server",
+    srcs = ["server.py"],
+    data = select({
+        "//config:opt": ["logging_quiet.ini"],
+        "//conditions:default": ["logging_debug.ini"],
+    }),
+)
+</textarea>
+<textarea class="file" data-path="app/server.py" data-hidden></textarea>
+<textarea class="file" data-path="app/logging_quiet.ini" data-hidden></textarea>
+<textarea class="file" data-path="app/logging_debug.ini" data-hidden></textarea>
+</div>
+    <h3>When nothing matches</h3>
+    <p>Leave out <code>//conditions:default</code> and build in a configuration that matches no condition. Analysis
+      fails, and the message lists every condition it checked:</p>
+    <pre data-label="Real output (Bazel 9.3.2), workspace path shortened"><code class="language-none">ERROR: /…/ws/sel/BUILD.bazel:1:10: configurable attribute "srcs" in //sel:nodefault doesn't match this configuration. Would a default condition help?
+
+Conditions checked:
+ //config:prod
+ //config:staging
+
+To see a condition's definition, run: bazel query --output=build &lt;condition label&gt;.
+
+This instance of //sel:nodefault has configuration identifier a7a71fd. To inspect its configuration, run: bazel config a7a71fd.
+
+For more help, see https://bazel.build/docs/configurable-attributes#faq-select-choose-condition.
+ERROR: Analysis of target '//sel:nodefault' failed; build aborted</code></pre>
+    <p>Sometimes failing is right: a target that only makes sense in production. Then say why, with
+      <code>no_match_error</code>:</p>
+    <pre data-label="sel/BUILD.bazel"><code class="language-starlark">filegroup(
+    name = "custommsg",
+    srcs = select(
+        {"//config:prod": ["prod.txt"]},
+        no_match_error = "Set --//config:env=prod; this target only exists for production.",
+    ),
+)</code></pre>
+    <pre data-label="Real output (Bazel 9.3.2), workspace path shortened"><code class="language-none">ERROR: /…/ws/sel/BUILD.bazel:9:10: configurable attribute "srcs" in //sel:custommsg doesn't match this configuration: Set --//config:env=prod; this target only exists for production.</code></pre>
+    <h3>When two conditions match</h3>
+    <p>Conditions are not checked in order. If two match, Bazel does not take the first; it fails, unless one condition
+      is <em>more specialized</em> (it checks everything the other checks, and more) or both branches have the same
+      value. With <code>--config=prod</code> meaning "<code>env=prod</code> and <code>-c opt</code>", this select has two
+      matches:</p>
+    <pre data-label="sel/BUILD.bazel"><code class="language-starlark">filegroup(
+    name = "ambiguous",
+    srcs = select({
+        "//config:prod": ["prod.txt"],   # flag_values = {":env": "prod"}
+        "//config:opt": ["opt.txt"],     # values = {"compilation_mode": "opt"}
+        "//conditions:default": ["dev.txt"],
+    }),
+)</code></pre>
+    <pre data-label="Real output (Bazel 9.3.2), workspace path shortened"><code class="language-none">ERROR: /…/ws/sel/BUILD.bazel:17:10: Illegal ambiguous match on configurable attribute "srcs" in //sel:ambiguous:
+//config:prod
+//config:opt
+Multiple matches are not allowed unless one is unambiguously more specialized or they resolve to the same value. See https://bazel.build/reference/be/functions#select.
+ERROR: Analysis of target '//sel:ambiguous' failed; build aborted</code></pre>
+    <p>The fix is a condition for the overlap. A <code>config_setting</code> that sets both entries is more specialized
+      than either one alone, so Bazel picks it:</p>
+    <pre data-label="config/BUILD.bazel"><code class="language-starlark">config_setting(
+    name = "prod_opt",
+    values = {"compilation_mode": "opt"},
+    flag_values = {":env": "prod"},
+)</code></pre>
+    <p>With <code>:prod_opt</code> added to the select, <code>--config=prod</code> resolves to its branch,
+      <code>--//config:env=prod</code> alone to <code>:prod</code>'s, and <code>-c opt</code> alone to
+      <code>:opt</code>'s (all three verified with <code>cquery</code>).</p>
+    <h3>Combining selects</h3>
+    <p>A <code>select()</code> can be added to a list, or to another select, with <code>+</code>. Each select is
+      resolved on its own and the results are concatenated. This keeps the shared part out of every branch:</p>
+    <pre data-label="sel/BUILD.bazel"><code class="language-starlark">filegroup(
+    name = "concat",
+    srcs = ["common.txt"] + select({
+        "//config:prod": ["prod.txt"],
+        "//conditions:default": [],
+    }),
+)</code></pre>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">$ bazel cquery 'labels(srcs, //sel:concat)' --//config:env=prod
+//sel:common.txt (null)
+//sel:prod.txt (null)
+$ bazel cquery 'labels(srcs, //sel:concat)'
+//sel:common.txt (null)</code></pre>
+    <p>(<code>(null)</code> is the configuration of a source file: files on disk are the same in every configuration.)
+      You cannot put a <code>select()</code> <em>inside</em> another <code>select()</code>'s branch, and you cannot
+      index into one: it is an opaque value until analysis.</p>
+    <h3>Attributes that cannot be configured</h3>
+    <p>Bazel must know some attributes while <em>loading</em>, before any configuration exists: the target's
+      <code>name</code>, its <code>visibility</code>, its <code>tags</code> (which <code>bazel test</code> filters on), a
+      genrule's <code>outs</code>, and a few more. A select there is a loading error:</p>
+    <pre data-label="Real output (Bazel 9.3.2), workspace path shortened"><code class="language-none">ERROR: /…/ws/nc/BUILD.bazel:1:10: //nc:files: attribute "visibility" is not configurable
+ERROR: /…/ws/nc/BUILD.bazel:2:8: //nc:t: attribute "tags" is not configurable</code></pre>
+    <aside class="callout think">
+      <p>Why must <code>tags</code> be known before configuration? Think about <code>bazel test //... --test_tag_filters=-slow</code>
+        from M05: which phase decides which tests exist?</p>
+    </aside>
+    <p><strong>Remember:</strong> <code>select()</code> picks one branch per configuration; give it a
+      <code>//conditions:default</code> or a <code>no_match_error</code>. Two matching conditions are an error unless one
+      is more specialized. <code>name</code>, <code>visibility</code>, <code>tags</code>, and <code>outs</code> cannot be
+      selected.</p>
+  </section>
+
+  <section class="lesson-section" id="build-settings">
+    <h2>Your own flags: build settings</h2>
+    <p>Bazel's built-in options cover compilers and platforms, not "which environment am I deploying to?". For that you
+      define a <strong>build setting</strong>: a target whose value comes from the command line. bazel_skylib's
+      <code>common_settings.bzl</code> provides the usual ones:</p>
+    <pre data-label="config/BUILD.bazel"><code class="language-starlark">load("@bazel_skylib//rules:common_settings.bzl", "bool_flag", "string_flag")
+
+string_flag(
+    name = "env",
+    build_setting_default = "dev",
+    values = ["dev", "staging", "prod"],
+)
+
+bool_flag(
+    name = "verbose",
+    build_setting_default = False,
+)
+
+config_setting(
+    name = "prod",
+    flag_values = {":env": "prod"},
+    visibility = ["//visibility:public"],
+)
+
+config_setting(
+    name = "verbose_on",
+    flag_values = {":verbose": "true"},
+)</code></pre>
+    <p>The flag's name on the command line is its label, with <code>--</code> in front:</p>
+    <pre data-label="Terminal"><code class="language-bash">pixi run bazel run //app:banner --//config:env=prod
+pixi run bazel build //... --//config:verbose          # bool: same as =true
+pixi run bazel build //... --no//config:verbose        # bool: false</code></pre>
+    <p>In <code>flag_values</code>, a <code>bool_flag</code>'s value is written as a string. Bazel 9.3.2 accepted both
+      <code>"true"</code> and <code>"True"</code> in our test; use lowercase <code>"true"</code>. The command line also
+      accepts <code>=1</code> and <code>=0</code>, but nothing else:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: While parsing option //config:verbose=maybe: 'maybe' is not a boolean</code></pre>
+    <h3>Why not <code>--define</code>?</h3>
+    <p>Older repositories use <code>--define env=prod</code> with <code>config_setting(define_values = {"env":
+      "prod"})</code>. It works, but every <code>--define</code> key is just a string. Compare what happens with a
+      typo:</p>
+    <div class="two-col">
+      <div>
+        <p><strong><code>--define=enviroment=prod</code></strong> (misspelled): silently ignored. The build succeeds with
+          the default branch:</p>
+        <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">//app:dev.txt (null)</code></pre>
+      </div>
+      <div>
+        <p><strong><code>--//config:enviroment=prod</code></strong> (misspelled): the label does not exist, and Bazel
+          stops:</p>
+        <pre data-label="Real output (Bazel 9.3.2), path shortened"><code class="language-none">ERROR: //config:enviroment :: Error loading option //config:enviroment: no such target '//config:enviroment': target 'enviroment' not declared in package 'config' defined by /…/ws/config/BUILD.bazel</code></pre>
+      </div>
+    </div>
+    <p>A <code>string_flag</code> with <code>values</code> also rejects values nobody planned for. This is a
+      Starlark <code>fail()</code> inside bazel_skylib, so it arrives with a short traceback:</p>
+    <pre data-label="Real output (Bazel 9.3.2), paths shortened"><code class="language-none">ERROR: /…/ws/config/BUILD.bazel:3:12: in string_flag rule //config:env:
+Traceback (most recent call last):
+	File "/…/external/bazel_skylib+/rules/common_settings.bzl", line 157, column 13, in _string_impl
+		fail("Error setting " + _no_at_str(ctx.label) + ": invalid value '" + value + "'. Allowed values are " + str(allowed_values))
+Error in fail: Error setting //config:env: invalid value 'qa'. Allowed values are ["dev", "staging", "prod"]
+ERROR: /…/ws/config/BUILD.bazel:3:12: Analysis of target '//config:env' (config: ffb1666) failed
+ERROR: /…/ws/app/BUILD.bazel:3:10: errors encountered resolving select() keys for //app:banner
+ERROR: Analysis of target '//app:banner' failed; build aborted</code></pre>
+    <p>Build settings are also ordinary targets. They have visibility, show up in <code>bazel query</code>, and can be
+      read by your own rules (later in the course). <code>--define</code> has none of that.</p>
+    <p>Try it. Run the commands, then change <code>prod</code> to <code>staging</code> in the second one.</p>
+    <div class="runnable" data-title="A string_flag and a bool_flag" data-commands="bazel cquery 'labels(data, //app:banner)' --//config:env=prod|bazel cquery 'labels(data, //app:banner)'|bazel cquery 'labels(data, //app:banner)' --//config:verbose|bazel cquery 'labels(data, //app:banner)' --//config:env=prod --//config:verbose|bazel query 'labels(data, //app:banner)'">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "deploy")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+bazel_dep(name = "bazel_skylib", version = "1.9.2")
+</textarea>
+<textarea class="file" data-path="config/BUILD.bazel">
+load("@bazel_skylib//rules:common_settings.bzl", "bool_flag", "string_flag")
+
+string_flag(
+    name = "env",
+    build_setting_default = "dev",
+    values = ["dev", "staging", "prod"],
+)
+
+bool_flag(
+    name = "verbose",
+    build_setting_default = False,
+)
+
+config_setting(
+    name = "prod",
+    flag_values = {":env": "prod"},
+    visibility = ["//visibility:public"],
+)
+
+config_setting(
+    name = "verbose_on",
+    flag_values = {":verbose": "true"},
+    visibility = ["//visibility:public"],
+)
+</textarea>
+<textarea class="file" data-path="app/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "banner",
+    srcs = ["banner.py"],
+    data = select({
+        "//config:prod": ["prod.txt"],
+        "//conditions:default": ["dev.txt"],
+    }) + select({
+        "//config:verbose_on": ["debug_help.txt"],
+        "//conditions:default": [],
+    }),
+)
+</textarea>
+<textarea class="file" data-path="app/banner.py" data-hidden></textarea>
+<textarea class="file" data-path="app/prod.txt" data-hidden></textarea>
+<textarea class="file" data-path="app/dev.txt" data-hidden></textarea>
+<textarea class="file" data-path="app/debug_help.txt" data-hidden></textarea>
+</div>
+    <aside class="callout note">
+      <p>Unlike <code>-c opt</code>, changing a flag like <code>--//config:env</code> on the command line did not create a
+        new <code>bazel-out</code> directory in Bazel 9.3.2: <code>cquery --output=files</code> still printed
+        <code>bazel-out/k8-fastbuild/bin/app/banner</code>. Outputs for <code>dev</code> and <code>prod</code> replace
+        each other there; the action cache still makes switching back cheap.</p>
+    </aside>
+    <p><strong>Remember:</strong> declare flags with <code>string_flag</code>/<code>bool_flag</code>, set them with
+      <code>--//pkg:name=value</code>, and match them with <code>flag_values</code>. Typos and unknown values fail
+      loudly, which <code>--define</code> never does.</p>
+  </section>
+
+  <section class="lesson-section" id="platforms">
+    <h2>Platforms and constraints</h2>
+    <aside class="callout python">
+      <p>A wheel's file name says where it runs: <code>cp313-cp313-manylinux_2_28_x86_64</code> or
+        <code>macosx_11_0_arm64</code>. pip compares those <em>tags</em> with your machine and picks a match. Python code
+        checks <code>sys.platform</code> at run time.</p>
+    </aside>
+    <p>Bazel describes machines the same way, with three building blocks:</p>
+    <div class="card-grid">
+      <div class="card"><h4><code>constraint_setting</code></h4><p>A dimension a machine can vary in: operating system, CPU, "has a GPU".</p></div>
+      <div class="card"><h4><code>constraint_value</code></h4><p>One choice in a dimension: <code>linux</code> for the OS setting, <code>arm64</code> for CPU.</p></div>
+      <div class="card"><h4><code>platform</code></h4><p>A named machine: a list of constraint values, at most one per setting.</p></div>
+    </div>
+    <p>The common settings already exist in the <code>platforms</code> module (version 1.1.0 here):
+      <code>@platforms//os:linux</code>, <code>@platforms//os:macos</code>, <code>@platforms//os:windows</code>,
+      <code>@platforms//cpu:x86_64</code>, <code>@platforms//cpu:arm64</code>, and more.
+      <code>@platforms//host</code> is the machine you are on. You add your own settings for anything else:</p>
+    <pre data-label="platforms/BUILD.bazel"><code class="language-starlark">constraint_setting(
+    name = "accelerator",
+    default_constraint_value = ":cpu_only",
+)
+
+constraint_value(name = "cpu_only", constraint_setting = ":accelerator")
+constraint_value(name = "gpu", constraint_setting = ":accelerator")
+
+platform(
+    name = "gpu_host",
+    parents = ["@platforms//host"],   # everything the host has...
+    constraint_values = [":gpu"],      # ...plus a GPU
+)
+
+platform(
+    name = "macos_arm",
+    constraint_values = [
+        "@platforms//os:macos",
+        "@platforms//cpu:arm64",
+    ],
+)</code></pre>
+    <p><code>--platforms=//platforms:macos_arm</code> sets the <strong>target platform</strong>: the machine the
+      outputs are for. It defaults to the host. Like any option, it is part of the configuration.</p>
+    <h3>select() on a constraint</h3>
+    <p>A <code>constraint_value</code> is itself a valid <code>select()</code> condition. For combinations, use a
+      <code>config_setting</code> with <code>constraint_values</code>:</p>
+    <div class="runnable" data-predict data-title="select() on the target platform" data-commands="bazel cquery 'labels(srcs, //tools:launcher)' --platforms=//:macos_arm|bazel cquery 'labels(srcs, //tools:launcher)'|bazel cquery 'labels(srcs, //tools:launcher)' --platforms=//:windows|bazel cquery 'labels(srcs, //tools:native)' --platforms=//:macos_arm|bazel query 'labels(srcs, //tools:launcher)'">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "tools")
+
+bazel_dep(name = "platforms", version = "1.1.0")
+</textarea>
+<textarea class="file" data-path="BUILD.bazel">
+platform(
+    name = "macos_arm",
+    constraint_values = [
+        "@platforms//os:macos",
+        "@platforms//cpu:arm64",
+    ],
+)
+
+platform(
+    name = "windows",
+    constraint_values = ["@platforms//os:windows"],
+)
+</textarea>
+<textarea class="file" data-path="tools/BUILD.bazel">
+filegroup(
+    name = "launcher",
+    srcs = select({
+        "@platforms//os:linux": ["launch.sh"],
+        "@platforms//os:macos": ["launch_mac.sh"],
+        "//conditions:default": ["launch.bat"],
+    }),
+)
+
+config_setting(
+    name = "mac_arm",
+    constraint_values = [
+        "@platforms//os:macos",
+        "@platforms//cpu:arm64",
+    ],
+)
+
+filegroup(
+    name = "native",
+    srcs = select({
+        ":mac_arm": ["native_arm64.so"],
+        "//conditions:default": ["native_generic.so"],
+    }),
+)
+</textarea>
+<textarea class="file" data-path="tools/launch.sh" data-hidden></textarea>
+<textarea class="file" data-path="tools/launch_mac.sh" data-hidden></textarea>
+<textarea class="file" data-path="tools/launch.bat" data-hidden></textarea>
+<textarea class="file" data-path="tools/native_arm64.so" data-hidden></textarea>
+<textarea class="file" data-path="tools/native_generic.so" data-hidden></textarea>
+</div>
+    <p>The sandbox's host is Linux, so the second command picks <code>launch.sh</code>. On a Mac, the same command would
+      pick <code>launch_mac.sh</code>: the default target platform follows the machine.</p>
+    <h3>target_compatible_with: "this only builds there"</h3>
+    <p>Some targets make no sense on some platforms: a Windows-only test, a CUDA kernel. Mark them with
+      <code>target_compatible_with</code>, a list of constraint values the target platform must have:</p>
+    <pre data-label="gpu/BUILD.bazel"><code class="language-starlark">py_test(
+    name = "train_test",
+    srcs = ["train_test.py"],
+    target_compatible_with = ["//platforms:gpu"],
+)</code></pre>
+    <p>On an incompatible platform, a <strong>wildcard</strong> like <code>//...</code> skips the target instead of
+      failing. Tests show up as <code>SKIPPED</code>:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">//gpu:cpu_math_test                                             (cached) PASSED in 0.5s
+//gpu:train_test                                                        SKIPPED
+Executed 0 out of 2 tests: 1 test passes and 1 was skipped.</code></pre>
+    <p>Naming the target <strong>explicitly</strong> is an error, and so is depending on it. The dependency chain
+      points at the constraint that was not met:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: Analysis of target '//platforms_demo:uses_cuda' failed; build aborted: Target //platforms_demo:uses_cuda is incompatible and cannot be built, but was explicitly requested.
+Dependency chain:
+    //platforms_demo:uses_cuda (a7a71f)
+    //platforms_demo:cuda_only (a7a71f)   &lt;-- target platform (@@platforms//host:host) didn't satisfy constraint //platforms_demo:has_gpu
+ERROR: Build did NOT complete successfully</code></pre>
+    <p>Here <code>uses_cuda</code> had no <code>target_compatible_with</code> of its own; it became incompatible because
+      it depends on a target that is. Incompatibility flows up the graph. With
+      <code>--platforms=//platforms_demo:linux_gpu</code>, the same build succeeds.</p>
+    <aside class="callout sim">
+      <p>The simulator skips incompatible targets and reports explicit requests with the same message, but it does not
+        run tests: where real Bazel prints <code>PASSED</code>, it prints <code>(would run)</code>. Lab 2 runs them for
+        real.</p>
+    </aside>
+    <p><strong>Remember:</strong> constraint settings are dimensions, constraint values are choices, platforms are named
+      combinations. <code>--platforms</code> picks the target platform; <code>select()</code> can branch on it, and
+      <code>target_compatible_with</code> makes wildcards skip targets that cannot work there.</p>
+  </section>
+
+  <section class="lesson-section" id="cquery">
+    <h2>query vs cquery</h2>
+    <p>You have seen the difference in every sandbox so far. <code>bazel query</code> works on the graph as
+      <em>loaded</em>, before any configuration exists. It cannot know which branch of a <code>select()</code> applies,
+      so it reports <strong>all</strong> of them:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">$ bazel query 'labels(data, //app:banner)'
+//app:dev.txt
+//app:prod.txt
+//app:staging.txt</code></pre>
+    <p><code>bazel cquery</code> runs after analysis, in the configuration your flags (and <code>.bazelrc</code>)
+      describe, and reports only the branch that applies, with each target's configuration hash:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">$ bazel cquery 'labels(data, //app:banner)' --config=prod
+//app:prod.txt (null)
+$ bazel cquery 'deps(//app:banner, 1)' --output=label_kind --config=prod
+py_binary rule //app:banner (eaa8dce)
+source file //app:prod.txt (null)
+source file //app:banner.py (null)</code></pre>
+    <p>(The second command's output is trimmed to the <code>//app</code> lines. A configured graph also contains
+      toolchains and rules_python's internal settings.)</p>
+    <p>Which one to use:</p>
+    <ul>
+      <li><strong><code>query</code></strong> for "what <em>could</em> this depend on?": impact analysis, finding every
+        user of a library across all configurations. It is fast and needs no flags.</li>
+      <li><strong><code>cquery</code></strong> for "what <em>does</em> this depend on in this build?": debugging a
+        <code>select()</code>, checking what <code>--config=prod</code> really ships.</li>
+    </ul>
+    <p>Two <code>cquery --output</code> formats are worth knowing now. <code>--output=files</code> prints the output
+      files a target produces in that configuration, which shows the configuration directory:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">$ bazel cquery //app:banner --output=files
+bazel-out/k8-fastbuild/bin/app/banner
+app/banner.py</code></pre>
+    <p><code>--output=build</code> prints the target as a BUILD rule with every <code>select()</code> already resolved.
+      Compare <code>query --output=build</code>, which keeps the select (trimmed):</p>
+    <div class="tabs">
+      <div class="tab" data-label="cquery --config=prod">
+        <pre data-label="Real output (Bazel 9.3.2), trimmed"><code class="language-none">py_binary(
+  name = "banner",
+  ...
+  data = ["//app:prod.txt"],
+  deps = ["@rules_python//python/runfiles:runfiles"],
+  srcs = ["//app:banner.py"],
+)</code></pre>
+      </div>
+      <div class="tab" data-label="query">
+        <pre data-label="Real output (Bazel 9.3.2), trimmed"><code class="language-none">  data = select({"//config:prod": ["//app:prod.txt"], "//config:staging": ["//app:staging.txt"], "//conditions:default": ["//app:dev.txt"]}),</code></pre>
+      </div>
+    </div>
+    <aside class="callout sim">
+      <p>The simulator's <code>cquery</code> resolves <code>select()</code> like Bazel. For a plain build on the host it
+        prints real Bazel's configuration ids (<code>a7a71fd</code>, or <code>e722a21</code> for tests); with other
+        flags it prints a stand-in id, so do not compare those with a real run. It supports
+        <code>--output=label</code>, <code>label_kind</code>, and <code>package</code> only.</p>
+    </aside>
+    <p>Predict the first two outputs before you run them. Notice that the select's condition,
+      <code>//config:s3</code>, is a dependency too, in both answers. (Real Bazel's lists are longer: they include the
+      Python toolchain and other implicit dependencies, which the simulator leaves out.)</p>
+    <div class="runnable" data-predict data-title="Same graph, two answers" data-commands="bazel query 'deps(//app:report, 1)'|bazel cquery 'deps(//app:report, 1)' --//config:storage=s3|bazel cquery 'deps(//app:report, 1)'">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "reports")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+bazel_dep(name = "bazel_skylib", version = "1.9.2")
+</textarea>
+<textarea class="file" data-path="config/BUILD.bazel" data-readonly>
+load("@bazel_skylib//rules:common_settings.bzl", "string_flag")
+
+string_flag(
+    name = "storage",
+    build_setting_default = "local",
+    values = ["local", "s3"],
+)
+
+config_setting(
+    name = "s3",
+    flag_values = {":storage": "s3"},
+    visibility = ["//visibility:public"],
+)
+</textarea>
+<textarea class="file" data-path="app/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_binary", "py_library")
+
+py_library(
+    name = "local_store",
+    srcs = ["local_store.py"],
+)
+
+py_library(
+    name = "s3_store",
+    srcs = ["s3_store.py"],
+)
+
+py_binary(
+    name = "report",
+    srcs = ["report.py"],
+    deps = select({
+        "//config:s3": [":s3_store"],
+        "//conditions:default": [":local_store"],
+    }),
+)
+</textarea>
+<textarea class="file" data-path="app/local_store.py" data-hidden></textarea>
+<textarea class="file" data-path="app/s3_store.py" data-hidden></textarea>
+<textarea class="file" data-path="app/report.py" data-hidden></textarea>
+</div>
+    <p>Selecting <code>deps</code> like this is how one binary gets a different implementation per configuration. The
+      Python code imports both names behind a <code>try</code>/<code>except ImportError</code>, or the two libraries
+      provide the same module path.</p>
+    <p><strong>Remember:</strong> <code>query</code> shows every branch of every select; <code>cquery</code> shows the
+      one your flags choose. Reach for <code>cquery</code> whenever the question includes "with these flags".</p>
+  </section>
+
+  <section class="lesson-section" id="environment">
+    <h2>Environment variables are not configuration</h2>
+    <aside class="callout python">
+      <p>Twelve-factor apps read configuration from the environment: <code>DATABASE_URL</code>,
+        <code>API_URL</code>, <code>DEBUG=1</code>. Build scripts often do too: a <code>setup.py</code> that checks
+        <code>os.environ</code> to decide whether to compile an extension.</p>
+    </aside>
+    <p>That is fine for <em>running</em> a program. It is a problem for <em>building</em> one. Bazel caches an action by
+      its declared inputs (M02). If a build step read <code>$API_URL</code> from your shell, its output would depend on
+      something Bazel does not track: two machines would produce different files under the same cache key. That is
+      exactly the non-hermetic build Bazel exists to prevent.</p>
+    <p>So, by default, actions and tests do not see your shell's variables. In this experiment we exported
+      <code>API_URL=https://example.test</code>, then ran a test that prints it and a genrule that writes it to a file:</p>
+    <pre data-label="envdemo/BUILD.bazel"><code class="language-starlark">genrule(
+    name = "stamp",
+    outs = ["stamp.txt"],
+    cmd = "echo \"API_URL=$${API_URL:-unset}\" &gt; $@",
+)</code></pre>
+    <table>
+      <thead><tr><th>Command</th><th>The test printed</th><th><code>stamp.txt</code> held</th></tr></thead>
+      <tbody>
+        <tr><td>no flag</td><td><code>API_URL = &lt;not set&gt;</code></td><td><code>API_URL=unset</code></td></tr>
+        <tr><td><code>--test_env=API_URL</code></td><td><code>API_URL = https://example.test</code></td><td>(not a test)</td></tr>
+        <tr><td><code>--action_env=API_URL</code></td><td><code>API_URL = https://example.test</code></td><td><code>API_URL=https://example.test</code></td></tr>
+      </tbody>
+    </table>
+    <ul>
+      <li><strong><code>--test_env=NAME</code></strong> passes a variable into tests only. Use it for things like a
+        test database URL. Tests that read it will rerun when its value changes.</li>
+      <li><strong><code>--action_env=NAME</code></strong> passes a variable into build actions (and, as the table shows,
+        tests). Its value becomes part of every affected action's key, so changing it reruns them. Use it rarely, for
+        things like <code>PATH</code> for a legacy tool.</li>
+      <li>Either form also takes a fixed value: <code>--test_env=API_URL=http://localhost:8000</code>, which is
+        reproducible and fine in <code>.bazelrc</code>.</li>
+    </ul>
+    <p>If what you want is "a production build" rather than "a build that read my shell", that is a build setting:
+      <code>--//config:env=prod</code>, visible in the graph, selectable, and part of the configuration.</p>
+    <aside class="callout warn">
+      <p>Do not try to read a <code>.bazelrc</code> value or a flag from Python with <code>os.environ</code>. Flags
+        exist at build time; your program runs later. To hand a build-time choice to run-time code, select a data
+        file (as in Lab 1), select a <code>deps</code> library, or set <code>env</code> on the target with a select.</p>
+    </aside>
+    <p><strong>Remember:</strong> build-time choices are flags and configurations, never ambient environment variables.
+      <code>--test_env</code> is for tests; <code>--action_env</code> leaks the environment into the cache key, so use it
+      sparingly.</p>
+  </section>
+
+  <section class="lesson-section" id="practice">
+    <h2>Practice</h2>
+    <p>These exercises run in the simulator, which resolves <code>select()</code>, flags, <code>.bazelrc</code>, and
+      platforms the way Bazel 9.3.2 does. It cannot run the programs, so the labs check the printed results.</p>
+
+    <div class="exercise" data-id="m06-e1" data-title="A quieter log config in opt builds">
+      <div class="exercise-prompt">
+        <p><code>//app:server</code> always ships <code>logging_debug.ini</code>. Make it ship
+          <code>logging_quiet.ini</code> instead when built with <code>-c opt</code>, and keep the debug file for every
+          other mode.</p>
+        <ul>
+          <li>Add a <code>config_setting</code> named <code>//config:opt</code> that matches compilation mode
+            <code>opt</code>, visible to <code>//app</code>.</li>
+          <li>Make the server's <code>data</code> a <code>select()</code> on it, with a default branch.</li>
+        </ul>
+      </div>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "web")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="config/BUILD.bazel">
+# Conditions for select() go here.
+</textarea>
+<textarea class="file" data-path="app/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "server",
+    srcs = ["server.py"],
+    data = ["logging_debug.ini"],
+)
+</textarea>
+<textarea class="file" data-path="app/server.py" data-hidden></textarea>
+<textarea class="file" data-path="app/logging_debug.ini" data-hidden></textarea>
+<textarea class="file" data-path="app/logging_quiet.ini" data-hidden></textarea>
+<script type="text/x-python" class="tests">
+def test_opt_is_a_config_setting(bazel):
+    t = bazel.target("//config:opt")
+    assert t.kind == "config_setting", f"//config:opt should be a config_setting, but it is a {t.kind}"
+    values = t.attrs.get("values") or {}
+    assert values == {"compilation_mode": "opt"}, f'//config:opt should set values = {{"compilation_mode": "opt"}}, got {values}'
+
+def test_opt_builds_ship_the_quiet_config(bazel):
+    data = bazel.cquery("labels(data, //app:server)", "-c", "opt")
+    assert data == ["//app:logging_quiet.ini"], f"with -c opt, data should be only logging_quiet.ini, got {data}"
+
+def test_other_modes_ship_the_debug_config(bazel):
+    for mode in ("fastbuild", "dbg"):
+        data = bazel.cquery("labels(data, //app:server)", "-c", mode)
+        assert data == ["//app:logging_debug.ini"], f"with -c {mode}, data should be only logging_debug.ini, got {data}"
+
+def test_everything_builds_in_every_mode(bazel):
+    for mode in ("fastbuild", "dbg", "opt"):
+        result = bazel.build("//...", "-c", mode)
+        assert result.ok, f"bazel build //... -c {mode} fails:\n" + result.error
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p><code>config_setting(name = "opt", values = {"compilation_mode": "opt"}, visibility = [...])</code>. In the
+          binary: <code>data = select({"//config:opt": [...], "//conditions:default": [...]})</code>.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="config/BUILD.bazel"><code class="language-starlark">config_setting(
+    name = "opt",
+    values = {"compilation_mode": "opt"},
+    visibility = ["//app:__pkg__"],
+)</code></pre>
+<pre data-path="app/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "server",
+    srcs = ["server.py"],
+    data = select({
+        "//config:opt": ["logging_quiet.ini"],
+        "//conditions:default": ["logging_debug.ini"],
+    }),
+)</code></pre>
+        <p>Built-in options go in <code>values</code> with their long name and no dashes. <code>"-c": "opt"</code> would
+          not work.</p>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m06-e2" data-title="A region flag">
+      <div class="exercise-prompt">
+        <p>The payments service ships one pricing table per region. Add a flag so the build picks it:</p>
+        <ul>
+          <li>A <code>string_flag</code> <code>//config:region</code> with values <code>us</code>, <code>eu</code>,
+            <code>apac</code>, defaulting to <code>us</code>.</li>
+          <li>One <code>config_setting</code> per non-default region, named <code>//config:eu</code> and
+            <code>//config:apac</code>.</li>
+          <li><code>//payments:pricing</code> (a <code>filegroup</code>) holds <code>prices_us.csv</code>,
+            <code>prices_eu.csv</code>, or <code>prices_apac.csv</code> to match <code>--//config:region</code>.</li>
+        </ul>
+      </div>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "payments")
+
+bazel_dep(name = "bazel_skylib", version = "1.9.2")
+</textarea>
+<textarea class="file" data-path="config/BUILD.bazel">
+load("@bazel_skylib//rules:common_settings.bzl", "string_flag")
+
+# Declare the region flag and its config_settings here.
+</textarea>
+<textarea class="file" data-path="payments/BUILD.bazel">
+filegroup(
+    name = "pricing",
+    srcs = ["prices_us.csv"],
+)
+</textarea>
+<textarea class="file" data-path="payments/prices_us.csv" data-hidden></textarea>
+<textarea class="file" data-path="payments/prices_eu.csv" data-hidden></textarea>
+<textarea class="file" data-path="payments/prices_apac.csv" data-hidden></textarea>
+<script type="text/x-python" class="tests">
+def test_region_is_a_string_flag(bazel):
+    t = bazel.target("//config:region")
+    assert t.kind == "string_flag", f"//config:region should be a string_flag, but it is a {t.kind}"
+    assert t.attrs.get("build_setting_default") == "us", "the default region should be \"us\""
+    values = sorted(t.attrs.get("values") or [])
+    assert values == ["apac", "eu", "us"], f"list the allowed values us, eu, apac; got {values}"
+
+def test_conditions_match_the_flag(bazel):
+    for region in ("eu", "apac"):
+        t = bazel.target(f"//config:{region}")
+        assert t.kind == "config_setting", f"//config:{region} should be a config_setting"
+        fv = {k.split(":")[-1]: v for k, v in (t.attrs.get("flag_values") or {}).items()}
+        assert fv == {"region": region}, f"//config:{region} should match flag_values {{\":region\": \"{region}\"}}, got {t.attrs.get('flag_values')}"
+
+def test_each_region_gets_its_table(bazel):
+    for flags, want in ((("--//config:region=eu",), "eu"), (("--//config:region=apac",), "apac"), (("--//config:region=us",), "us"), ((), "us")):
+        srcs = bazel.cquery("labels(srcs, //payments:pricing)", *flags)
+        assert srcs == [f"//payments:prices_{want}.csv"], f"with {' '.join(flags) or 'no flags'}, pricing should be prices_{want}.csv, got {srcs}"
+
+def test_everything_builds(bazel):
+    result = bazel.build("//...")
+    assert result.ok, "bazel build //... fails:\n" + result.error
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p>The flag: <code>string_flag(name = "region", build_setting_default = "us", values = [...])</code>. Each
+          condition: <code>config_setting(name = "eu", flag_values = {":region": "eu"}, visibility = [...])</code>. The
+          <code>us</code> table goes in the default branch.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="config/BUILD.bazel"><code class="language-starlark">load("@bazel_skylib//rules:common_settings.bzl", "string_flag")
+
+string_flag(
+    name = "region",
+    build_setting_default = "us",
+    values = ["us", "eu", "apac"],
+)
+
+config_setting(
+    name = "eu",
+    flag_values = {":region": "eu"},
+    visibility = ["//payments:__pkg__"],
+)
+
+config_setting(
+    name = "apac",
+    flag_values = {":region": "apac"},
+    visibility = ["//payments:__pkg__"],
+)</code></pre>
+<pre data-path="payments/BUILD.bazel"><code class="language-starlark">filegroup(
+    name = "pricing",
+    srcs = select({
+        "//config:eu": ["prices_eu.csv"],
+        "//config:apac": ["prices_apac.csv"],
+        "//conditions:default": ["prices_us.csv"],
+    }),
+)</code></pre>
+        <p>With real Bazel, <code>--//config:region=mars</code> now fails with
+          <code>invalid value 'mars'. Allowed values are ["us", "eu", "apac"]</code>.</p>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m06-e3" data-title="A --config=prod for the team">
+      <div class="exercise-prompt">
+        <p>Release engineers type <code>--//config:env=prod -c opt</code> on every production build, and sometimes
+          forget half of it. Add a named config to the workspace <code>.bazelrc</code> so that
+          <code>--config=prod</code> sets both.</p>
+        <ul>
+          <li><code>--config=prod</code> must work for <code>build</code>, <code>test</code>, <code>run</code>, and
+            <code>cquery</code>.</li>
+          <li>Plain builds stay <code>dev</code> and <code>fastbuild</code>.</li>
+          <li>Leave the <code>try-import</code> line in place.</li>
+        </ul>
+      </div>
+<textarea class="file" data-path=".bazelrc">
+test --test_output=errors
+
+try-import %workspace%/user.bazelrc
+</textarea>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "deploy")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+bazel_dep(name = "bazel_skylib", version = "1.9.2")
+</textarea>
+<textarea class="file" data-path="config/BUILD.bazel" data-readonly>
+load("@bazel_skylib//rules:common_settings.bzl", "string_flag")
+
+string_flag(
+    name = "env",
+    build_setting_default = "dev",
+    values = ["dev", "staging", "prod"],
+)
+
+config_setting(
+    name = "prod",
+    flag_values = {":env": "prod"},
+    visibility = ["//visibility:public"],
+)
+
+config_setting(
+    name = "opt",
+    values = {"compilation_mode": "opt"},
+    visibility = ["//visibility:public"],
+)
+</textarea>
+<textarea class="file" data-path="app/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "banner",
+    srcs = ["banner.py"],
+    data = select({
+        "//config:prod": ["prod.txt"],
+        "//conditions:default": ["dev.txt"],
+    }) + select({
+        "//config:opt": ["optimized.txt"],
+        "//conditions:default": [],
+    }),
+)
+</textarea>
+<textarea class="file" data-path="app/banner.py" data-hidden></textarea>
+<textarea class="file" data-path="app/prod.txt" data-hidden></textarea>
+<textarea class="file" data-path="app/dev.txt" data-hidden></textarea>
+<textarea class="file" data-path="app/optimized.txt" data-hidden></textarea>
+<script type="text/x-python" class="tests">
+def test_config_prod_selects_prod_and_opt(bazel):
+    data = bazel.cquery("labels(data, //app:banner)", "--config=prod")
+    assert data == ["//app:optimized.txt", "//app:prod.txt"], f"with --config=prod, data should be optimized.txt and prod.txt, got {data}"
+
+def test_plain_builds_stay_dev(bazel):
+    data = bazel.cquery("labels(data, //app:banner)")
+    assert data == ["//app:dev.txt"], f"without --config, data should be only dev.txt, got {data}"
+
+def test_config_prod_works_for_build_and_test(bazel):
+    for cmd in (bazel.build, bazel.test):
+        result = cmd("//app:banner", "--config=prod")
+        assert result.ok or "No test targets" in result.error, f"--config=prod should be defined for build and test:\n{result.error}"
+
+def test_the_rc_file_keeps_its_try_import(bazel):
+    rc = bazel.ws.files.get(".bazelrc", "")
+    assert "try-import %workspace%/user.bazelrc" in rc, "keep the try-import line for personal settings"
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p>Two lines starting with <code>build:prod</code>. Because <code>test</code>, <code>run</code>, and
+          <code>cquery</code> inherit <code>build</code> options, one section covers all four commands.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path=".bazelrc"><code class="language-ini">build:prod --//config:env=prod
+build:prod -c opt
+
+test --test_output=errors
+
+try-import %workspace%/user.bazelrc</code></pre>
+        <p>Writing <code>build:prod --//config:env=prod -c opt</code> on one line is equivalent. Use
+          <code>common:prod</code> instead if the config should also be accepted by <code>bazel query</code>.</p>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m06-e4" data-title="Fix the select() that breaks two builds">
+      <div class="exercise-prompt">
+        <p><code>//app:logging</code> picks a logging config. Two builds fail:</p>
+        <ul>
+          <li>A plain <code>bazel build //...</code>: "doesn't match this configuration".</li>
+          <li><code>bazel build //... --//config:env=prod -c opt</code>: "Illegal ambiguous match".</li>
+        </ul>
+        <p>Run both under "Try commands". Then fix the select so that every combination builds and picks:
+          <code>prod_opt.ini</code> for prod + opt, <code>prod.ini</code> for prod alone, <code>opt.ini</code> for opt
+          alone, and <code>dev.ini</code> otherwise. Keep the existing conditions; you may add one.</p>
+      </div>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "logs")
+
+bazel_dep(name = "bazel_skylib", version = "1.9.2")
+</textarea>
+<textarea class="file" data-path="config/BUILD.bazel">
+load("@bazel_skylib//rules:common_settings.bzl", "string_flag")
+
+string_flag(
+    name = "env",
+    build_setting_default = "dev",
+    values = ["dev", "prod"],
+)
+
+config_setting(
+    name = "prod",
+    flag_values = {":env": "prod"},
+    visibility = ["//visibility:public"],
+)
+
+config_setting(
+    name = "opt",
+    values = {"compilation_mode": "opt"},
+    visibility = ["//visibility:public"],
+)
+</textarea>
+<textarea class="file" data-path="app/BUILD.bazel">
+filegroup(
+    name = "logging",
+    srcs = select({
+        "//config:prod": ["prod.ini"],
+        "//config:opt": ["opt.ini"],
+    }),
+)
+</textarea>
+<textarea class="file" data-path="app/prod_opt.ini" data-hidden></textarea>
+<textarea class="file" data-path="app/prod.ini" data-hidden></textarea>
+<textarea class="file" data-path="app/opt.ini" data-hidden></textarea>
+<textarea class="file" data-path="app/dev.ini" data-hidden></textarea>
+<script type="text/x-python" class="tests">
+CASES = [
+    ((), "dev.ini"),
+    (("-c", "opt"), "opt.ini"),
+    (("--//config:env=prod",), "prod.ini"),
+    (("--//config:env=prod", "-c", "opt"), "prod_opt.ini"),
+]
+
+def test_every_combination_builds(bazel):
+    for flags, _ in CASES:
+        result = bazel.build("//...", *flags)
+        assert result.ok, f"bazel build //... {' '.join(flags)} fails:\n" + result.error
+
+def test_every_combination_picks_its_file(bazel):
+    for flags, want in CASES:
+        srcs = bazel.cquery("labels(srcs, //app:logging)", *flags)
+        assert srcs == [f"//app:{want}"], f"with {' '.join(flags) or 'no flags'}, //app:logging should be {want}, got {srcs}"
+
+def test_existing_conditions_are_kept(bazel):
+    assert bazel.target("//config:prod").kind == "config_setting", "keep //config:prod"
+    assert bazel.target("//config:opt").kind == "config_setting", "keep //config:opt"
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p>The first error wants a <code>//conditions:default</code> branch. The second wants a condition that is more
+          specialized than both: a <code>config_setting</code> with <em>both</em> the <code>values</code> entry and the
+          <code>flag_values</code> entry. The flag key is a label, so <code>":env"</code> and
+          <code>"//config:env"</code> name the same setting.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="config/BUILD.bazel"><code class="language-starlark">load("@bazel_skylib//rules:common_settings.bzl", "string_flag")
+
+string_flag(
+    name = "env",
+    build_setting_default = "dev",
+    values = ["dev", "prod"],
+)
+
+config_setting(
+    name = "prod",
+    flag_values = {":env": "prod"},
+    visibility = ["//visibility:public"],
+)
+
+config_setting(
+    name = "opt",
+    values = {"compilation_mode": "opt"},
+    visibility = ["//visibility:public"],
+)
+
+config_setting(
+    name = "prod_opt",
+    values = {"compilation_mode": "opt"},
+    flag_values = {":env": "prod"},
+    visibility = ["//visibility:public"],
+)</code></pre>
+<pre data-path="app/BUILD.bazel"><code class="language-starlark">filegroup(
+    name = "logging",
+    srcs = select({
+        "//config:prod_opt": ["prod_opt.ini"],
+        "//config:prod": ["prod.ini"],
+        "//config:opt": ["opt.ini"],
+        "//conditions:default": ["dev.ini"],
+    }),
+)</code></pre>
+        <p>The order of the keys does not matter. With prod + opt, all three named conditions match, and
+          <code>:prod_opt</code> wins because it checks everything the other two check.</p>
+      </details>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="lab">
+    <h2>Labs: configured builds for real</h2>
+    <p>The exercises checked which branch a <code>select()</code> picks. These labs check what that means for a real
+      program: which file actually lands in the runfiles, what <code>bazel run</code> prints under each flag, how real
+      Bazel rejects a bad flag value, and how it skips a target on a platform that cannot run it. The simulator
+      reports the errors, but it cannot run the program or the tests.</p>
+
+    <div class="lab" data-id="m06-lab1" data-title="A banner chosen by a build flag">
+      <div class="lab-prompt">
+        <p>The <code>deploy</code> workspace has <code>//app:banner</code>, a Python program that prints whichever
+          banner file is in its runfiles. Today it always ships <code>banners/dev.txt</code>. Make the banner a build-time
+          choice:</p>
+        <ul>
+          <li><code>bazel run //app:banner</code> prints <code>Welcome to DEV: data resets nightly.</code></li>
+          <li><code>--//config:env=staging</code> prints the staging banner, <code>--//config:env=prod</code> prints
+            <code>Welcome to PRODUCTION.</code>, and <code>--//config:env=qa</code> fails with
+            <code>invalid value 'qa'</code>.</li>
+          <li><code>--config=prod</code> from <code>.bazelrc</code> means "the prod banner, and <code>-c opt</code>". The
+            grader checks the opt part with <code>cquery --output=files</code>.</li>
+        </ul>
+        <ul class="checklist" data-id="m06-lab1-steps">
+          <li>Run <code>pixi run start m06-lab1</code>, then <code>cd work/m06-lab1</code></li>
+          <li>Run <code>pixi run bazel run //app:banner --//config:env=prod</code> and read the error</li>
+          <li>Declare <code>string_flag(name = "env", ...)</code> and two <code>config_setting</code>s in <code>config/BUILD.bazel</code></li>
+          <li>Make <code>data</code> on <code>//app:banner</code> a <code>select()</code>; try all three values</li>
+          <li>Add <code>build:prod</code> lines to <code>.bazelrc</code>, then check <code>pixi run bazel cquery 'labels(data, //app:banner)' --config=prod</code></li>
+          <li>Run <code>pixi run grade m06-lab1</code> from the repository root</li>
+        </ul>
+      </div>
+      <details class="hint"><summary>Hint</summary>
+        <p><code>banner.py</code> prints every banner it finds, so the select must put exactly one file in
+          <code>data</code>. The files live in a subdirectory: the select's values are <code>"banners/prod.txt"</code> and
+          so on. For the opt check, <code>pixi run bazel cquery //app:banner --config=prod --output=files</code> should
+          print a path under <code>bazel-out/k8-opt</code>.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-label="config/BUILD.bazel"><code class="language-starlark">load("@bazel_skylib//rules:common_settings.bzl", "string_flag")
+
+string_flag(
+    name = "env",
+    build_setting_default = "dev",
+    values = ["dev", "staging", "prod"],
+)
+
+config_setting(
+    name = "staging",
+    flag_values = {":env": "staging"},
+    visibility = ["//visibility:public"],
+)
+
+config_setting(
+    name = "prod",
+    flag_values = {":env": "prod"},
+    visibility = ["//visibility:public"],
+)</code></pre>
+<pre data-label="app/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "banner",
+    srcs = ["banner.py"],
+    data = select({
+        "//config:prod": ["banners/prod.txt"],
+        "//config:staging": ["banners/staging.txt"],
+        "//conditions:default": ["banners/dev.txt"],
+    }),
+    deps = ["@rules_python//python/runfiles"],
+)</code></pre>
+<pre data-label=".bazelrc"><code class="language-ini">build:prod --//config:env=prod
+build:prod -c opt
+
+try-import %workspace%/user.bazelrc</code></pre>
+      </details>
+    </div>
+
+    <div class="lab" data-id="m06-lab2" data-title="Platforms and incompatible targets">
+      <div class="lab-prompt">
+        <p>The <code>trainer</code> workspace has a GPU-only test, <code>//gpu:train_test</code>, that fails on every
+          laptop and CI runner, so <code>bazel test //...</code> is always red. The workspace already declares an
+          <code>accelerator</code> constraint with values <code>//platforms:cpu_only</code> (the default) and
+          <code>//platforms:gpu</code>. Make the build understand which machines have a GPU:</p>
+        <ul>
+          <li><code>bazel test //...</code> passes, with <code>//gpu:train_test</code> reported as
+            <code>SKIPPED</code>.</li>
+          <li><code>bazel build //gpu:train_test</code> on this machine fails with "is incompatible and cannot be
+            built, but was explicitly requested".</li>
+          <li>A platform <code>//platforms:gpu_host</code> (this machine plus a GPU) makes it buildable.</li>
+          <li><code>bazel run //app:device</code> prints <code>device: cpu</code>, and <code>device: gpu</code> with
+            <code>--platforms=//platforms:gpu_host</code>.</li>
+        </ul>
+        <ul class="checklist" data-id="m06-lab2-steps">
+          <li>Run <code>pixi run start m06-lab2</code>, then <code>cd work/m06-lab2</code></li>
+          <li>Run <code>pixi run bazel test //... --test_output=errors</code> and see the GPU test fail</li>
+          <li>Add <code>target_compatible_with</code> to <code>//gpu:train_test</code>; test <code>//...</code> again</li>
+          <li>Declare <code>platform(name = "gpu_host", ...)</code> with <code>parents = ["@platforms//host"]</code></li>
+          <li>Make <code>//app:device</code>'s <code>data</code> a <code>select()</code> on <code>//platforms:gpu</code></li>
+          <li>Run <code>pixi run grade m06-lab2</code> from the repository root</li>
+        </ul>
+      </div>
+      <details class="hint"><summary>Hint</summary>
+        <p><code>parents</code> copies every constraint of another platform; listing <code>:gpu</code> in
+          <code>constraint_values</code> overrides the accelerator setting's default. Do not build
+          <code>--platforms=//platforms:gpu_host</code> into <code>.bazelrc</code>: this machine has no GPU, and the
+          grader expects <code>train_test</code> to be skipped by default.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-label="platforms/BUILD.bazel (added)"><code class="language-starlark">platform(
+    name = "gpu_host",
+    parents = ["@platforms//host"],
+    constraint_values = [":gpu"],
+)</code></pre>
+<pre data-label="gpu/BUILD.bazel (the GPU test)"><code class="language-starlark">py_test(
+    name = "train_test",
+    srcs = ["train_test.py"],
+    target_compatible_with = ["//platforms:gpu"],
+)</code></pre>
+<pre data-label="app/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "device",
+    srcs = ["device.py"],
+    data = select({
+        "//platforms:gpu": ["gpu.txt"],
+        "//conditions:default": ["cpu.txt"],
+    }),
+    deps = ["@rules_python//python/runfiles"],
+)</code></pre>
+      </details>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="quiz">
+    <h2>Quiz</h2>
+    <div class="quiz" data-id="m06-quiz">
+<script type="application/json">
+{"title": "Configuration quiz", "passScore": 0.7, "questions": [
+  {"type": "single", "prompt": "You build <code>//app:server</code> with no flags, then with <code>-c opt</code>. Where are the two sets of outputs?", "options": ["Both in <code>bazel-out/k8-fastbuild</code>; the second build overwrites the first", "In <code>bazel-out/k8-fastbuild</code> and <code>bazel-out/k8-opt</code>, side by side", "In <code>bazel-bin</code> and <code>bazel-opt</code>", "Only the latest build is kept; Bazel cleans on mode changes"], "answer": 1, "explanation": "<p>Compilation mode is part of the output directory name, <code>&lt;cpu&gt;-&lt;mode&gt;</code>. Both trees stay, so switching back is fast. <code>bazel-bin</code> points at the configuration you built last.</p>"},
+  {"type": "multi", "prompt": "A workspace <code>.bazelrc</code> contains <code>build --//config:env=staging</code>. Which commands see that option? Select all that apply.", "options": ["<code>bazel build</code>", "<code>bazel test</code>", "<code>bazel run</code>", "<code>bazel query</code>", "<code>bazel cquery</code>"], "answer": [0, 1, 2, 4], "explanation": "<p><code>test</code>, <code>run</code>, and <code>cquery</code> inherit <code>build</code> options. <code>query</code> does not build, so it reads only <code>common</code> and <code>query</code> lines.</p>"},
+  {"type": "single", "prompt": "The <code>.bazelrc</code> has <code>build:prod --//config:env=prod</code>. What does <code>bazel query //... --config=prod</code> do?", "options": ["Runs the query with env=prod", "Runs the query and ignores the config", "Fails: Config value 'prod' is not defined in any .rc file", "Fails: query does not accept --config"], "answer": 2, "explanation": "<p>Named configs are looked up in the sections the command reads. <code>query</code> reads no <code>build</code> lines, so for it <code>prod</code> is undefined. Define it as <code>common:prod</code> if query should accept it.</p>"},
+  {"type": "single", "prompt": "With <code>build:prod --//config:env=prod</code> in <code>.bazelrc</code>, what env does <code>bazel build //app --config=prod --//config:env=staging</code> use?", "options": ["prod: named configs always win", "staging: the later option wins, and --config expands where it is written", "dev: conflicting options cancel out", "An error: the option is set twice"], "answer": 1, "explanation": "<p><code>--config=prod</code> is replaced by its options at its position on the command line. The explicit <code>--//config:env=staging</code> comes after it, so it wins. Swap the order and prod wins.</p>"},
+  {"type": "text", "prompt": "Which <code>.bazelrc</code> directive reads a file only if it exists (for example a personal <code>user.bazelrc</code>)?", "answer": ["try-import", "try-import %workspace%/user.bazelrc"], "explanation": "<p><code>try-import %workspace%/user.bazelrc</code> skips a missing file silently. Plain <code>import</code> stops Bazel with \"Nonexistent path in import declaration\".</p>"},
+  {"type": "single", "prompt": "Does this build with no flags?", "code": "filegroup(\n    name = \"cfg\",\n    srcs = select({\n        \"//config:prod\": [\"prod.ini\"],\n        \"//config:staging\": [\"staging.ini\"],\n    }),\n)", "lang": "starlark", "options": ["Yes, with an empty srcs", "Yes, with the first branch", "No: configurable attribute \"srcs\" in //:cfg doesn't match this configuration", "No: Illegal ambiguous match"], "answer": 2, "explanation": "<p>Without <code>//conditions:default</code>, a configuration that matches no key is an analysis error. Add a default branch, or a <code>no_match_error</code> that explains which flag to set.</p>"},
+  {"type": "single", "prompt": "<code>:prod</code> matches <code>--//config:env=prod</code>; <code>:opt</code> matches <code>-c opt</code>. A select has keys <code>:prod</code>, <code>:opt</code>, and a default, with different values. What happens with <code>--//config:env=prod -c opt</code>?", "options": ["The first key in the dict wins", "The last key in the dict wins", "Illegal ambiguous match: two conditions match and neither is more specialized", "The default branch is used"], "answer": 2, "explanation": "<p>select() does not use key order. Two matches are allowed only if one condition checks a superset of the other's settings, or both values are equal. Add a <code>config_setting</code> with both <code>values</code> and <code>flag_values</code> to cover the overlap.</p>"},
+  {"type": "multi", "prompt": "Which attributes cannot take a <code>select()</code>? Select all that apply.", "options": ["<code>name</code>", "<code>visibility</code>", "<code>tags</code>", "<code>data</code>", "<code>deps</code>"], "answer": [0, 1, 2], "explanation": "<p>Bazel needs <code>name</code>, <code>visibility</code>, and <code>tags</code> while loading, before a configuration exists. A select there fails with <code>attribute \"tags\" is not configurable</code>. <code>srcs</code>, <code>deps</code>, and <code>data</code> are the usual things to select.</p>"},
+  {"type": "output", "prompt": "What does <code>bazel cquery 'labels(srcs, //app:files)' --//config:env=prod</code> print? Ignore the configuration suffix.", "code": "filegroup(\n    name = \"files\",\n    srcs = [\"common.txt\"] + select({\n        \"//config:prod\": [\"prod.txt\"],\n        \"//conditions:default\": [\"dev.txt\"],\n    }),\n)", "lang": "starlark", "answer": "//app:common.txt\n//app:prod.txt", "explanation": "<p>The list and the resolved select are concatenated. cquery prints only the branch that applies; source files carry the configuration <code>(null)</code>, which this question leaves out.</p>"},
+  {"type": "output", "prompt": "Same target, but <code>bazel query 'labels(srcs, //app:files)'</code>. What does it print?", "code": "filegroup(\n    name = \"files\",\n    srcs = [\"common.txt\"] + select({\n        \"//config:prod\": [\"prod.txt\"],\n        \"//conditions:default\": [\"dev.txt\"],\n    }),\n)", "lang": "starlark", "answer": "//app:common.txt\n//app:dev.txt\n//app:prod.txt", "explanation": "<p><code>query</code> runs before configuration, so it reports every branch of every select, sorted.</p>"},
+  {"type": "single", "prompt": "Why prefer a <code>string_flag</code> <code>--//config:env=prod</code> over <code>--define env=prod</code>?", "options": ["--define is removed in Bazel 9", "A misspelled flag label or a value outside <code>values</code> is an error; a misspelled --define key is silently ignored", "string_flag builds faster", "--define cannot be used with select()"], "answer": 1, "explanation": "<p>Both work with select() (via <code>flag_values</code> or <code>define_values</code>). The build setting is a real target: Bazel checks it exists, skylib checks its value, and it has visibility. <code>--define=enviroment=prod</code> just builds the default.</p>"},
+  {"type": "single", "prompt": "<code>//gpu:train_test</code> has <code>target_compatible_with = [\"//platforms:gpu\"]</code>, and the host has no GPU. What does <code>bazel test //...</code> report for it?", "options": ["FAILED", "PASSED", "SKIPPED", "An error: target is incompatible and cannot be built"], "answer": 2, "explanation": "<p>Wildcards silently skip incompatible targets; tests are listed as SKIPPED. Naming the target explicitly (<code>bazel test //gpu:train_test</code>) is the error case.</p>"},
+  {"type": "single", "prompt": "Does this load?", "code": "platform(\n    name = \"mac\",\n    constraint_values = [\"@platforms//os:macos\"],\n)\n\nfilegroup(\n    name = \"x\",\n    srcs = select({\n        \"@platforms//os:macos\": [\"mac.txt\"],\n        \"//conditions:default\": [\"other.txt\"],\n    }),\n)", "lang": "starlark", "options": ["Yes: a constraint_value is a valid select() key", "No: select() keys must be config_settings", "No: platform() needs a load()", "Yes, but it always picks other.txt"], "answer": 0, "explanation": "<p>A <code>constraint_value</code> can be used directly as a condition. <code>platform</code>, <code>constraint_setting</code>, and <code>constraint_value</code> are native rules. With <code>--platforms=//:mac</code>, cquery picks <code>mac.txt</code>.</p>"},
+  {"type": "single", "prompt": "A genrule's command reads <code>$API_URL</code>. You exported it in your shell. What does the genrule see, by default?", "options": ["Your shell's value", "Nothing: actions do not inherit arbitrary shell variables unless you pass --action_env=API_URL", "The value from .bazelrc", "The value from the target's env attribute"], "answer": 1, "explanation": "<p>An action's result must depend only on declared inputs. <code>--action_env=API_URL</code> passes it through and adds it to the action key; <code>--test_env</code> does the same for tests only.</p>"}
+]}
+</script>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="recap">
+    <h2>Recap</h2>
+    <ul>
+      <li>A configuration is the set of options that can change outputs. Each gets a <code>bazel-out/&lt;cpu&gt;-&lt;mode&gt;</code> tree (for <code>-c</code>) and a hash that <code>cquery</code> prints.</li>
+      <li><code>-c</code> is <code>fastbuild</code> (default), <code>dbg</code>, or <code>opt</code>.</li>
+      <li><code>.bazelrc</code> lines are <code>command[:name] options</code>. <code>test</code>, <code>run</code>, and <code>cquery</code> read <code>build</code> lines; <code>query</code> does not. <code>--config=name</code> expands in place; the last value wins.</li>
+      <li>Workspace <code>.bazelrc</code> is committed; <code>try-import %workspace%/user.bazelrc</code> holds personal settings. <code>~/.bazelrc</code> is read after the workspace file.</li>
+      <li><code>config_setting</code> matches on <code>values</code>, <code>define_values</code>, <code>flag_values</code>, or <code>constraint_values</code>; <code>select()</code> picks a branch per configuration.</li>
+      <li>Give every select a <code>//conditions:default</code> or a <code>no_match_error</code>. Overlapping conditions need a more specialized one.</li>
+      <li><code>name</code>, <code>visibility</code>, <code>tags</code>, and <code>outs</code> are not configurable.</li>
+      <li><code>string_flag</code>/<code>bool_flag</code> from bazel_skylib make typed, checked flags: <code>--//config:env=prod</code>. Prefer them to <code>--define</code>.</li>
+      <li>Platforms are named sets of constraint values; <code>--platforms</code> sets the target platform. <code>target_compatible_with</code> makes wildcards skip a target, and explicit requests fail.</li>
+      <li><code>query</code> shows every select branch; <code>cquery</code> shows the one your flags choose.</li>
+      <li>Shell variables do not reach actions or tests unless you pass <code>--action_env</code> or <code>--test_env</code>.</li>
+    </ul>
+    <div class="flashcards" data-title="Configuration review">
+<script type="application/json">
+[
+  {"front": "What is a configuration?", "back": "The set of build options that can change outputs: compilation mode, target platform, custom flags. Bazel fixes it before analysis."},
+  {"front": "Why do <code>bazel-out/k8-fastbuild</code> and <code>bazel-out/k8-opt</code> both exist?", "back": "Each compilation mode gets its own output tree, so switching modes does not overwrite or rebuild the other."},
+  {"front": "What does <code>build:ci -c opt</code> in .bazelrc do?", "back": "Defines a named config. Passing --config=ci adds -c opt to build and every command that inherits build options."},
+  {"front": "Which commands read <code>build</code> lines in .bazelrc?", "back": "build, test, run, cquery (and others that build). Not query: it reads common and query lines only."},
+  {"front": "<code>try-import</code> vs <code>import</code>?", "back": "try-import silently skips a missing file; import fails with \"Nonexistent path in import declaration\"."},
+  {"front": "What does <code>//conditions:default</code> do?", "back": "The select() branch used when no other condition matches. Without it, no match is an analysis error."},
+  {"front": "How do you fix \"Illegal ambiguous match\"?", "back": "Add a config_setting that checks everything both matching conditions check (it is more specialized), or make the conditions exclusive."},
+  {"front": "Name three attributes that cannot be selected.", "back": "name, visibility, tags (also a genrule's outs). Bazel needs them during loading."},
+  {"front": "How do you declare and set a custom string flag?", "back": "string_flag(name = \"env\", build_setting_default = \"dev\", values = [...]) from @bazel_skylib//rules:common_settings.bzl; set with --//config:env=prod."},
+  {"front": "Why prefer build settings over <code>--define</code>?", "back": "Typos in the flag label and values outside the allowed list are errors. A misspelled --define is ignored silently."},
+  {"front": "What does <code>target_compatible_with</code> do?", "back": "Lists constraint values the target platform must have. On other platforms, wildcards skip the target (tests show SKIPPED); explicit requests fail as incompatible."},
+  {"front": "query vs cquery on a select()?", "back": "query lists every branch (no configuration yet). cquery resolves the select for your flags and shows only the chosen branch."}
+]
+</script>
+    </div>
+    <h3>Going further</h3>
+    <ul>
+      <li><a href="https://bazel.build/docs/configurable-attributes">Configurable build attributes (select)</a> on bazel.build</li>
+      <li><a href="https://bazel.build/run/bazelrc">Write bazelrc configuration files</a> on bazel.build</li>
+      <li><a href="https://bazel.build/extending/config">Build settings (user-defined flags)</a> on bazel.build</li>
+      <li><a href="https://bazel.build/extending/platforms">Platforms</a> and <a href="https://bazel.build/docs/platforms">building with platforms</a> on bazel.build</li>
+      <li><a href="https://bazel.build/query/cquery">Configurable query (cquery)</a> on bazel.build</li>
+      <li><a href="https://bazel.build/reference/be/general#config_setting"><code>config_setting</code> reference</a> on bazel.build</li>
+      <li><a href="https://github.com/bazelbuild/bazel-skylib/blob/main/docs/common_settings_doc.md">bazel_skylib <code>common_settings</code></a> and <a href="https://registry.bazel.build/modules/bazel_skylib">bazel_skylib on the Bazel Central Registry</a></li>
+      <li><a href="https://registry.bazel.build/modules/platforms">The <code>platforms</code> module on the Bazel Central Registry</a></li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>

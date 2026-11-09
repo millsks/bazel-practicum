@@ -1,0 +1,1338 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M04 · Third-Party Dependencies with Bzlmod · Bazel Practicum</title>
+<link rel="stylesheet" href="../assets/css/course.css">
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/viz.js" defer></script>
+<script src="../assets/js/viz-bazel.js" defer></script>
+<script src="../assets/js/course.js" defer></script>
+</head>
+<body data-root="../" data-module="m04">
+<main class="lesson">
+  <header class="lesson-hero">
+    <p class="eyebrow">Stage 1 · Foundations · Module 04</p>
+    <h1>Third-Party Dependencies with Bzlmod</h1>
+    <p class="lede">Every real project stands on other people's code: rule sets from the Bazel Central Registry and
+      packages from PyPI. This module takes <code>MODULE.bazel</code> apart line by line, shows how Bazel picks versions
+      (and why it is not pip), and wires PyPI into the build with a hashed lock file, so <code>import requests</code>
+      works under Bazel exactly as it does in your Pixi environment, on every machine.</p>
+    <div class="lesson-meta"><span>⏱ ~2.5 hours</span><span>Prerequisites: <a href="m03-rules-python.html">M03</a></span></div>
+    <ul class="objectives">
+      <li>Read and write <code>MODULE.bazel</code>: <code>module()</code>, <code>bazel_dep</code>, <code>repo_name</code>, <code>dev_dependency</code>, and the four overrides</li>
+      <li>Explain Minimal Version Selection and how it differs from pip's resolver</li>
+      <li>Tell apparent repository names (<code>@rules_python</code>) from canonical ones (<code>@@rules_python+</code>)</li>
+      <li>Use a module extension with <code>use_extension</code> and <code>use_repo</code></li>
+      <li>Add PyPI packages with <code>pip.parse</code>, a hashed lock from <code>compile_pip_requirements</code>, and labels like <code>@pypi//python_dateutil</code></li>
+      <li>Run pytest under <code>bazel test</code></li>
+      <li>Inspect the module graph with <code>bazel mod</code>, and know what <code>MODULE.bazel.lock</code> is for</li>
+    </ul>
+  </header>
+
+  <section class="lesson-section" id="module-file">
+    <h2>MODULE.bazel, line by line</h2>
+    <aside class="callout python">
+      <p>In a Python project, <code>pyproject.toml</code> names your project and lists what it needs:
+        <code>dependencies = ["requests&gt;=2.31"]</code>. Pixi's <code>pixi.toml</code> does the same for conda packages.
+        Then a resolver turns those wishes into exact versions and writes a lock file.</p>
+    </aside>
+    <p><code>MODULE.bazel</code> is Bazel's <code>pyproject.toml</code>. You met it in M00: it marks the workspace root.
+      Here is a complete one, the kind you will write for the rest of the course:</p>
+    <pre data-label="MODULE.bazel"><code class="language-starlark">module(name = "weather", version = "0.1.0")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+bazel_dep(name = "bazel_skylib", version = "1.9.2")
+
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(python_version = "3.13", is_default = True)</code></pre>
+    <dl>
+      <dt><code>module(name, version)</code></dt>
+      <dd>Names <em>this</em> module, the <strong>root module</strong>. It must be the first call in the file. The version
+        only matters if someone else depends on you; leave it out in an application.</dd>
+      <dt><code>bazel_dep(name, version)</code></dt>
+      <dd>Depends on another <strong>module</strong>: a versioned bundle of Bazel code (rules, toolchains, libraries)
+        with its own <code>MODULE.bazel</code>. The <code>name</code> is the module's registry name; the
+        <code>version</code> is the <em>minimum</em> you accept (more on that soon).</dd>
+      <dt><code>use_extension</code> and its tags</dt>
+      <dd>Run a <strong>module extension</strong>: Starlark code from a module that creates more repositories, such as
+        a Python interpreter or a hub of PyPI packages. Covered below.</dd>
+    </dl>
+    <p>Every <code>bazel_dep</code> makes an external <strong>repository</strong> visible under the same name. That is
+      why <code>bazel_dep(name = "bazel_skylib", ...)</code> lets a BUILD file say
+      <code>load("@bazel_skylib//rules:write_file.bzl", "write_file")</code>. No <code>bazel_dep</code>, no
+      <code>@bazel_skylib</code>.</p>
+    <p>Try it. This BUILD file uses <a href="https://registry.bazel.build/modules/bazel_skylib">bazel_skylib</a>'s
+      <code>write_file</code> rule, but the module does not declare it. Run the build, read the error, then add the
+      missing line to <code>MODULE.bazel</code> and run again.</p>
+    <div class="runnable" data-title="A load from a module you did not declare" data-commands="bazel build //docs:hello|bazel query //docs:all --output=label_kind">
+<textarea class="file" data-path="MODULE.bazel">
+module(name = "handbook")
+
+# Add a bazel_dep for bazel_skylib 1.9.2 here.
+</textarea>
+<textarea class="file" data-path="docs/BUILD.bazel" data-readonly>
+load("@bazel_skylib//rules:write_file.bzl", "write_file")
+
+write_file(
+    name = "hello",
+    out = "hello.txt",
+    content = ["Hello from skylib"],
+)
+</textarea>
+</div>
+    <p>Real Bazel fails while <em>loading</em> the package, because the <code>load()</code> names a repository the
+      main repository cannot see:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: error loading package 'docs': Unable to find package for @@[unknown repo 'bazel_skylib' requested from @@]//rules:write_file.bzl: The repository '@@[unknown repo 'bazel_skylib' requested from @@]' could not be resolved: No repository visible as '@bazel_skylib' from main repository.</code></pre>
+    <p>Read it as "who asked, for what, and from where": <code>requested from @@</code> means the main repository (your
+      workspace) asked, and nothing named <code>@bazel_skylib</code> is visible from it.</p>
+    <h3>Mistakes in the bazel_dep line itself</h3>
+    <p>A typo in the name or a version that does not exist fails before any BUILD file is read, while Bazel resolves
+      the module graph:</p>
+    <pre data-label="Real output (Bazel 9.3.2): version = &quot;1.99.0&quot;"><code class="language-none">ERROR: Error computing the main repository mapping: in module dependency chain &lt;root&gt; -&gt; bazel_skylib@1.99.0: module bazel_skylib@1.99.0 not found in registries:
+* https://bcr.bazel.build/modules/bazel_skylib/1.99.0/MODULE.bazel: not found</code></pre>
+    <p>Declaring the same module twice is a Starlark error with a traceback pointing at the second line:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">Error in bazel_dep: The repo name 'bazel_skylib' cannot be defined by a bazel_dep at /work/handbook/MODULE.bazel:4:10 as it is already defined by a bazel_dep at /work/handbook/MODULE.bazel:3:10</code></pre>
+    <aside class="callout note" data-title="About paths in real output">
+      <p>Real output on this page comes from runs of Bazel 9.3.2 with rules_python 2.4.6. Workspace paths are shortened
+        to <code>/work/&lt;workspace&gt;</code> and Bazel's cache to <code>~/.cache/bazel/…</code>; progress lines are
+        dropped.</p>
+    </aside>
+    <p><strong>Remember:</strong> <code>module()</code> first; one <code>bazel_dep</code> per module; the dependency's
+      name becomes the <code>@name</code> you type in labels and loads.</p>
+  </section>
+
+  <section class="lesson-section" id="versions">
+    <h2>Versions: the registry and Minimal Version Selection</h2>
+    <p>Where does <code>bazel_skylib@1.9.2</code> come from? From the <strong>Bazel Central Registry</strong> (BCR) at
+      <a href="https://registry.bazel.build/">registry.bazel.build</a>, Bazel's PyPI. For each module and version it
+      stores a copy of the module's <code>MODULE.bazel</code> and a <code>source.json</code> saying where to download
+      the source archive and its checksum. Browse it to find a module's versions and its README.</p>
+    <p>Each module in the graph declares its own <code>bazel_dep</code>s, so dependencies have dependencies.
+      <code>rules_python</code> alone pulls in many more, from <code>bazel_features</code> to <code>protobuf</code>. When two modules ask for different versions of the
+      same module, Bazel has to pick one.</p>
+    <h3>pip picks the newest; Bazel picks the oldest that satisfies everyone</h3>
+    <div class="two-col">
+      <div>
+        <h4>pip</h4>
+        <p>You write ranges (<code>requests&gt;=2.31,&lt;3</code>). The resolver searches for the <em>newest</em>
+          versions that satisfy every range, backtracking when they conflict. Run it next month and you may get
+          different versions, which is why you need a lock file.</p>
+      </div>
+      <div>
+        <h4>Bazel (MVS)</h4>
+        <p>Every <code>bazel_dep</code> version is a <em>minimum</em>. For each module, Bazel picks the
+          <strong>highest of the minimums</strong> anyone in the graph asked for. Never newer than someone asked for, so
+          the same <code>MODULE.bazel</code> files always give the same answer.</p>
+      </div>
+    </div>
+    <p>This is <strong>Minimal Version Selection</strong> (MVS), the algorithm Go modules also use. It needs no search
+      and no backtracking, and a new release on the registry cannot change your build until someone raises a version in
+      a <code>MODULE.bazel</code>. The price: only <em>one</em> version of each module ends up in the graph, and it can
+      be newer than the one you wrote.</p>
+    <p>Here is what that looks like. This workspace asks for skylib 1.7.1, but <code>rules_shell</code> 0.8.0 (through
+      its own dependencies) needs at least 1.8.2:</p>
+    <pre data-label="MODULE.bazel"><code class="language-starlark">module(name = "handbook", version = "1.0.0")
+
+bazel_dep(name = "bazel_skylib", version = "1.7.1")
+bazel_dep(name = "rules_shell", version = "0.8.0")</code></pre>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">WARNING: For repository 'bazel_skylib', the root module requires module version bazel_skylib@1.7.1, but got bazel_skylib@1.8.2 in the resolved dependency graph. Please update the version in your MODULE.bazel or set --check_direct_dependencies=off</code></pre>
+    <p>The build still works, with 1.8.2. Bazel warns because your file no longer tells the truth about what you run.
+      Fix it by writing the version Bazel actually picked. Teams usually make it an error in CI with
+      <code>--check_direct_dependencies=error</code>:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: For repository 'bazel_skylib', the root module requires module version bazel_skylib@1.7.1, but got bazel_skylib@1.8.2 in the resolved dependency graph. Please update the version in your MODULE.bazel or set --check_direct_dependencies=off
+ERROR: Error computing the main repository mapping: Direct dependency check failed.</code></pre>
+    <p>Going the other way works as you would expect: ask for skylib 1.9.2 and every module in the graph gets 1.9.2,
+      even those that only asked for 1.6. "Highest minimum" means the root module can always pull a dependency
+      <em>up</em>.</p>
+    <aside class="callout think">
+      <p>Your module asks for <code>platforms</code> 1.0.0, <code>rules_go</code> asks for 0.0.10, and
+        <code>bazel_skylib</code> asks for 1.1.0. Which version does MVS select, and why can it never select 1.2.0 even
+        if the registry has it? (1.1.0: the highest minimum. Nobody asked for 1.2.0.)</p>
+    </aside>
+    <aside class="callout warn" data-title="Not for PyPI">
+      <p>MVS only applies to <em>Bazel modules</em> (rule sets and tools from the registry). PyPI packages are resolved
+        by pip, exactly as you are used to, then pinned in a lock file. The two systems sit side by side, and the rest of
+        this module covers both.</p>
+    </aside>
+    <p><strong>Remember:</strong> a <code>bazel_dep</code> version is a minimum; MVS picks the highest minimum; keep your
+      root versions equal to what is resolved.</p>
+  </section>
+
+  <section class="lesson-section" id="repo-names">
+    <h2>Apparent and canonical repository names</h2>
+    <p>A label like <code>@bazel_skylib//rules:write_file.bzl</code> starts with an <strong>apparent repository
+      name</strong>: the name <em>your</em> module uses for a repository. Each module sees the world through its own
+      names. Behind them, every repository has one <strong>canonical name</strong>, unique in the whole build, which
+      Bazel writes with two at-signs. For a module from the registry it is the module name plus a <code>+</code>:</p>
+    <pre data-label="Terminal"><code class="language-bash">pixi run bazel query @bazel_skylib//rules:write_file.bzl --consistent_labels</code></pre>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">@@bazel_skylib+//rules:write_file.bzl</code></pre>
+    <p>The table that turns one into the other is the <strong>repository mapping</strong>. Bazel prints the main
+      repository's mapping with <code>bazel mod dump_repo_mapping ''</code>:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">{"":"","handbook":"","bazel_skylib":"bazel_skylib+","bazel_tools":"bazel_tools"}</code></pre>
+    <p>Read each pair as "apparent: canonical". <code>""</code> and <code>handbook</code> (your module's name) both mean
+      the main repository, whose canonical name is empty: that is the <code>@@</code> you see in errors such as
+      <code>requested from @@</code>. Repositories made by extensions get longer canonical names, such as
+      <code>@@rules_python++pip+weather_pypi</code>: module, extension, repository.</p>
+    <aside class="callout warn">
+      <p>Never type a canonical name in a BUILD file. The <code>+</code> format is an implementation detail that has
+        already changed once (Bazel 7 used <code>~</code>). Use apparent names; read canonical ones in error
+        messages.</p>
+    </aside>
+    <h3>repo_name: choose the apparent name</h3>
+    <p><code>repo_name</code> on a <code>bazel_dep</code> changes the apparent name. It is mostly used to keep old BUILD
+      files working when a module was renamed, or to shorten a long name:</p>
+    <pre data-label="MODULE.bazel"><code class="language-starlark">bazel_dep(name = "bazel_skylib", version = "1.9.2", repo_name = "skylib")</code></pre>
+    <p>Now <code>@skylib</code> works, and <code>@bazel_skylib</code> no longer does: the module is the same, only its
+      name in <em>your</em> module changed. Run both commands, then edit the <code>load()</code>:</p>
+    <div class="runnable" data-title="repo_name renames the repository for you" data-commands="bazel build //docs:hello|bazel query //docs:all">
+<textarea class="file" data-path="MODULE.bazel">
+module(name = "handbook")
+
+bazel_dep(name = "bazel_skylib", version = "1.9.2", repo_name = "skylib")
+</textarea>
+<textarea class="file" data-path="docs/BUILD.bazel">
+load("@bazel_skylib//rules:write_file.bzl", "write_file")
+
+write_file(
+    name = "hello",
+    out = "hello.txt",
+    content = ["Hello from skylib"],
+)
+</textarea>
+</div>
+    <p>Real Bazel gives the same <code>No repository visible as '@bazel_skylib'</code> error until the
+      <code>load()</code> says <code>@skylib</code>. Bazel itself still calls the module <code>bazel_skylib@1.9.2</code>
+      in <code>bazel mod graph</code>; <code>repo_name</code> never changes the module's identity.</p>
+    <p><strong>Remember:</strong> <code>@name</code> is apparent and per-module; <code>@@name+</code> is canonical and
+      global; <code>repo_name</code> only renames the apparent one.</p>
+  </section>
+
+  <section class="lesson-section" id="dev-and-overrides">
+    <h2>dev_dependency and overrides</h2>
+    <h3>dev_dependency: dependencies only you need</h3>
+    <aside class="callout python">
+      <p>In <code>pyproject.toml</code>, pytest goes in a dev group or an optional extra, not in
+        <code>dependencies</code>, so people who install your package do not get it. Pixi has the same idea with
+        features.</p>
+    </aside>
+    <p><code>dev_dependency = True</code> marks a <code>bazel_dep</code> (or a <code>use_extension</code>) as needed
+      only when your module is the root: for your tests, linters, and tools. When another module depends on yours,
+      Bazel ignores your dev dependencies entirely, so they never enter its graph or its version selection.</p>
+    <pre data-label="MODULE.bazel"><code class="language-starlark">module(name = "textkit", version = "1.0.0")
+
+bazel_dep(name = "bazel_skylib", version = "1.8.2")
+bazel_dep(name = "rules_shell", version = "0.8.0", dev_dependency = True)  # only our sh_tests use it</code></pre>
+    <p>As the root module, <code>textkit</code> sees both. You can preview what a consumer sees with
+      <code>--ignore_dev_dependency</code>. Both runs below are real, on the <code>handbook</code> workspace with
+      <code>rules_shell</code> marked dev:</p>
+    <pre data-label="Real output (Bazel 9.3.2): bazel mod graph --depth=1"><code class="language-none">&lt;root&gt; (handbook@1.0.0)
+├───bazel_skylib@1.8.2
+└───rules_shell@0.8.0 </code></pre>
+    <pre data-label="Real output (Bazel 9.3.2): bazel mod graph --depth=1 --ignore_dev_dependency"><code class="language-none">&lt;root&gt; (handbook@1.0.0)
+└───bazel_skylib@1.8.2 </code></pre>
+    <aside class="callout tip">
+      <p>Mark something dev when your <em>library</em> code does not load from it. Test rule sets, formatters, a pip hub
+        with only pytest in it: dev. The rule set your BUILD files use to build the library itself: not dev. In an
+        application nobody will depend on, it changes nothing, but it documents intent.</p>
+    </aside>
+    <h3>Overrides: when the registry is not the answer</h3>
+    <p>Sometimes you need a module from somewhere other than the registry, or a version MVS would not pick. Four
+      override functions do this. Each takes the <code>module_name</code> of a module in the graph, and each
+      <strong>only works in the root module</strong>: overrides in your dependencies' <code>MODULE.bazel</code> files are
+      ignored, so a library cannot force choices on you.</p>
+    <div class="card-grid">
+      <div class="card"><h4><code>single_version_override</code></h4><p>Pin a registry module to an exact
+        <code>version</code>, even <em>below</em> what MVS would pick. Also takes <code>patches</code>. Use it to hold back
+        a broken release or to patch a module.</p></div>
+      <div class="card"><h4><code>local_path_override</code></h4><p>Use a module from a directory on disk
+        (<code>path</code>). For a module you are developing next to your project, or one vendored into your
+        repository.</p></div>
+      <div class="card"><h4><code>git_override</code></h4><p>Use a module from a Git <code>remote</code> at a
+        <code>commit</code>. For an unreleased fix or a fork. Pin a commit hash, never a branch.</p></div>
+      <div class="card"><h4><code>archive_override</code></h4><p>Use a module from a source archive at
+        <code>urls</code> with an <code>integrity</code> hash. For releases on a server that is not a registry.</p></div>
+    </div>
+    <pre data-label="MODULE.bazel"><code class="language-starlark">bazel_dep(name = "textkit", version = "0.3.0")
+local_path_override(
+    module_name = "textkit",
+    path = "vendor/textkit",
+)
+
+bazel_dep(name = "bazel_skylib", version = "1.9.2")
+git_override(
+    module_name = "bazel_skylib",
+    remote = "https://github.com/bazelbuild/bazel-skylib.git",
+    commit = "564ef5d5407bd9f91a046c7ceed2c259b884ac49",
+)</code></pre>
+    <p>The <code>bazel_dep</code> line is still required; the override only changes <em>where</em> the module comes from.
+      Overridden modules show <code>@_</code> instead of a version in the graph, because the version no longer comes
+      from the registry:</p>
+    <pre data-label="Real output (Bazel 9.3.2): bazel mod graph --depth=1"><code class="language-none">&lt;root&gt; (handbook@0.1.0)
+└───bazel_skylib@_ </code></pre>
+    <p><code>bazel mod show_repo</code> shows the repository rule behind a module, which is the quickest way to confirm
+      an override took effect:</p>
+    <pre data-label="Real output (Bazel 9.3.2): bazel mod show_repo bazel_skylib"><code class="language-none">## bazel_skylib@_:
+load("@@bazel_tools//tools/build_defs/repo:git.bzl", "git_repository")
+git_repository(
+  name = "bazel_skylib+",
+  remote = "https://github.com/bazelbuild/bazel-skylib.git",
+  commit = "564ef5d5407bd9f91a046c7ceed2c259b884ac49",
+)</code></pre>
+    <p>An override for a module nobody depends on is an error, which catches typos in <code>module_name</code>:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: Error computing the main repository mapping: the root module specifies overrides on nonexistent module(s): nope</code></pre>
+    <aside class="callout pro">
+      <p>Every override is a decision the registry no longer makes for you, so leave a comment saying why and when to
+        remove it. A <code>git_override</code> to a fork tends to outlive the bug it fixed.</p>
+    </aside>
+    <p><strong>Remember:</strong> dev dependencies vanish for consumers; overrides change where a module comes from and
+      only count in the root module.</p>
+  </section>
+
+  <section class="lesson-section" id="extensions">
+    <h2>Module extensions and use_repo</h2>
+    <p>A <code>bazel_dep</code> gives you exactly one repository: the module's own source. Many things you depend on do
+      not fit that shape. A Python interpreter differs per operating system. A set of PyPI packages depends on
+      <em>your</em> lock file. Something has to read your configuration and create repositories on demand.</p>
+    <p>That something is a <strong>module extension</strong>: Starlark code shipped by a module, which reads
+      <strong>tags</strong> (calls such as <code>pip.parse(...)</code>) from every module in the graph and then defines
+      any number of repositories. Three steps, always the same:</p>
+    <pre data-label="MODULE.bazel"><code class="language-starlark"># 1. Get a proxy for the extension: the .bzl file that defines it, and its name.
+pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
+
+# 2. Call tags on it to configure it. Nothing runs yet.
+pip.parse(
+    hub_name = "weather_pypi",
+    python_version = "3.13",
+    requirements_lock = "//:requirements_lock.txt",
+)
+
+# 3. Import the repositories you want to use, by name.
+use_repo(pip, pypi = "weather_pypi")</code></pre>
+    <p>Step three is the one people forget. An extension may create hundreds of repositories (one per wheel, for pip),
+      but your module only <em>sees</em> the ones you import with <code>use_repo</code>. Like a <code>bazel_dep</code>,
+      it makes an apparent name. <code>use_repo(pip, "weather_pypi")</code> imports it under its own name;
+      <code>use_repo(pip, pypi = "weather_pypi")</code> imports it as <code>@pypi</code>.</p>
+    <p>Bazel runs an extension lazily, the first time something needs one of its repositories. That has a surprising
+      consequence: a <code>use_repo</code> that names a repository the extension never creates is only reported when
+      the extension runs. Here the hub is called <code>weather_pypi</code> but <code>use_repo</code> asks for
+      <code>pip</code>:</p>
+    <pre data-label="Real output (Bazel 9.3.2): bazel mod show_extension @rules_python//python/extensions:pip.bzl%pip"><code class="language-none">ERROR: module extension @@rules_python+//python/extensions:pip.bzl%pip does not generate repository "pip", yet it is imported as "pip" in the usage at /work/weather/MODULE.bazel:11:20</code></pre>
+    <p>The sandbox below defines a hub but never imports it. Run the build, then add the <code>use_repo</code> line.</p>
+    <div class="runnable" data-title="Forgetting use_repo" data-commands="bazel build //app:fetch|bazel query 'deps(//app:fetch, 1)'">
+<textarea class="file" data-path="MODULE.bazel">
+module(name = "weather")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(python_version = "3.13", is_default = True)
+
+pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
+pip.parse(
+    hub_name = "weather_pypi",
+    python_version = "3.13",
+    requirements_lock = "//:requirements_lock.txt",
+)
+</textarea>
+<textarea class="file" data-path="app/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "fetch",
+    srcs = ["fetch.py"],
+    deps = ["@pypi//requests"],
+)
+</textarea>
+<textarea class="file" data-path="requirements_lock.txt" data-readonly>
+certifi==2026.10.5
+charset-normalizer==3.4.4
+idna==3.11
+requests==2.34.2
+urllib3==2.8.0
+</textarea>
+<textarea class="file" data-path="app/fetch.py" data-hidden></textarea>
+</div>
+    <p>Without the <code>use_repo</code>, real Bazel reports exactly what it reports for a missing
+      <code>bazel_dep</code>, because from your module's point of view it is the same problem. From the
+      <code>weather</code> workspace used later in this module, where a library depends on
+      <code>@pypi//python_dateutil</code>:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: /work/weather/forecast/BUILD.bazel:3:11: no such package '@@[unknown repo 'pypi' requested from @@]//python_dateutil': The repository '@@[unknown repo 'pypi' requested from @@]' could not be resolved: No repository visible as '@pypi' from main repository and referenced by '//forecast:forecast'</code></pre>
+    <aside class="callout pro">
+      <p><code>bazel mod tidy</code> rewrites <code>MODULE.bazel</code> so every <code>use_repo</code> lists exactly what
+        the extensions report you need, and formats the file. Run it after editing extension usages.</p>
+    </aside>
+    <p><strong>Remember:</strong> <code>use_extension</code>, then tags, then <code>use_repo</code>. If a repository is
+      "not visible", check the <code>use_repo</code> before anything else.</p>
+  </section>
+
+  <section class="lesson-section" id="pip">
+    <h2>PyPI packages: pip.parse and the hub</h2>
+    <aside class="callout python">
+      <p>With pip-tools you keep loose wishes in <code>requirements.in</code>, run <code>pip-compile</code> to get a fully
+        pinned <code>requirements.txt</code>, and <code>pip install -r</code> it into a virtual environment. Bazel uses the
+        same two files. It just never installs into an environment you can see.</p>
+    </aside>
+    <p>rules_python's <code>pip</code> extension reads a <strong>lock file</strong>, a <code>requirements.txt</code>
+      where every package, including transitive ones, is pinned with <code>==</code> and carries hashes. From it, the
+      extension creates one repository per wheel and a <strong>hub</strong> repository that gives each package a
+      friendly label. The <code>pip.parse</code> tag takes three attributes you always set:</p>
+    <dl>
+      <dt><code>hub_name</code></dt>
+      <dd>The hub repository's name. Make it unique: the convention is your module name plus <code>_pypi</code>.</dd>
+      <dt><code>python_version</code></dt>
+      <dd>Which registered toolchain (M03) evaluates markers and picks wheels. It must match a
+        <code>python.toolchain(...)</code> call, or the extension fails.</dd>
+      <dt><code>requirements_lock</code></dt>
+      <dd>The label of the lock file, usually <code>"//:requirements_lock.txt"</code>.</dd>
+    </dl>
+    <h3>Why not hub_name = "pypi"?</h3>
+    <p>Most older examples write <code>hub_name = "pypi"</code>. With rules_python 2.4.6 that still works, but every
+      build prints:</p>
+    <pre data-label="Real output (Bazel 9.3.2, rules_python 2.4.6)"><code class="language-none">DEBUG: ~/.cache/bazel/…/external/rules_python+/python/private/pypi/extension.bzl:397:26: WARNING: The PyPI hub name 'pypi' is reserved (module 'weather'). Please rename your hub, otherwise a future release will rename it to 'weather_pypi'.</code></pre>
+    <p>Since rules_python 2.2, the name <code>pypi</code> is reserved for a "unified" hub the extension generates on
+      its own. So name your hub after your module and import it <em>as</em> <code>@pypi</code> with
+      <code>use_repo</code>'s keyword form. Your BUILD files keep the short, conventional labels:</p>
+    <pre data-label="MODULE.bazel"><code class="language-starlark">pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
+pip.parse(
+    hub_name = "weather_pypi",
+    python_version = "3.13",
+    requirements_lock = "//:requirements_lock.txt",
+)
+use_repo(pip, pypi = "weather_pypi")</code></pre>
+    <h3>Labels for PyPI packages</h3>
+    <p>Each locked package becomes a package in the hub, named after its <strong>distribution name</strong> (the name
+      on PyPI, in the lock file) <strong>normalized</strong>: lowercase, with every run of <code>-</code>,
+      <code>_</code>, and <code>.</code> replaced by one underscore. <code>@pypi//requests</code> is short for
+      <code>@pypi//requests:requests</code>, which is the target you put in <code>deps</code>.</p>
+    <table>
+      <thead><tr><th>In the lock file</th><th>You import</th><th>Label</th></tr></thead>
+      <tbody>
+        <tr><td><code>requests</code></td><td><code>import requests</code></td><td><code>@pypi//requests</code></td></tr>
+        <tr><td><code>python-dateutil</code></td><td><code>import dateutil</code></td><td><code>@pypi//python_dateutil</code></td></tr>
+        <tr><td><code>PyYAML</code></td><td><code>import yaml</code></td><td><code>@pypi//pyyaml</code></td></tr>
+        <tr><td><code>typing-extensions</code></td><td><code>import typing_extensions</code></td><td><code>@pypi//typing_extensions</code></td></tr>
+        <tr><td><code>zope.interface</code></td><td><code>import zope.interface</code></td><td><code>@pypi//zope_interface</code></td></tr>
+      </tbody>
+    </table>
+    <p>The label follows the <em>distribution</em>, never the import name. This is the single most common PyPI mistake
+      under Bazel. All three of these are wrong for python-dateutil, and real Bazel rejects each with the same
+      message. (These runs used a hub named <code>pypi</code>; with <code>weather_pypi</code> the canonical name in the
+      message reads <code>@@rules_python++pip+weather_pypi</code>.)</p>
+    <div class="tabs">
+      <div class="tab" data-label="@pypi//dateutil">
+        <p>The import name. There is no distribution called <code>dateutil</code>.</p>
+        <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: no such package '@@rules_python++pip+pypi//dateutil': BUILD file not found in directory 'dateutil' of external repository @@rules_python++pip+pypi. Add a BUILD file to a directory to mark it as a package.</code></pre>
+      </div>
+      <div class="tab" data-label="@pypi//python-dateutil">
+        <p>The distribution name, but not normalized. Labels are matched exactly.</p>
+        <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: no such package '@@rules_python++pip+pypi//python-dateutil': BUILD file not found in directory 'python-dateutil' of external repository @@rules_python++pip+pypi. Add a BUILD file to a directory to mark it as a package.</code></pre>
+      </div>
+      <div class="tab" data-label="@pypi//Python_Dateutil">
+        <p>Normalized, except for case.</p>
+        <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: no such package '@@rules_python++pip+pypi//Python_Dateutil': BUILD file not found in directory 'Python_Dateutil' of external repository @@rules_python++pip+pypi. Add a BUILD file to a directory to mark it as a package.</code></pre>
+      </div>
+    </div>
+    <p>The same message also means "not in the lock file". Adding <code>requests</code> to <code>requirements.in</code>
+      is not enough: the hub is built from the <em>lock</em>. Predict what this build prints, then run it.</p>
+    <div class="runnable" data-predict data-title="In requirements.in, but is it in the hub?" data-commands="bazel build //app:fetch">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "weather")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(python_version = "3.13", is_default = True)
+
+pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
+pip.parse(
+    hub_name = "weather_pypi",
+    python_version = "3.13",
+    requirements_lock = "//:requirements_lock.txt",
+)
+use_repo(pip, pypi = "weather_pypi")
+</textarea>
+<textarea class="file" data-path="requirements.in">
+python-dateutil
+requests
+</textarea>
+<textarea class="file" data-path="requirements_lock.txt" data-readonly>
+# Generated before requests was added to requirements.in
+python-dateutil==4.0.0
+six==1.17.0
+</textarea>
+<textarea class="file" data-path="app/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "fetch",
+    srcs = ["fetch.py"],
+    deps = [
+        "@pypi//python_dateutil",
+        "@pypi//requests",
+    ],
+)
+</textarea>
+<textarea class="file" data-path="app/fetch.py" data-hidden></textarea>
+</div>
+    <h3>What is in the hub</h3>
+    <p>Each package in the hub has a few targets. You will almost always use the default one:</p>
+    <pre data-label="Real output (Bazel 9.3.2): bazel query @pypi//pytest:all"><code class="language-none">@pypi//pytest:_no_matching_repository
+@pypi//pytest:data
+@pypi//pytest:dist_info
+@pypi//pytest:extracted_whl_files
+@pypi//pytest:pkg
+@pypi//pytest:pytest
+@pypi//pytest:srcs
+@pypi//pytest:whl
+@pypi//pytest:whl_file</code></pre>
+    <p><code>:pytest</code> is an <code>alias</code> for <code>:pkg</code>, a <code>py_library</code> with the unpacked
+      wheel and <code>deps</code> on pytest's own dependencies (pluggy, iniconfig, packaging…). You list only what your
+      code imports; the transitive packages come along.</p>
+    <h3>Undeclared imports fail, even if the package is locked</h3>
+    <p>The lock decides what <em>can</em> be used; <code>deps</code> decide what <em>is</em> on each target's import
+      path. If <code>dates.py</code> adds <code>import attrs</code> without <code>"@pypi//attrs"</code> in
+      <code>deps</code>, the test fails at run time even though attrs is in the lock:</p>
+    <pre data-label="Real output (Bazel 9.3.2, from the test log)"><code class="language-none">    from forecast.dates import weekday
+forecast/dates.py:1: in &lt;module&gt;
+    import attrs
+E   ModuleNotFoundError: No module named 'attrs'</code></pre>
+    <p>This is Bazel's sandboxing working for you: in a virtual environment, an undeclared import works by accident
+      because everything is installed in one place.</p>
+    <p><strong>Remember:</strong> hub named <code>&lt;module&gt;_pypi</code>, imported as <code>@pypi</code>; labels use
+      the normalized distribution name; only locked packages exist; every import needs a <code>deps</code> entry.</p>
+  </section>
+
+  <section class="lesson-section" id="lock-file">
+    <h2>Generating the lock: compile_pip_requirements</h2>
+    <p>You could run pip-tools yourself, but then the lock depends on whichever Python you ran it with. rules_python
+      ships a macro that runs <code>pip-compile</code> with the hermetic interpreter from your toolchain:</p>
+    <pre data-label="BUILD.bazel (workspace root)"><code class="language-starlark">load("@rules_python//python:pip.bzl", "compile_pip_requirements")
+
+compile_pip_requirements(
+    name = "requirements",
+    src = "requirements.in",
+    requirements_txt = "requirements_lock.txt",
+)</code></pre>
+    <p>A <strong>macro</strong> is a function that declares several targets at once. This one makes four:</p>
+    <pre data-label="Real output (Bazel 9.3.2): bazel query //... --output=label_kind"><code class="language-none">filegroup rule //:requirements
+py_test rule //:requirements.test
+py_binary rule //:requirements.update
+alias rule //:requirements_test</code></pre>
+    <dl>
+      <dt><code>bazel run //:requirements.update</code></dt>
+      <dd>Re-solves <code>requirements.in</code> and rewrites <code>requirements_lock.txt</code> in your source tree.
+        Run it after every change to <code>requirements.in</code>, and to upgrade.</dd>
+      <dt><code>bazel test //:requirements.test</code></dt>
+      <dd>Re-solves into a temporary file and fails if the result differs from the committed lock. It needs the network
+        (it is tagged <code>requires-network</code> and <code>no-sandbox</code>). <code>//:requirements_test</code> is a
+        deprecated alias for it.</dd>
+    </dl>
+    <p>The lock file must exist before the first run; an empty file is fine. Then:</p>
+    <pre data-label="Terminal"><code class="language-bash">touch requirements_lock.txt
+pixi run bazel run //:requirements.update</code></pre>
+    <pre data-label="requirements_lock.txt (generated, excerpt)"><code class="language-none">#
+# This file is autogenerated by pip-compile with Python 3.13
+# by the following command:
+#
+#    bazel run //:requirements.update
+#
+iniconfig==2.3.1 \
+    --hash=sha256:67f4b9c50da0dedf52af349e7749a80a9057a5031199791b906c3bb3ae878960 \
+    --hash=sha256:9121e2c1fdb355232495be3194c8dfe87ccc2d5dee45947b78e68f499790d7a7
+    # via pytest
+…
+python-dateutil==4.0.0 \
+    --hash=sha256:a5e246f79eb80475e691bf93862cead98decd8a498cf53ba0516fcdc0f50dc1c \
+    --hash=sha256:d7295ff14fdc0f92f662100bfb6c551d160ca090f2939f1ec5b9794265c03f06
+    # via -r requirements.in</code></pre>
+    <h3>Why the hashes matter</h3>
+    <p>Each <code>--hash</code> is the SHA-256 of one file PyPI serves for that version (here a wheel and an sdist). When
+      Bazel downloads the wheel, pip checks it against the hashes. A file that was replaced on the index, or a
+      corrupted mirror, fails the build instead of quietly entering it. Change one hash by hand and you see:</p>
+    <pre data-label="Real output (Bazel 9.3.2, excerpt)"><code class="language-none">ERROR: THESE PACKAGES DO NOT MATCH THE HASHES FROM THE REQUIREMENTS FILE. If you have updated the package versions, please update the hashes. Otherwise, examine the package contents carefully; someone may have tampered with them.
+        Expected sha256 a5e246f79eb80475e691bf93862cead98decd8a498cf53ba0516fcdc0f50dc1d
+             Got        a5e246f79eb80475e691bf93862cead98decd8a498cf53ba0516fcdc0f50dc1c</code></pre>
+    <h3>Unpinned lock files</h3>
+    <p>A Python developer's instinct is to point <code>requirements_lock</code> at the loose <code>requirements.in</code>.
+      Don't. rules_python 2.4.6 warns that the file has no hashes, and a line with a range instead of <code>==</code> is
+      not a pin at all: it is dropped. With a "lock" of <code>pytest</code> and <code>python-dateutil&gt;=2.9</code>, the
+      hub's package list was just <code>["pytest"]</code>, and the dateutil label failed as if the package did not
+      exist:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">rules_python:weather:pypi:hub:weather_pypi WARNING: requirement file has been generated without hashes, will use all hashes for the given version  that could find on the index:
+ERROR: no such package '@@rules_python++pip+weather_pypi//python_dateutil': BUILD file not found in directory 'python_dateutil' of external repository @@rules_python++pip+weather_pypi. Add a BUILD file to a directory to mark it as a package.</code></pre>
+    <p>The fix is always the same: lock with <code>bazel run //:requirements.update</code> and commit both files.</p>
+    <h3>Keeping the lock honest</h3>
+    <p>Add a package to <code>requirements.in</code> without updating, and the test catches it:</p>
+    <pre data-label="Real output (Bazel 9.3.2, end of the requirements.test log)"><code class="language-none">+requests==2.34.2 \
++    --hash=sha256:2a0d60c172f83ac6ab31e4554906c0f3b3588d37b5cb939b1c061f4907e278e0 \
++    --hash=sha256:f288924cae4e29463698d6d60bc6a4da69c89185ad1e0bcc4104f584e960b9ed
+     # via -r requirements.in
+…
+Lock file out of date. Run 'bazel run //:requirements.update' to update.</code></pre>
+    <aside class="callout pro">
+      <p>The lock test re-resolves against the live index, so it is slow, needs the network, and starts failing on its
+        own when a new release appears. Many teams add <code>tags = ["manual"]</code> to the macro so
+        <code>bazel test //...</code> skips it, and run <code>bazel test //:requirements.test</code> in a separate CI job
+        when <code>requirements.in</code> changes. The labs in this module do that.</p>
+    </aside>
+    <p><strong>Remember:</strong> edit <code>requirements.in</code>, run <code>//:requirements.update</code>, commit
+      both; the lock has <code>==</code> pins and hashes; <code>//:requirements.test</code> checks they agree.</p>
+  </section>
+
+  <section class="lesson-section" id="pytest">
+    <h2>pytest under Bazel</h2>
+    <aside class="callout python">
+      <p>You type <code>pytest</code> and it finds <code>test_*.py</code> files, collects <code>test_*</code> functions,
+        and reports. Plain <code>assert</code>, fixtures, <code>parametrize</code>.</p>
+    </aside>
+    <p>A <code>py_test</code> does not know pytest exists. It runs one file, its <code>main</code>, as a script, and
+      passes if the process exits with 0. Run a pytest-style file directly and Python defines your test functions, calls
+      none of them, and exits 0. The test "passes" with an assertion that is plainly false:</p>
+    <pre data-label="forecast/BUILD.bazel (wrong)"><code class="language-starlark">py_test(
+    name = "dates_test",
+    srcs = ["dates_test.py"],          # def test_weekday(): assert ... == "Tuesday"  (wrong on purpose)
+    deps = [":forecast", "@pypi//pytest"],
+)</code></pre>
+    <pre data-label="Real output (Bazel 9.3.2, --test_output=all)"><code class="language-none">INFO: From Testing //forecast:dates_test:
+…
+//forecast:dates_test                                                    PASSED in 0.5s
+Executed 1 out of 1 test: 1 test passes.</code></pre>
+    <p>Nothing was collected and nothing was printed. This is the most dangerous mistake in this module, because it
+      looks like success.</p>
+    <h3>A small pytest entry point</h3>
+    <p>The fix is a three-line <code>main</code> that hands the test files to pytest and exits with pytest's status. Put
+      it next to your tests (or in a shared <code>//tools</code> package) and reuse it:</p>
+    <pre data-label="forecast/pytest_main.py"><code class="language-python">import sys
+
+import pytest
+
+if __name__ == "__main__":
+    sys.exit(pytest.main(sys.argv[1:]))</code></pre>
+    <pre data-label="forecast/BUILD.bazel"><code class="language-starlark">py_test(
+    name = "dates_test",
+    srcs = [
+        "dates_test.py",
+        "pytest_main.py",
+    ],
+    args = ["$(rootpath dates_test.py)"],
+    main = "pytest_main.py",
+    deps = [
+        ":forecast",
+        "@pypi//pytest",
+    ],
+)</code></pre>
+    <ul>
+      <li><code>main</code> names the file Bazel runs; it must also be in <code>srcs</code>.</li>
+      <li><code>args</code> are passed on the command line. <code>$(rootpath dates_test.py)</code> expands to the file's
+        path relative to the runfiles root, <code>forecast/dates_test.py</code>, which is where the test starts.</li>
+      <li><code>@pypi//pytest</code> is a normal dependency: pytest is locked and hashed like any other package.</li>
+    </ul>
+    <p>Now the real report appears, and a wrong assertion fails the Bazel test:</p>
+    <pre data-label="Real output (Bazel 9.3.2, --test_output=errors)"><code class="language-none">FAIL: //forecast:dates_test (Exit 1) (see ~/.cache/bazel/…/testlogs/forecast/dates_test/test.log)
+INFO: From Testing //forecast:dates_test:
+platform linux -- Python 3.13.18, pytest-9.2.0, pluggy-1.7.0
+rootdir: ~/.cache/bazel/…/bin/forecast/dates_test.runfiles/_main
+collected 1 item
+forecast/dates_test.py F                                                 [100%]
+_________________________________ test_weekday _________________________________
+&gt;       assert weekday("2026-11-09") == "Tuesday"  # wrong on purpose
+E       AssertionError: assert 'Monday' == 'Tuesday'
+…
+//forecast:dates_test                                                    FAILED in 1.7s
+Executed 1 out of 1 test: 1 fails locally.</code></pre>
+    <p>Notice the interpreter, <code>Python 3.13.18</code>: the hermetic toolchain from M03, not your system Python, and
+      pytest 9.2.0 from the lock, not whatever your Pixi environment has.</p>
+    <aside class="callout note">
+      <p>One pytest run per <code>py_test</code> target is the Bazel way: small targets cache independently and run in
+        parallel. M05 extends this entry point to honor <code>--test_filter</code> and write Bazel's
+        <code>test.xml</code>, and compares it with unittest.</p>
+    </aside>
+    <p><strong>Remember:</strong> a <code>py_test</code> runs a script; without a pytest <code>main</code>, pytest-style
+      tests silently pass. Use <code>main</code> + <code>args</code> + <code>@pypi//pytest</code>.</p>
+  </section>
+
+  <section class="lesson-section" id="module-lock">
+    <h2>MODULE.bazel.lock</h2>
+    <p>The first time you build, Bazel writes <code>MODULE.bazel.lock</code> next to <code>MODULE.bazel</code>. It is
+      not a list of chosen versions (MVS recomputes those from the <code>MODULE.bazel</code> files, deterministically).
+      It records what Bazel <em>fetched</em> to compute them, so the next run can skip the network and detect
+      changes. Its top-level keys, from a real lock file:</p>
+    <pre data-label="MODULE.bazel.lock (structure)"><code class="language-json">{
+  "lockFileVersion": 28,
+  "registryFileHashes": { "https://bcr.bazel.build/modules/bazel_skylib/1.9.2/MODULE.bazel": "…", … },
+  "selectedYankedVersions": {},
+  "moduleExtensions": { "@@rules_python+//python/uv:uv.bzl%uv": { … }, … },
+  "facts": { "@@rules_python+//python/extensions:pip.bzl%pip": { "dist_hashes": { … } } },
+  "factsVersions": {}
+}</code></pre>
+    <dl>
+      <dt><code>registryFileHashes</code></dt>
+      <dd>A SHA-256 for every registry file read, such as each module's <code>MODULE.bazel</code>. If the registry ever
+        serves different bytes for a published version, the build fails instead of changing.</dd>
+      <dt><code>moduleExtensions</code></dt>
+      <dd>Recorded results of module extensions, with digests of their inputs, so Bazel can skip re-running them
+        while nothing they read has changed.</dd>
+      <dt><code>facts</code></dt>
+      <dd>Data extensions looked up, such as the wheel URLs and hashes the pip extension found on PyPI.</dd>
+    </dl>
+    <p><strong>Commit it.</strong> It is to <code>MODULE.bazel</code> what <code>pixi.lock</code> is to
+      <code>pixi.toml</code>: it makes a fresh clone and CI see exactly the inputs you saw. (This course's repository
+      ignores it inside lab copies only so that labs start clean.)</p>
+    <h3>--lockfile_mode</h3>
+    <p>By default (<code>update</code>), Bazel adds missing entries as it goes. In CI you want the opposite: fail if
+      the committed lock is incomplete, so nobody forgets to commit it. Add a <code>bazel_dep</code> without building
+      locally first, then:</p>
+    <pre data-label="Terminal"><code class="language-bash">pixi run bazel build //... --lockfile_mode=error</code></pre>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: Error computing the main repository mapping: Missing checksum for registry file https://bcr.bazel.build/modules/platforms/1.1.0/MODULE.bazel not permitted with --lockfile_mode=error. Please run `bazel mod deps --lockfile_mode=update` to update your lockfile.</code></pre>
+    <p>The other modes are <code>refresh</code> (re-fetch things that may change, such as yanked-version info) and
+      <code>off</code>.</p>
+    <aside class="callout warn">
+      <p>Two lock files, two jobs. <code>requirements_lock.txt</code> pins PyPI packages and is written by
+        <code>//:requirements.update</code>. <code>MODULE.bazel.lock</code> records module and extension inputs and is
+        written by Bazel itself. You edit neither by hand, and you commit both.</p>
+    </aside>
+    <p><strong>Remember:</strong> commit <code>MODULE.bazel.lock</code>; use <code>--lockfile_mode=error</code> in
+      CI.</p>
+  </section>
+
+  <section class="lesson-section" id="bazel-mod">
+    <h2>Inspecting the graph: bazel mod</h2>
+    <aside class="callout python">
+      <p><code>pip show</code>, <code>pipdeptree</code>, and <code>pixi tree</code> answer "what did I get, and who
+        pulled it in?" <code>bazel mod</code> answers the same for modules.</p>
+    </aside>
+    <p>All outputs below come from the <code>handbook</code> workspace: skylib 1.8.2 (as <code>@skylib</code>) and a
+      dev dependency on rules_shell 0.8.0.</p>
+    <h3>bazel mod graph</h3>
+    <p>The whole resolved graph. <code>(*)</code> marks a module already expanded above; <code>--depth=1</code> limits
+      it to direct dependencies.</p>
+    <pre data-label="Real output (Bazel 9.3.2): bazel mod graph"><code class="language-none">&lt;root&gt; (handbook@1.0.0)
+├───bazel_skylib@1.8.2
+│   ├───platforms@1.0.0
+│   │   └───rules_license@1.0.0 (*)
+│   └───rules_license@1.0.0
+└───rules_shell@0.8.0
+    ├───bazel_skylib@1.8.2 (*)
+    ├───platforms@1.0.0 (*)
+    └───bazel_features@1.42.1
+        └───bazel_skylib@1.8.2 (*) </code></pre>
+    <h3>bazel mod deps</h3>
+    <p>The direct dependencies of the modules you name. Without arguments it shows only the root's header, so name a
+      module: <code>&lt;root&gt;</code>, a name, or <code>name@version</code>.</p>
+    <pre data-label="Real output (Bazel 9.3.2): bazel mod deps rules_shell"><code class="language-none">&lt;root&gt; (handbook@1.0.0)
+└───rules_shell@0.8.0
+    ├───bazel_features@1.42.1
+    ├───bazel_skylib@1.8.2
+    └───platforms@1.0.0 </code></pre>
+    <h3>bazel mod explain</h3>
+    <p>"Why is this module here?" It prints every path to it, with <code>#</code> marking the target. Add
+      <code>--verbose</code> to see which versions were requested before MVS raised them.</p>
+    <pre data-label="Real output (Bazel 9.3.2): bazel mod explain platforms"><code class="language-none">&lt;root&gt; (handbook@1.0.0)
+├───bazel_skylib@1.8.2
+│   └───platforms@1.0.0 #
+└───rules_shell@0.8.0
+    └───platforms@1.0.0 # </code></pre>
+    <h3>bazel mod show_repo</h3>
+    <p>The repository rule behind an apparent name (with <code>@</code>) or a module (without). Use it to check where
+      code really comes from:</p>
+    <pre data-label="Real output (Bazel 9.3.2): bazel mod show_repo @skylib"><code class="language-none">## @skylib:
+load("@@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+http_archive(
+  name = "bazel_skylib+",
+  urls = ["https://github.com/bazelbuild/bazel-skylib/releases/download/1.8.2/bazel-skylib-1.8.2.tar.gz"],
+  integrity = "sha256-bnjw5X3iaAH29WT6fEpI3Is2hz5BYlepK7sJN+6shEY=",
+  …
+  remote_module_file_urls = ["https://bcr.bazel.build/modules/bazel_skylib/1.8.2/MODULE.bazel"],
+  …
+)</code></pre>
+    <p>On a pip hub it lists the packages the hub knows, which is a quick way to see what your lock produced. From the
+      <code>weather</code> workspace (trimmed):</p>
+    <pre data-label="Real output (Bazel 9.3.2): bazel mod show_repo @pypi"><code class="language-none">## @pypi:
+load("@@rules_python+//python/private/pypi:hub_repository.bzl", "hub_repository")
+hub_repository(
+  name = "rules_python++pip+weather_pypi",
+  _original_name = "weather_pypi",
+  repo_name = "weather_pypi",
+  …
+  packages = ["iniconfig", "packaging", "pluggy", "pygments", "pytest", "python_dateutil", "tzdata"],
+  …
+)</code></pre>
+    <p><code>bazel mod show_extension @rules_python//python/extensions:pip.bzl%pip</code> goes one level up: every
+      repository the extension created, and every module's <code>pip.parse</code> and <code>use_repo</code> calls. You
+      will see a hub you never asked for, <code>rules_python_publish_deps</code>: rules_python's own, for its release
+      tooling. Extensions are shared by the whole graph.</p>
+    <aside class="callout sim">
+      <p>The simulator does not implement <code>bazel mod</code>, <code>MODULE.bazel.lock</code>, or MVS: it treats every
+        <code>bazel_dep</code> as resolved at the version written. Use a real workspace (the labs below) for all of
+        this section.</p>
+    </aside>
+    <p><strong>Remember:</strong> <code>graph</code> for the picture, <code>deps</code> for one level, <code>explain</code>
+      for "why", <code>show_repo</code> for "from where".</p>
+  </section>
+
+  <section class="lesson-section" id="practice">
+    <h2>Practice</h2>
+    <p>The simulator checks <code>MODULE.bazel</code> and BUILD files: which repositories are visible, which labels
+      resolve against the lock file, and which targets build. It does not download anything, so the labs prove the rest.</p>
+
+    <div class="exercise" data-id="m04-e1" data-title="Add a bazel_dep and load from it">
+      <div class="exercise-prompt">
+        <p>The <code>handbook</code> workspace wants to generate a version file with skylib's <code>write_file</code> and
+          copy a logo with its <code>copy_file</code>. The BUILD file is written; the workspace does not declare
+          skylib. Add the <code>bazel_dep</code> (bazel_skylib 1.9.2, the course's version) and the missing
+          <code>load()</code>s so <code>bazel build //...</code> succeeds.</p>
+      </div>
+<textarea class="file" data-path="MODULE.bazel">
+module(name = "handbook", version = "1.0.0")
+</textarea>
+<textarea class="file" data-path="docs/BUILD.bazel">
+write_file(
+    name = "version",
+    out = "VERSION.txt",
+    content = ["1.0.0"],
+)
+
+copy_file(
+    name = "logo",
+    src = "logo.svg",
+    out = "static/logo.svg",
+)
+</textarea>
+<textarea class="file" data-path="docs/logo.svg" data-hidden></textarea>
+<script type="text/x-python" class="tests">
+import re
+
+def test_skylib_is_a_bazel_dep(bazel):
+    assert "bazel_skylib" in bazel.ws.module.deps.values(), "MODULE.bazel needs bazel_dep(name = \"bazel_skylib\", ...)"
+
+def test_the_version_is_1_9_2(bazel):
+    text = bazel.ws.files.get("MODULE.bazel", "")
+    assert re.search(r'bazel_dep\(\s*name\s*=\s*"bazel_skylib"\s*,\s*version\s*=\s*"1\.9\.2"', text), "use version = \"1.9.2\" for bazel_skylib"
+
+def test_both_rules_are_loaded(bazel):
+    assert bazel.target("//docs:version").kind == "write_file", "//docs:version should be a write_file"
+    assert bazel.target("//docs:logo").kind == "copy_file", "//docs:logo should be a copy_file"
+
+def test_everything_builds(bazel):
+    result = bazel.build("//...")
+    assert result.ok, "bazel build //... fails:\n" + result.error
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p>Two files change. In <code>MODULE.bazel</code>: <code>bazel_dep(name = "bazel_skylib", version = "1.9.2")</code>.
+          In the BUILD file, each rule lives in its own <code>.bzl</code> file under <code>@bazel_skylib//rules</code>:
+          <code>write_file.bzl</code> and <code>copy_file.bzl</code>.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="MODULE.bazel"><code class="language-starlark">module(name = "handbook", version = "1.0.0")
+
+bazel_dep(name = "bazel_skylib", version = "1.9.2")</code></pre>
+<pre data-path="docs/BUILD.bazel"><code class="language-starlark">load("@bazel_skylib//rules:copy_file.bzl", "copy_file")
+load("@bazel_skylib//rules:write_file.bzl", "write_file")
+
+write_file(
+    name = "version",
+    out = "VERSION.txt",
+    content = ["1.0.0"],
+)
+
+copy_file(
+    name = "logo",
+    src = "logo.svg",
+    out = "static/logo.svg",
+)</code></pre>
+        <p>One <code>load()</code> per <code>.bzl</code> file; one <code>bazel_dep</code> per module, however many files you
+          load from it.</p>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m04-e2" data-title="Wire up a pip hub and depend on requests">
+      <div class="exercise-prompt">
+        <p><code>app/fetch.py</code> does <code>import requests</code>. The lock file is generated and committed. Make
+          PyPI packages available in <code>MODULE.bazel</code> with <code>pip.parse</code> and <code>use_repo</code>, and
+          give <code>//app:fetch</code> its dependency, so that:</p>
+        <ul>
+          <li>the hub is named after the module, <code>weather_pypi</code> (not the reserved <code>pypi</code>), for Python 3.13;</li>
+          <li>BUILD files reach it as <code>@pypi</code>;</li>
+          <li><code>//app:fetch</code> depends on <code>@pypi//requests</code>, and <code>bazel build //...</code> succeeds.</li>
+        </ul>
+      </div>
+<textarea class="file" data-path="MODULE.bazel">
+module(name = "weather")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(python_version = "3.13", is_default = True)
+</textarea>
+<textarea class="file" data-path="app/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "fetch",
+    srcs = ["fetch.py"],
+)
+</textarea>
+<textarea class="file" data-path="requirements_lock.txt" data-readonly>
+# Generated by: bazel run //:requirements.update
+# (hashes shortened for this page; real ones are 64 hex digits)
+certifi==2026.10.5 \
+    --hash=sha256:2f6a3c1e
+    # via requests
+charset-normalizer==3.4.4 \
+    --hash=sha256:8a1b0e2c
+    # via requests
+idna==3.11 \
+    --hash=sha256:795dafcc
+    # via requests
+requests==2.34.2 \
+    --hash=sha256:2a0d60c1
+    # via -r requirements.in
+urllib3==2.8.0 \
+    --hash=sha256:0cf3cae5
+    # via requests
+</textarea>
+<textarea class="file" data-path="app/fetch.py" data-hidden></textarea>
+<script type="text/x-python" class="tests">
+import re
+
+def test_the_hub_has_a_non_reserved_name(bazel):
+    text = bazel.ws.files.get("MODULE.bazel", "")
+    assert "pip.parse(" in text, "call pip.parse(...) on the pip extension"
+    assert re.search(r'hub_name\s*=\s*"weather_pypi"', text), "name the hub weather_pypi (hub_name = \"weather_pypi\")"
+
+def test_the_hub_is_visible_as_pypi(bazel):
+    assert "pypi" in bazel.ws.module.pip_hubs, "import the hub as @pypi: use_repo(pip, pypi = \"weather_pypi\")"
+
+def test_fetch_depends_on_requests(bazel):
+    deps = bazel.attr("//app:fetch", "deps") or []
+    assert "@pypi//requests" in deps or "@pypi//requests:requests" in deps, f"//app:fetch deps are {deps}; add \"@pypi//requests\""
+
+def test_everything_builds(bazel):
+    result = bazel.build("//...")
+    assert result.ok, "bazel build //... fails:\n" + result.error
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p>Three lines in <code>MODULE.bazel</code>: <code>pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")</code>,
+          a <code>pip.parse(...)</code> with <code>hub_name</code>, <code>python_version</code>, and
+          <code>requirements_lock = "//:requirements_lock.txt"</code>, then <code>use_repo</code> with a keyword argument
+          to choose the apparent name.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="MODULE.bazel"><code class="language-starlark">module(name = "weather")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(python_version = "3.13", is_default = True)
+
+pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
+pip.parse(
+    hub_name = "weather_pypi",
+    python_version = "3.13",
+    requirements_lock = "//:requirements_lock.txt",
+)
+use_repo(pip, pypi = "weather_pypi")</code></pre>
+<pre data-path="app/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "fetch",
+    srcs = ["fetch.py"],
+    deps = ["@pypi//requests"],
+)</code></pre>
+        <p>You list only <code>requests</code>. certifi, idna, urllib3, and charset-normalizer are its dependencies; the
+          hub wires them up for you.</p>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m04-e3" data-title="Fix the PyPI labels">
+      <div class="exercise-prompt">
+        <p>A teammate converted <code>//config:loader</code> from a <code>pyproject.toml</code> project. It imports
+          <code>dateutil</code>, <code>yaml</code>, and <code>typing_extensions</code>, and they wrote one label per import.
+          All three fail, each with <code>no such package</code>. Rewrite
+          <code>deps</code> with the correct label for each package, using the names in the lock file.</p>
+      </div>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "settings")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(python_version = "3.13", is_default = True)
+
+pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
+pip.parse(
+    hub_name = "settings_pypi",
+    python_version = "3.13",
+    requirements_lock = "//:requirements_lock.txt",
+)
+use_repo(pip, pypi = "settings_pypi")
+</textarea>
+<textarea class="file" data-path="requirements_lock.txt" data-readonly>
+# hashes shortened for this page
+python-dateutil==4.0.0 \
+    --hash=sha256:a5e246f7
+PyYAML==6.0.3 \
+    --hash=sha256:4a2e8cec
+six==1.17.0 \
+    --hash=sha256:4721f391
+typing-extensions==4.15.0 \
+    --hash=sha256:f0fa19c6
+</textarea>
+<textarea class="file" data-path="config/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "loader",
+    srcs = ["loader.py"],
+    deps = [
+        "@pypi//dateutil",
+        "@pypi//yaml",
+        "@pypi//typing-extensions",
+    ],
+)
+</textarea>
+<textarea class="file" data-path="config/loader.py" data-hidden></textarea>
+<script type="text/x-python" class="tests">
+def _deps(bazel):
+    return [d.split(":")[0] for d in (bazel.attr("//config:loader", "deps") or [])]
+
+def test_dateutil_uses_its_distribution_name(bazel):
+    assert "@pypi//python_dateutil" in _deps(bazel), "dateutil is imported from the python-dateutil distribution: @pypi//python_dateutil"
+
+def test_yaml_uses_its_distribution_name(bazel):
+    assert "@pypi//pyyaml" in _deps(bazel), "yaml comes from PyYAML; normalized, that is @pypi//pyyaml (lowercase)"
+
+def test_typing_extensions_is_normalized(bazel):
+    deps = _deps(bazel)
+    assert "@pypi//typing-extensions" not in deps, "real Bazel rejects @pypi//typing-extensions: labels use underscores"
+    assert "@pypi//typing_extensions" in deps, "add @pypi//typing_extensions"
+
+def test_no_extra_packages(bazel):
+    deps = _deps(bazel)
+    assert len(deps) == 3, f"list exactly the three packages loader.py imports, not {deps}"
+
+def test_everything_builds(bazel):
+    result = bazel.build("//...")
+    assert result.ok, "bazel build //... fails:\n" + result.error
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p>Find each import's distribution in the lock file (dateutil → python-dateutil, yaml → PyYAML), then normalize:
+          lowercase, and <code>-</code> or <code>.</code> become <code>_</code>. <code>six</code> is a dependency of
+          python-dateutil; you do not list it.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="config/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "loader",
+    srcs = ["loader.py"],
+    deps = [
+        "@pypi//python_dateutil",
+        "@pypi//pyyaml",
+        "@pypi//typing_extensions",
+    ],
+)</code></pre>
+        <p>The rule is the same one PyPI uses for project names (PEP 503 normalization), plus underscores, because a
+          Bazel package name with dashes would be legal but confusing. When unsure, run
+          <code>bazel mod show_repo @pypi</code> in a real workspace and read its <code>packages</code> list.</p>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m04-e4" data-title="Test-only dependencies">
+      <div class="exercise-prompt">
+        <p><code>textkit</code> is a library other modules will depend on. Its code uses only rules_python. Its tests use
+          <code>sh_test</code> from rules_shell and skylib's <code>diff_test</code>, and <code>tests/BUILD.bazel</code>
+          (which you must not edit) loads skylib as <code>@skylib</code>.</p>
+        <p>Change <code>MODULE.bazel</code> so that both test-only modules are dev dependencies, skylib is visible as
+          <code>@skylib</code>, rules_python stays a regular dependency, and <code>bazel test //...</code> selects both
+          tests.</p>
+      </div>
+<textarea class="file" data-path="MODULE.bazel">
+module(name = "textkit", version = "0.3.0")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+bazel_dep(name = "rules_shell", version = "0.8.0")
+bazel_dep(name = "bazel_skylib", version = "1.9.2")
+</textarea>
+<textarea class="file" data-path="textkit/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "upper",
+    srcs = ["upper.py"],
+    visibility = ["//visibility:public"],
+)
+</textarea>
+<textarea class="file" data-path="tests/BUILD.bazel" data-readonly>
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+load("@skylib//rules:diff_test.bzl", "diff_test")
+
+sh_test(
+    name = "upper_test",
+    srcs = ["upper_test.sh"],
+    data = ["//textkit:upper"],
+)
+
+diff_test(
+    name = "golden_test",
+    file1 = "expected.txt",
+    file2 = "actual.txt",
+)
+</textarea>
+<textarea class="file" data-path="textkit/upper.py" data-hidden></textarea>
+<textarea class="file" data-path="tests/upper_test.sh" data-hidden></textarea>
+<textarea class="file" data-path="tests/expected.txt" data-hidden></textarea>
+<textarea class="file" data-path="tests/actual.txt" data-hidden></textarea>
+<script type="text/x-python" class="tests">
+def test_skylib_is_visible_as_skylib(bazel):
+    assert bazel.ws.module.deps.get("skylib") == "bazel_skylib", "give bazel_skylib the apparent name skylib with repo_name = \"skylib\""
+
+def test_test_modules_are_dev_dependencies(bazel):
+    dev = bazel.ws.module.dev_deps
+    assert "rules_shell" in dev, "rules_shell is only used by tests: add dev_dependency = True"
+    assert "skylib" in dev, "bazel_skylib is only used by tests: add dev_dependency = True"
+
+def test_rules_python_is_a_regular_dependency(bazel):
+    assert "rules_python" in bazel.ws.module.deps, "keep the rules_python bazel_dep"
+    assert "rules_python" not in bazel.ws.module.dev_deps, "textkit's own code needs rules_python, so it must not be a dev dependency"
+
+def test_bazel_test_selects_both_tests(bazel):
+    result = bazel.test("//...")
+    assert result.ok, "bazel test //... fails:\n" + result.error
+    assert result.tests == ["//tests:golden_test", "//tests:upper_test"], f"bazel test //... would run {result.tests}"
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p>Both <code>repo_name</code> and <code>dev_dependency</code> are keyword arguments of <code>bazel_dep</code>, and
+          they combine on one line. Dev dependencies still work in your own tests: the flag only matters when
+          <code>textkit</code> is <em>not</em> the root module.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="MODULE.bazel"><code class="language-starlark">module(name = "textkit", version = "0.3.0")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+
+# Test-only: not part of the graph for modules that depend on textkit.
+bazel_dep(name = "rules_shell", version = "0.8.0", dev_dependency = True)
+bazel_dep(name = "bazel_skylib", version = "1.9.2", dev_dependency = True, repo_name = "skylib")</code></pre>
+        <p>A module that depends on <code>textkit</code> now gets rules_python and nothing else from it. Real Bazel would
+          still bring skylib into its graph (rules_python depends on it), but at a version chosen without textkit's
+          opinion.</p>
+      </details>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="lab">
+    <h2>Labs: real modules, real wheels</h2>
+    <p>The exercises checked that your labels resolve. Only real Bazel resolves versions with MVS, downloads and
+      verifies wheels against their hashes, runs pytest on the hermetic interpreter, and writes
+      <code>MODULE.bazel.lock</code>. Both labs need network access the first time.</p>
+
+    <div class="lab" data-id="m04-lab1" data-title="PyPI dependencies with pip.parse and a hashed lock">
+      <div class="lab-prompt">
+        <p>The <code>weather</code> workspace has a library, <code>forecast/dates.py</code>, that imports
+          <code>dateutil</code>, and pytest-style tests for it. <code>requirements.in</code> lists pytest and
+          python-dateutil and the root BUILD file already declares <code>compile_pip_requirements</code>, but the lock is
+          empty and nothing is wired up. Make <code>bazel test //...</code> run the three tests through pytest, with
+          every package pinned and hashed.</p>
+        <ul class="checklist" data-id="m04-lab1-steps">
+          <li>Run <code>pixi run start m04-lab1</code>, then <code>cd work/m04-lab1</code></li>
+          <li>Run <code>pixi run bazel run //:requirements.update</code> and read the new <code>requirements_lock.txt</code></li>
+          <li>Add <code>pip.parse</code> and <code>use_repo</code> to <code>MODULE.bazel</code>: hub <code>weather_pypi</code>, visible as <code>@pypi</code></li>
+          <li>Check with <code>pixi run bazel query @pypi//pytest</code> and <code>pixi run bazel mod show_repo @pypi</code></li>
+          <li>Give <code>//forecast:forecast</code> its PyPI dependency</li>
+          <li>Run <code>pixi run bazel test //forecast:dates_test --test_output=all</code>: is there a pytest report? Then add the pytest entry point (<code>pytest_main.py</code> is already there)</li>
+          <li>Back at the repository root, run <code>pixi run grade m04-lab1</code></li>
+        </ul>
+      </div>
+      <details class="hint"><summary>Hint</summary>
+        <p>The checks: the lock contains <code>--hash=sha256:</code> and <code>python-dateutil==</code>;
+          <code>@pypi//pytest</code> and <code>@pypi//python_dateutil</code> exist; the hub is not named <code>pypi</code>;
+          the library's <code>deps</code> are exactly <code>@pypi//python_dateutil</code>; the test's <code>deps</code>
+          and <code>main</code> are <code>:forecast</code>, <code>@pypi//pytest</code>, and <code>pytest_main.py</code>;
+          and the test log says <code>3 passed</code>. Watch for the step where the test "passes" with no pytest output:
+          that is the silent-pass trap from this module.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-label="MODULE.bazel"><code class="language-starlark">module(name = "weather")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(python_version = "3.13", is_default = True)
+
+pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
+pip.parse(
+    hub_name = "weather_pypi",
+    python_version = "3.13",
+    requirements_lock = "//:requirements_lock.txt",
+)
+use_repo(pip, pypi = "weather_pypi")</code></pre>
+<pre data-label="forecast/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "forecast",
+    srcs = ["dates.py"],
+    deps = ["@pypi//python_dateutil"],
+)
+
+py_test(
+    name = "dates_test",
+    srcs = [
+        "dates_test.py",
+        "pytest_main.py",
+    ],
+    args = ["$(rootpath dates_test.py)"],
+    main = "pytest_main.py",
+    deps = [
+        ":forecast",
+        "@pypi//pytest",
+    ],
+)</code></pre>
+        <p>The finished test, with <code>--test_output=all</code>:</p>
+        <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">INFO: From Testing //forecast:dates_test:
+platform linux -- Python 3.13.18, pytest-9.2.0, pluggy-1.7.0
+rootdir: ~/.cache/bazel/…/bin/forecast/dates_test.runfiles/_main
+collected 3 items
+forecast/dates_test.py ...                                               [100%]
+…
+//forecast:dates_test                                                    PASSED in 1.4s
+Executed 1 out of 1 test: 1 test passes.</code></pre>
+        <p>The lock you generate may show newer versions than the ones on this page: <code>requirements.in</code> has
+          ranges, and <code>//:requirements.update</code> resolves them against today's PyPI. That is the point of
+          committing the lock.</p>
+      </details>
+    </div>
+
+    <div class="lab" data-id="m04-lab2" data-title="bazel_dep, repo_name, overrides, and dev dependencies">
+      <div class="lab-prompt">
+        <p>The <code>handbook</code> workspace builds <code>bazel-bin/docs/page.txt</code> from a banner provided by
+          <code>textkit</code>, an in-house module vendored at <code>vendor/textkit</code> (it is not in the registry),
+          plus a title written with skylib. Its <code>MODULE.bazel</code> has four problems. Fix them so the graph
+          resolves cleanly under <code>--check_direct_dependencies=error</code> and <code>bazel test //...</code> passes.
+          Edit only <code>MODULE.bazel</code>.</p>
+        <ul class="checklist" data-id="m04-lab2-steps">
+          <li>Run <code>pixi run start m04-lab2</code>, then <code>cd work/m04-lab2</code></li>
+          <li>Run <code>pixi run bazel mod graph --depth=1</code> and read the WARNING: fix the skylib version</li>
+          <li><code>docs/BUILD.bazel</code> loads from <code>@skylib</code>: make that name exist</li>
+          <li>Depend on <code>textkit</code> 0.3.0 from <code>vendor/textkit</code>; confirm with <code>pixi run bazel mod show_repo textkit</code></li>
+          <li>Make <code>rules_shell</code> a dev dependency; compare <code>bazel mod graph --depth=1</code> with and without <code>--ignore_dev_dependency</code></li>
+          <li>Run <code>pixi run bazel test //...</code> and read <code>bazel-bin/docs/page.txt</code>, then <code>pixi run grade m04-lab2</code> from the repository root</li>
+        </ul>
+      </div>
+      <details class="hint"><summary>Hint</summary>
+        <p>MVS picks skylib 1.8.2 here, so ask for 1.8.2. <code>repo_name = "skylib"</code> fixes the load. A
+          <code>bazel_dep</code> on textkit plus <code>local_path_override(module_name = "textkit", path = "vendor/textkit")</code>
+          makes it resolve without a registry. The workspace has a <code>.bazelignore</code> listing <code>vendor</code>:
+          <code>vendor/textkit</code> is a separate module with its own <code>MODULE.bazel</code>, so the main
+          repository's <code>//...</code> must not treat its directories as our packages. Without it,
+          <code>bazel test //...</code> tries to load <code>vendor/textkit/BUILD.bazel</code> as part of
+          <em>our</em> repository, where <code>@bazel_skylib</code> is not visible under that name.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-label="MODULE.bazel"><code class="language-starlark">module(name = "handbook", version = "1.0.0")
+
+bazel_dep(name = "bazel_skylib", version = "1.8.2", repo_name = "skylib")
+bazel_dep(name = "textkit", version = "0.3.0")
+local_path_override(
+    module_name = "textkit",
+    path = "vendor/textkit",
+)
+
+bazel_dep(name = "rules_shell", version = "0.8.0", dev_dependency = True)</code></pre>
+        <p>Before the override, textkit cannot be resolved at all:</p>
+        <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: in module dependency chain &lt;root&gt; -&gt; textkit@0.3.0: module textkit@0.3.0 not found in registries:
+* https://bcr.bazel.build/modules/textkit/0.3.0/MODULE.bazel: not found</code></pre>
+        <p>After it, <code>bazel mod graph</code> shows <code>textkit@_</code>, and textkit's own skylib dependency joins
+          the same MVS selection as yours. The grader previews a consumer's view with
+          <code>--ignore_dev_dependency</code>. In our runs of Bazel 9.3.2, that flag combined with the
+          <code>local_path_override</code> made textkit unresolvable again, so the grader re-supplies the vendored path
+          with <code>--override_module=textkit=%workspace%/vendor/textkit</code>, the command-line form of
+          <code>local_path_override</code>.</p>
+      </details>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="quiz">
+    <h2>Quiz</h2>
+    <div class="quiz" data-id="m04-quiz">
+<script type="application/json">
+{"title": "Bzlmod and PyPI quiz", "passScore": 0.7, "questions": [
+  {"type": "single", "prompt": "Your root module asks for <code>bazel_skylib</code> 1.7.1. Two dependencies ask for 1.6.1 and 1.8.2. The registry also has 1.9.2. Which version does Bazel use?", "options": ["1.6.1, the lowest", "1.7.1, the root module's choice", "1.8.2, the highest version anyone asked for", "1.9.2, the newest available"], "answer": 2, "explanation": "<p>Minimal Version Selection treats every requested version as a minimum and picks the highest of them. It never picks a version nobody asked for, so 1.9.2 is out. Bazel also warns that the root asked for 1.7.1 but got 1.8.2.</p>"},
+  {"type": "single", "prompt": "How does MVS differ from pip's resolver?", "options": ["MVS picks the newest compatible versions; pip picks the oldest", "MVS needs no search and gives the same answer whenever the MODULE.bazel files are unchanged; pip searches for the newest versions that fit and its answer changes as PyPI publishes", "They are the same algorithm", "MVS allows several versions of a module side by side; pip does not"], "answer": 1, "explanation": "<p>pip backtracks toward the newest versions satisfying all ranges, so its result depends on what is on PyPI today, hence lock files. MVS is deterministic from the declared minimums. Both end with one version per package or module.</p>"},
+  {"type": "single", "prompt": "Does this BUILD file load?", "code": "# MODULE.bazel\nmodule(name = \"handbook\")\nbazel_dep(name = \"bazel_skylib\", version = \"1.9.2\", repo_name = \"skylib\")\n\n# docs/BUILD.bazel\nload(\"@bazel_skylib//rules:write_file.bzl\", \"write_file\")", "lang": "starlark", "options": ["Yes: repo_name only adds an alias", "No: No repository visible as '@bazel_skylib' from main repository", "Yes, with a deprecation warning", "No: module bazel_skylib not found in registries"], "answer": 1, "explanation": "<p><code>repo_name</code> replaces the apparent name, it does not add one. In this module the repository is <code>@skylib</code> only.</p>"},
+  {"type": "text", "prompt": "Write the label for the <code>python-dateutil</code> package in a hub imported as <code>@pypi</code> (short form).", "answer": ["@pypi//python_dateutil", "@pypi//python_dateutil:python_dateutil"], "explanation": "<p>Labels use the normalized distribution name: lowercase, with <code>-</code>, <code>_</code>, and <code>.</code> runs turned into one underscore. The import name <code>dateutil</code> does not matter.</p>"},
+  {"type": "multi", "prompt": "Which of these fail in real Bazel when the lock pins <code>PyYAML==6.0.3</code>? Select all that apply.", "options": ["@pypi//yaml", "@pypi//PyYAML", "@pypi//pyyaml", "@pypi//pyyaml:pyyaml"], "answer": [0, 1], "explanation": "<p><code>yaml</code> is the import name and <code>PyYAML</code> is not normalized (labels are case-sensitive). <code>@pypi//pyyaml</code> and its long form <code>@pypi//pyyaml:pyyaml</code> are correct.</p>"},
+  {"type": "single", "prompt": "MODULE.bazel has <code>pip.parse(hub_name = \"weather_pypi\", ...)</code> but no <code>use_repo</code> line. A BUILD file depends on <code>@weather_pypi//requests</code>. What happens?", "options": ["It works: pip.parse makes the hub visible", "No repository visible as '@weather_pypi' from main repository", "pip downloads requests into the Pixi environment", "A warning, then the build continues without requests"], "answer": 1, "explanation": "<p>An extension may create many repositories, but your module sees only those you import with <code>use_repo</code>. The error is the same as for a missing <code>bazel_dep</code>.</p>"},
+  {"type": "single", "prompt": "Why should you not write <code>hub_name = \"pypi\"</code> with rules_python 2.4.6?", "options": ["It is a syntax error", "The name is reserved for the unified hub the extension generates; rules_python warns and plans to rename it", "PyPI forbids it", "It only works on Linux"], "answer": 1, "explanation": "<p>Name the hub after your module (<code>weather_pypi</code>) and import it as <code>@pypi</code> with <code>use_repo(pip, pypi = \"weather_pypi\")</code>. BUILD files keep using <code>@pypi//...</code>.</p>"},
+  {"type": "single", "prompt": "You added <code>requests</code> to <code>requirements.in</code> and to a target's <code>deps</code>, and the build fails with <code>no such package '@@rules_python++pip+weather_pypi//requests'</code>. What did you forget?", "options": ["A bazel_dep on requests", "To run bazel run //:requirements.update, so the lock file pins it", "To pip install requests", "To add requests to MODULE.bazel.lock"], "answer": 1, "explanation": "<p>The hub is built from the lock file, not from <code>requirements.in</code>. Re-lock, then commit both files.</p>"},
+  {"type": "output", "prompt": "Which targets does this macro create? Write <code>bazel query //...</code>'s output.", "code": "load(\"@rules_python//python:pip.bzl\", \"compile_pip_requirements\")\n\ncompile_pip_requirements(\n    name = \"requirements\",\n    src = \"requirements.in\",\n    requirements_txt = \"requirements_lock.txt\",\n)", "lang": "starlark", "answer": "//:requirements\n//:requirements.test\n//:requirements.update\n//:requirements_test", "explanation": "<p><code>.update</code> is a <code>py_binary</code> that rewrites the lock; <code>.test</code> is a <code>py_test</code> that checks it; <code>_test</code> is a deprecated alias; the bare name is a <code>filegroup</code>. Query output is sorted.</p>"},
+  {"type": "single", "prompt": "A <code>py_test</code> has <code>srcs = [\"calc_test.py\"]</code> and <code>deps</code> including <code>@pypi//pytest</code>. The file only defines <code>def test_add(): assert add(1, 1) == 3</code>. What does <code>bazel test</code> report?", "options": ["FAILED: the assertion is false", "PASSED: Python runs the file as a script, defines the function, and exits 0", "ERROR: py_test requires unittest", "NO STATUS: pytest is not configured"], "answer": 1, "explanation": "<p>A <code>py_test</code> runs its main file and checks the exit code. Nothing calls pytest, so nothing is collected. Add a main that calls <code>pytest.main(...)</code> on the test files.</p>"},
+  {"type": "multi", "prompt": "Which statements about <code>dev_dependency = True</code> are true? Select all that apply.", "options": ["The dependency is available in your own BUILD files when your module is the root", "Modules that depend on yours do not see it at all", "It installs the dependency only in Pixi's dev environment", "It suits test-only rule sets such as rules_shell for sh_test"], "answer": [0, 1, 3], "explanation": "<p>Dev dependencies work normally in the root module and disappear for consumers, so they do not affect anyone else's graph or version selection. Pixi has nothing to do with it.</p>"},
+  {"type": "single", "prompt": "You need an unreleased fix from a rule set's GitHub repository. Which override do you use?", "options": ["single_version_override", "local_path_override", "git_override with a commit hash", "archive_override pointing at the main branch"], "answer": 2, "explanation": "<p><code>git_override(module_name, remote, commit)</code> fetches that exact commit. <code>single_version_override</code> only picks among registry versions; <code>local_path_override</code> needs a checkout on disk. Pin a commit, never a branch.</p>"},
+  {"type": "single", "prompt": "A library you depend on has a <code>single_version_override</code> in its MODULE.bazel. What effect does it have on your build?", "options": ["It applies to the whole graph", "None: overrides only count in the root module", "It causes an error", "It applies only to that library's own targets"], "answer": 1, "explanation": "<p>Only the root module's overrides are honored, so no dependency can force a version or source on you.</p>"},
+  {"type": "multi", "prompt": "Which of these should you commit to version control? Select all that apply.", "options": ["MODULE.bazel.lock", "requirements_lock.txt", "bazel-bin", "requirements.in"], "answer": [0, 1, 3], "explanation": "<p>Both lock files and the input file are source. <code>bazel-bin</code> is a symlink to build outputs and belongs in <code>.gitignore</code>.</p>"},
+  {"type": "text", "prompt": "Which <code>bazel mod</code> subcommand prints every path from the root to a given module, answering \"why is this here?\"", "answer": ["explain", "bazel mod explain", "mod explain"], "explanation": "<p><code>bazel mod explain &lt;module&gt;</code> marks the module with <code>#</code> on every path. <code>--verbose</code> adds the versions requested before MVS raised them.</p>"}
+]}
+</script>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="recap">
+    <h2>Recap</h2>
+    <ul>
+      <li><code>MODULE.bazel</code> starts with <code>module()</code>; each <code>bazel_dep</code> brings in one module from
+        the Bazel Central Registry and makes <code>@name</code> visible.</li>
+      <li>Versions in <code>bazel_dep</code> are minimums. Minimal Version Selection picks the highest minimum, so builds
+        do not change when the registry does. Keep root versions equal to what is resolved.</li>
+      <li>Apparent names (<code>@skylib</code>) are per module and set by <code>repo_name</code>; canonical names
+        (<code>@@bazel_skylib+</code>) are global and only for reading errors.</li>
+      <li><code>dev_dependency = True</code> hides a dependency from consumers. Overrides (single version, local path, git,
+        archive) change where a module comes from and only work in the root module.</li>
+      <li>Module extensions create repositories from tags; <code>use_repo</code> imports the ones you use.</li>
+      <li><code>pip.parse(hub_name = "&lt;module&gt;_pypi", python_version, requirements_lock)</code> plus
+        <code>use_repo(pip, pypi = "&lt;module&gt;_pypi")</code> gives <code>@pypi//&lt;normalized distribution name&gt;</code>.</li>
+      <li>Lock with <code>bazel run //:requirements.update</code>; the lock has <code>==</code> pins and hashes;
+        <code>//:requirements.test</code> keeps it in sync with <code>requirements.in</code>.</li>
+      <li>pytest needs an entry point: <code>main = "pytest_main.py"</code>, <code>args = ["$(rootpath ...)"]</code>, and
+        <code>@pypi//pytest</code>. Without it, tests silently pass.</li>
+      <li>Commit <code>MODULE.bazel.lock</code>; CI runs with <code>--lockfile_mode=error</code>. <code>bazel mod graph</code>,
+        <code>deps</code>, <code>explain</code>, and <code>show_repo</code> inspect the graph.</li>
+    </ul>
+    <div class="flashcards" data-title="Bzlmod and PyPI review">
+<script type="application/json">
+[
+  {"front": "What does the version in <code>bazel_dep</code> mean?", "back": "A minimum. Minimal Version Selection picks the highest minimum anyone in the graph requested."},
+  {"front": "Bazel warns: <em>root module requires 1.7.1, but got 1.8.2</em>. Fix?", "back": "Write the resolved version (1.8.2) in MODULE.bazel. CI can enforce this with --check_direct_dependencies=error."},
+  {"front": "Apparent vs canonical name?", "back": "Apparent: the @name your module uses (@skylib). Canonical: the global @@name Bazel uses internally (@@bazel_skylib+). Write apparent names only."},
+  {"front": "What does <code>repo_name</code> do?", "back": "Sets the apparent name of a bazel_dep in your module. The old name stops working; the module itself is unchanged."},
+  {"front": "What does <code>dev_dependency = True</code> do?", "back": "The dependency exists only when your module is the root. Modules depending on yours never see it."},
+  {"front": "Name the four overrides.", "back": "single_version_override (pin/patch a registry version), local_path_override (directory), git_override (remote + commit), archive_override (urls + integrity). Root module only."},
+  {"front": "The three steps of using a module extension?", "back": "ext = use_extension(\"@mod//path:file.bzl\", \"name\"); call tags like ext.parse(...); use_repo(ext, \"repo\") or use_repo(ext, alias = \"repo\")."},
+  {"front": "Label for <code>typing-extensions</code> in hub <code>@pypi</code>?", "back": "@pypi//typing_extensions: lowercase, dashes and dots become underscores. Distribution name, not import name."},
+  {"front": "How do you create or update <code>requirements_lock.txt</code>?", "back": "compile_pip_requirements(name = \"requirements\", ...) in BUILD, then bazel run //:requirements.update."},
+  {"front": "Why does a pytest-style <code>py_test</code> pass when its asserts are wrong?", "back": "py_test runs the file as a script; nothing calls the test functions. Use a main that calls pytest.main(sys.argv[1:]) with args = [\"$(rootpath test.py)\"]."},
+  {"front": "What is in <code>MODULE.bazel.lock</code>?", "back": "Hashes of registry files, cached module extension results, and extension facts (like wheel hashes). Commit it; use --lockfile_mode=error in CI."},
+  {"front": "Which <code>bazel mod</code> command answers \"why is this module here?\"", "back": "bazel mod explain &lt;module&gt; (add --verbose for the versions MVS raised)."}
+]
+</script>
+    </div>
+    <h3>Going further</h3>
+    <ul>
+      <li><a href="https://bazel.build/external/overview">External dependencies overview</a> and
+        <a href="https://bazel.build/external/module">Bazel modules</a> on bazel.build: MVS, overrides, repository names</li>
+      <li><a href="https://bazel.build/external/extension">Module extensions</a> and
+        <a href="https://bazel.build/external/lockfile">the Bazel lockfile</a></li>
+      <li><a href="https://bazel.build/external/mod-command">The <code>bazel mod</code> command</a>: every subcommand and flag</li>
+      <li><a href="https://registry.bazel.build/">Bazel Central Registry</a>: browse modules and versions</li>
+      <li><a href="https://rules-python.readthedocs.io/en/latest/pypi/download.html">rules_python: downloading PyPI packages</a>,
+        <a href="https://rules-python.readthedocs.io/en/latest/pypi/lock.html">locking</a>, and
+        <a href="https://rules-python.readthedocs.io/en/latest/pypi/use.html">using them in BUILD files</a></li>
+      <li><a href="https://research.swtch.com/vgo-mvs">Minimal Version Selection</a>, Russ Cox's original essay</li>
+      <li>Next: <a href="m05-testing.html">M05</a> makes tests fast, filtered, and reliable</li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>

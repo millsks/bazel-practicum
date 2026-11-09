@@ -1,0 +1,50 @@
+load("@bazel_skylib//rules:diff_test.bzl", "diff_test")
+load("@bazel_skylib//rules:run_binary.bzl", "run_binary")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
+
+# Generates constants.py from colors.csv with the //tools:gen_constants tool.
+# run_binary builds the tool for the exec configuration, like genrule's tools.
+run_binary(
+    name = "constants_gen",
+    srcs = ["colors.csv"],
+    outs = ["constants.py"],
+    args = [
+        "$(location colors.csv)",
+        "$(location constants.py)",
+    ],
+    tool = "//tools:gen_constants",
+)
+
+# The generated module, as a library other targets can import.
+py_library(
+    name = "constants",
+    srcs = [":constants.py"],
+)
+
+py_test(
+    name = "constants_test",
+    srcs = ["constants_test.py"],
+    deps = [":constants"],
+)
+
+# Copies the generated constants.py over constants.golden.py ("blesses" it):
+#   pixi run bazel run //palette:update_golden
+py_binary(
+    name = "update_golden",
+    srcs = ["update_golden.py"],
+    args = [
+        "$(rootpath :constants.py)",
+        "$(rootpath constants.golden.py)",
+    ],
+    data = [
+        ":constants.py",
+        "constants.golden.py",
+    ],
+)
+
+# Fails when the generator's output drifts from the reviewed, checked-in golden.
+diff_test(
+    name = "constants_golden_test",
+    file1 = ":constants.py",
+    file2 = "constants.golden.py",
+)

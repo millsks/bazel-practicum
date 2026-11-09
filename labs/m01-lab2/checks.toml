@@ -1,0 +1,28 @@
+[[check]]
+name = "the //docs package loads"
+command = ["query", "//docs:all"]
+stdout_lines = ["//docs:handbook", "//docs:pages"]
+message = "Bazel could not load docs/BUILD.bazel. Read the first ERROR line: which label reaches into a subpackage, and what does Bazel suggest instead?"
+
+[[check]]
+name = "docs/guides is still its own package"
+command = ["query", "//docs/guides:*"]
+stdout_lines = ["//docs/guides:BUILD.bazel", "//docs/guides:setup.md"]
+message = "Keep docs/guides/BUILD.bazel. Fix the label that points into the subpackage instead of removing the package boundary."
+
+[[check]]
+name = "bazel build //docs:handbook succeeds"
+command = ["build", "//docs:handbook"]
+message = "Run `pixi run bazel build //docs:handbook`. A 'missing input file' error means a label names a file that is not on disk: compare the label with `ls docs/`."
+
+[[check]]
+name = "handbook.txt holds every page"
+command = ["build", "//docs:handbook"]
+file_contains = { "bazel-bin/docs/handbook.txt" = "## Setup" }
+message = "bazel-bin/docs/handbook.txt should contain the setup guide from docs/guides/setup.md."
+
+[[check]]
+name = "handbook.txt includes the change log"
+command = ["build", "//docs:handbook"]
+file_contains = { "bazel-bin/docs/handbook.txt" = "Moved the handbook into Bazel." }
+message = "bazel-bin/docs/handbook.txt should end with docs/CHANGES.md."

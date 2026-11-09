@@ -1,0 +1,21 @@
+load("@rules_python//python:defs.bzl", "py_library")
+
+# Generates catalog.py from catalog.csv with the //tools/catalog_gen tool.
+genrule(
+    name = "catalog_gen",
+    srcs = [
+        "catalog.csv",
+        "//tools/catalog_gen",
+    ],
+    outs = ["catalog.py"],
+    cmd = "$(location //tools/catalog_gen) $(location catalog.csv) $@",
+)
+
+py_library(
+    name = "catalog",
+    srcs = [":catalog.py"],
+    visibility = ["//visibility:public"],
+)
+
+# TODO(M6): a diff_test named catalog_golden_test that compares the generated
+#           catalog.py with a reviewed, checked-in catalog.golden.py.

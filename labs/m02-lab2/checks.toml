@@ -1,0 +1,26 @@
+[[check]]
+name = "bazel test //... passes"
+command = ["test", "//..."]
+message = "Both tests should already pass; read the test output if one fails."
+
+[[check]]
+name = "a second bazel test //... runs nothing: both results are (cached)"
+command = ["test", "//..."]
+output_contains = ["Executed 0 out of 2 tests"]
+message = "Nothing changed, so Bazel should reuse both results. Something forces tests to re-run: look for a flag in .bazelrc and a tag in textstats/BUILD.bazel."
+
+[[check]]
+name = "no test is tagged external"
+command = ["query", "attr(tags, external, //...)"]
+stdout_lacks = ["//textstats"]
+message = "The \"external\" tag tells Bazel a test talks to the outside world, so its result is never cached."
+
+[[check]]
+name = "bazel clean (throws away the output base)"
+command = ["clean"]
+
+[[check]]
+name = "after bazel clean, the results come back from the disk cache"
+command = ["test", "//..."]
+output_contains = ["Executed 0 out of 2 tests", "disk cache hit"]
+message = "bazel clean empties the local action cache. Add --disk_cache to .bazelrc so results survive it."

@@ -1,0 +1,3 @@
+id = "m04-lab1"
+title = "PyPI dependencies with pip.parse and a hashed lock"
+module = "m04"

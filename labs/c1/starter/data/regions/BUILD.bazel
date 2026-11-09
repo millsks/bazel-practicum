@@ -1,0 +1,6 @@
+# TODO(M4): a target named "region" that produces region.json: a copy of eu.json
+#           when --//config:region=eu, otherwise a copy of us.json.
+exports_files([
+    "eu.json",
+    "us.json",
+])

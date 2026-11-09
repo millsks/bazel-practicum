@@ -1,0 +1,547 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M00 · How This Practicum Works · Bazel Practicum</title>
+<link rel="stylesheet" href="../assets/css/course.css">
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/viz.js" defer></script>
+<script src="../assets/js/viz-bazel.js" defer></script>
+<script src="../assets/js/course.js" defer></script>
+</head>
+<body data-root="../" data-module="m00">
+<main class="lesson">
+  <header class="lesson-hero">
+    <p class="eyebrow">Orientation · Module 00</p>
+    <h1>How This Practicum Works</h1>
+    <p class="lede">Bazel is a build and test tool that knows every file and every dependency in your repository, so it
+      can rebuild and retest only what changed, the same way on every machine. This module explains what that buys you,
+      how the course lets you practice it in the page and on your own machine, and gets you to your first real build.</p>
+    <div class="lesson-meta"><span>⏱ ~1 hour</span><span>Prerequisites: Python packages, imports, and tests; Pixi installed</span></div>
+    <ul class="objectives">
+      <li>Explain what problem Bazel solves, and when it is not worth it</li>
+      <li>Name the three files every Bazel workspace starts with: <code>.bazelversion</code>, <code>MODULE.bazel</code>, and <code>BUILD.bazel</code></li>
+      <li>Use the in-page simulator and know where it stops</li>
+      <li>Install Bazel 9 through Pixi and Bazelisk, and run a real build, binary, and test</li>
+      <li>Read a Bazel error message: where it points, and what the first line means</li>
+    </ul>
+  </header>
+
+  <section class="lesson-section" id="why-bazel">
+    <h2>Why Bazel?</h2>
+    <aside class="callout python">
+      <p>In a Python project you probably run <code>pip install -e .</code> once, then <code>pytest</code> whenever you change
+        something. pytest has no idea what you changed, so it runs everything (or whatever you point it at). If a test
+        quietly depends on a file it never declared, it still works on your laptop, until it doesn't on CI.</p>
+    </aside>
+    <p>That works well for one package. It strains when a repository holds dozens of services and libraries, in several
+      languages, with code generators in between. Three questions get hard to answer:</p>
+    <ol>
+      <li><strong>What do I need to rebuild and retest after this change?</strong> Usually "everything", because nothing knows.</li>
+      <li><strong>Is this build the same as CI's?</strong> Only if every tool, version, and environment variable matches.</li>
+      <li><strong>Why is the build slow?</strong> Because every machine redoes work another machine already did.</li>
+    </ol>
+    <p>Bazel answers them by making you <em>declare</em> the build. Each directory that holds code gets a
+      <code>BUILD.bazel</code> file listing <strong>targets</strong>: a library, a binary, a test. Each target lists its
+      source files and the other targets it depends on. From those declarations Bazel builds a graph of the whole
+      repository. Then:</p>
+    <div class="card-grid">
+      <div class="card"><h4>Correct</h4><p>Actions run in a sandbox that only contains their declared inputs. A forgotten dependency fails loudly instead of working by accident.</p></div>
+      <div class="card"><h4>Incremental</h4><p>Every action is keyed by a hash of its inputs. Change one file and only the actions downstream of it run again.</p></div>
+      <div class="card"><h4>Cached and shared</h4><p>Because keys are content hashes, results can come from a cache, including a remote one CI and your teammates share.</p></div>
+      <div class="card"><h4>Polyglot</h4><p>Python, Go, Java, C++, protobuf, and shell all live in one graph, so a Python test can depend on a Go binary.</p></div>
+    </div>
+    <aside class="callout think">
+      <p>Try the visualizer below. Click <code>fmt.py</code>, then <code>main.py</code>. Which targets re-run each time, and
+        which tests can Bazel skip? This one picture is most of why teams adopt Bazel.</p>
+    </aside>
+    <div class="viz" data-viz="buildgraph"></div>
+    <aside class="callout warn" data-title="When Bazel is not worth it">
+      <p>A single Python package with a few dozen tests does not need Bazel: <code>pixi</code> plus <code>pytest</code> is
+        simpler and faster to set up. Bazel pays off with many packages, several languages, generated code, slow CI, or a
+        need for reproducible builds. It costs you BUILD files to maintain and a new tool for the team to learn. This
+        course teaches it so you can judge that trade with experience instead of hype.</p>
+    </aside>
+  </section>
+
+  <section class="lesson-section" id="vocabulary">
+    <h2>The words you will see everywhere</h2>
+    <p>You will meet these in the first ten minutes of any Bazel project. Each gets a full module later; for now, a sketch:</p>
+    <dl>
+      <dt><strong>Workspace</strong> (or repository)</dt>
+      <dd>The directory tree Bazel builds. Its root holds a <code>MODULE.bazel</code> file.</dd>
+      <dt><strong>Module</strong></dt>
+      <dd>A versioned unit of Bazel code you depend on, such as <code>rules_python</code>, fetched from the Bazel Central Registry. Your workspace is a module too.</dd>
+      <dt><strong>Package</strong></dt>
+      <dd>A directory with a <code>BUILD.bazel</code> (or <code>BUILD</code>) file, plus everything below it that is not another package.</dd>
+      <dt><strong>Target</strong></dt>
+      <dd>Something in a package that Bazel can build: a rule (like <code>py_binary</code>) or a file.</dd>
+      <dt><strong>Label</strong></dt>
+      <dd>A target's name: <code>//hello:greeting</code> means "the target <code>greeting</code> in the package <code>hello</code>".</dd>
+      <dt><strong>Rule</strong></dt>
+      <dd>A kind of target, such as <code>py_library</code>, <code>go_test</code>, or <code>genrule</code>. Rules come from rule sets you load.</dd>
+      <dt><strong>Starlark</strong></dt>
+      <dd>The language of BUILD and <code>.bzl</code> files: a small, deterministic dialect of Python.</dd>
+    </dl>
+  </section>
+
+  <section class="lesson-section" id="three-files">
+    <h2>Three files every workspace starts with</h2>
+    <p>Here is the smallest useful Python workspace, the one you will build for real at the end of this module:</p>
+    <pre data-label="Workspace layout"><code class="language-none">first_build/
+├── .bazelversion          # which Bazel to run
+├── MODULE.bazel           # this workspace's name and its dependencies
+└── hello/
+    ├── BUILD.bazel        # the targets in package //hello
+    ├── greeting.py
+    ├── greeting_test.py
+    └── hello.py</code></pre>
+    <pre data-label=".bazelversion"><code class="language-none">9.3.2</code></pre>
+    <p><strong><code>.bazelversion</code></strong> pins the Bazel release. You do not install Bazel itself: you install
+      <strong>Bazelisk</strong>, a small launcher that reads this file, downloads that exact Bazel once, and runs it. Every
+      developer and every CI machine then runs the same Bazel.</p>
+    <pre data-label="MODULE.bazel"><code class="language-starlark">module(name = "first_build")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(python_version = "3.13", is_default = True)</code></pre>
+    <p><strong><code>MODULE.bazel</code></strong> names your module and declares what it depends on. Here: the Python rules,
+      and a Python 3.13 interpreter that Bazel downloads itself, so builds never depend on whichever Python happens to be
+      on your machine. Module 04 covers this file in depth.</p>
+    <pre data-label="hello/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
+
+py_library(
+    name = "greeting",
+    srcs = ["greeting.py"],
+)
+
+py_binary(
+    name = "hello",
+    srcs = ["hello.py"],
+    deps = [":greeting"],
+)
+
+py_test(
+    name = "greeting_test",
+    srcs = ["greeting_test.py"],
+    deps = [":greeting"],
+)</code></pre>
+    <p><strong><code>BUILD.bazel</code></strong> declares targets. Read it top to bottom: load three rules from
+      <code>rules_python</code>; a library made of <code>greeting.py</code>; a binary made of <code>hello.py</code> that
+      uses the library; a test that uses it too. <code>":greeting"</code> is a label relative to this package, short for
+      <code>//hello:greeting</code>.</p>
+    <aside class="callout bazel">
+      <p>Bazel 9 removed the old <code>WORKSPACE</code> file (Bzlmod and <code>MODULE.bazel</code> replaced it) and no
+        longer loads rule sets automatically. Older tutorials skip the <code>load()</code> line and use
+        <code>WORKSPACE</code>; with Bazel 9 both fail. If a guide you find online has a <code>WORKSPACE</code> file, it
+        predates Bazel 8.</p>
+    </aside>
+  </section>
+
+  <section class="lesson-section" id="simulator">
+    <h2>The simulator in this page</h2>
+    <p>Real Bazel needs a JVM, downloads, and a file system, so it cannot run in a browser. Instead, each lesson includes
+      <strong>sandboxes</strong> backed by <em>minibazel</em>, the course's model of Bazel written in Python and run in your
+      browser. It reads the files in the sandbox and answers the way Bazel 9.3 would during its first two phases:
+      which targets exist, whether they are valid, and what depends on what.</p>
+    <p>This sandbox holds the workspace from the previous section. Run the first command, then try the others. The first
+      run takes a few seconds while Python loads in your browser.</p>
+    <div class="runnable" data-title="Explore the first workspace" data-commands="bazel query //...|bazel query 'deps(//hello:hello)'|bazel build //hello:hello|bazel test //...">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "first_build")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(python_version = "3.13", is_default = True)
+</textarea>
+<textarea class="file" data-path="hello/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
+
+py_library(
+    name = "greeting",
+    srcs = ["greeting.py"],
+)
+
+py_binary(
+    name = "hello",
+    srcs = ["hello.py"],
+    deps = [":greeting"],
+)
+
+py_test(
+    name = "greeting_test",
+    srcs = ["greeting_test.py"],
+    deps = [":greeting"],
+)
+</textarea>
+<textarea class="file" data-path="hello/greeting.py" data-hidden></textarea>
+<textarea class="file" data-path="hello/hello.py" data-hidden></textarea>
+<textarea class="file" data-path="hello/greeting_test.py" data-hidden></textarea>
+</div>
+    <p>Now break it. Delete the <code>load(...)</code> line in <code>hello/BUILD.bazel</code> and run
+      <code>bazel build //hello:hello</code> again. You get the most common Bazel 9 error there is.</p>
+    <aside class="callout sim">
+      <p>The simulator models <strong>loading</strong> (evaluating BUILD files) and <strong>analysis</strong> (checking the
+        graph: labels, visibility, dependency types, <code>select()</code>), plus <code>bazel query</code> and
+        <code>cquery</code>. It never runs a program, a test, or a compiler. So <code>bazel test</code> here tells you which
+        tests <em>would</em> run, not whether they pass. Anything that needs execution (test results, caching, generated
+        files, real timings) is in a <strong>lab</strong>, which runs real Bazel on your machine.</p>
+    </aside>
+    <p>Sandboxes reset with the <strong>Reset</strong> button. Exercises save your edits in this browser.</p>
+  </section>
+
+  <section class="lesson-section" id="labs">
+    <h2>Labs: real Bazel on your machine</h2>
+    <p>Each module ends with one or two labs. A lab is a small workspace in the
+      <a href="https://github.com/millsks/bazel-practicum">bazel-practicum</a> repository, with a starter you edit and a
+      grader that runs real Bazel commands against it. Set up once:</p>
+    <pre data-label="Terminal"><code class="language-bash">git clone https://github.com/millsks/bazel-practicum.git
+cd bazel-practicum
+pixi install            # Python tooling and Bazelisk, from conda-forge
+pixi run bazel version  # Bazelisk downloads Bazel 9.3.2 on first use</code></pre>
+    <p>Then, for any lab:</p>
+    <pre data-label="Terminal"><code class="language-bash">pixi run labs                 # list labs and which you have started
+pixi run start m00-lab1       # copy the starter to work/m00-lab1/
+cd work/m00-lab1
+pixi run bazel build //...    # work on it with real Bazel
+cd ../..
+pixi run grade m00-lab1       # run the lab's checks</code></pre>
+    <aside class="callout pixi">
+      <p>Pixi installs <strong>Bazelisk</strong>, and this repository puts a small <code>bazel</code> wrapper for it on
+        <code>PATH</code>, so <code>pixi run bazel ...</code> works from any directory inside the clone (or run
+        <code>pixi shell</code> once and type <code>bazel ...</code>). For a workspace outside the repository,
+        <code>pixi add bazelisk</code> and run <code>pixi run bazelisk ...</code>. Nothing else to install: no Homebrew,
+        no system Python, no Java. Bazel ships its own JDK.</p>
+    </aside>
+    <p>The grader copies your workspace to <code>build/labs/</code>, adds any grading files, runs each check, and prints
+      what passed. Your copy in <code>work/</code> is never modified, so grade as often as you like.</p>
+    <aside class="callout tip">
+      <p>The first lab downloads Bazel (about 60 MB), a Python toolchain, and rule sets. Later labs reuse Bazel's
+        repository cache, so they start in seconds.</p>
+    </aside>
+  </section>
+
+  <section class="lesson-section" id="reading-output">
+    <h2>Reading Bazel's output</h2>
+    <p>A successful real build is quiet. This is <code>bazel run //hello:hello</code> from the lab's solution:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">INFO: Found 1 target...
+Target //hello:hello up-to-date:
+  bazel-bin/hello/hello
+INFO: Elapsed time: 0.229s, Critical Path: 0.00s
+INFO: 1 process: 1 internal.
+INFO: Build completed successfully, 1 total action
+INFO: Running command line: bazel-bin/hello/hello
+Hello, Bazel!</code></pre>
+    <p>Everything Bazel builds lands under <code>bazel-bin/</code>, a symlink Bazel creates in your workspace (with
+      <code>bazel-out</code>, <code>bazel-testlogs</code>, and <code>bazel-&lt;name&gt;</code>). Never edit or commit them; add
+      <code>bazel-*</code> to <code>.gitignore</code>.</p>
+    <p>An error names a file, line, and column, then says what is wrong. This is the untouched lab starter:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: hello/BUILD.bazel:3:1: name 'py_library' is not defined (did you mean 'cc_library'?)
+ERROR: hello/BUILD.bazel:8:1: name 'py_binary' is not defined (did you mean 'cc_binary'?)
+ERROR: package contains errors: hello: name 'py_library' is not defined (did you mean 'cc_library'?)</code></pre>
+    <p>Three habits make Bazel errors easy:</p>
+    <ol>
+      <li><strong>Read the first ERROR line first.</strong> Later lines are usually consequences ("package contains errors", "Build did NOT complete").</li>
+      <li><strong>Go to the location.</strong> <code>hello/BUILD.bazel:3:1</code> is line 3, column 1.</li>
+      <li><strong>Ignore the guess when it is wrong.</strong> Bazel suggests <code>cc_library</code> because it is the closest built-in name; the real fix is loading <code>py_library</code> from <code>rules_python</code>.</li>
+    </ol>
+  </section>
+
+  <section class="lesson-section" id="practice">
+    <h2>Practice</h2>
+    <p>Exercises are checked in the page by the simulator. Edit the files, press <strong>Check</strong>, and read each
+      check's message. You can also open "Try commands" to run <code>bazel</code> against your edits.</p>
+
+    <div class="exercise" data-id="m00-e1" data-title="Load the Python rules">
+      <div class="exercise-prompt">
+        <p>This BUILD file uses <code>py_library</code> and <code>py_binary</code> but Bazel 9 cannot find them. Add the
+          <code>load()</code> statement that makes both available, so <code>bazel build //hello:hello</code> succeeds.</p>
+      </div>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "first_build")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="hello/BUILD.bazel">
+py_library(
+    name = "greeting",
+    srcs = ["greeting.py"],
+)
+
+py_binary(
+    name = "hello",
+    srcs = ["hello.py"],
+    deps = [":greeting"],
+)
+</textarea>
+<textarea class="file" data-path="hello/greeting.py" data-hidden></textarea>
+<textarea class="file" data-path="hello/hello.py" data-hidden></textarea>
+<script type="text/x-python" class="tests">
+def test_the_package_loads(bazel):
+    bazel.target("//hello:hello")
+
+def test_hello_is_a_py_binary(bazel):
+    assert bazel.target("//hello:hello").kind == "py_binary", "//hello:hello should be a py_binary"
+
+def test_build_succeeds(bazel):
+    result = bazel.build("//hello:hello")
+    assert result.ok, "bazel build //hello:hello fails:\n" + result.error
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p>The rules live in the file <code>@rules_python//python:defs.bzl</code>. <code>load()</code> takes the file's
+          label first, then the names you want from it.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="hello/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_binary", "py_library")
+
+py_library(
+    name = "greeting",
+    srcs = ["greeting.py"],
+)
+
+py_binary(
+    name = "hello",
+    srcs = ["hello.py"],
+    deps = [":greeting"],
+)</code></pre>
+        <p>Order inside <code>load()</code> does not matter; alphabetical is the convention (Buildifier, Bazel's
+          formatter, sorts them for you).</p>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m00-e2" data-title="Declare a test target">
+      <div class="exercise-prompt">
+        <p>The package has a test file, <code>greeting_test.py</code>, but no target for it, so
+          <code>bazel test //...</code> finds nothing to run. Add a <code>py_test</code> named <code>greeting_test</code>
+          that tests the <code>greeting</code> library. Then <code>bazel test //...</code> should select exactly
+          <code>//hello:greeting_test</code>.</p>
+      </div>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "first_build")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="hello/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_binary", "py_library")
+
+py_library(
+    name = "greeting",
+    srcs = ["greeting.py"],
+)
+
+py_binary(
+    name = "hello",
+    srcs = ["hello.py"],
+    deps = [":greeting"],
+)
+</textarea>
+<textarea class="file" data-path="hello/greeting.py" data-hidden></textarea>
+<textarea class="file" data-path="hello/hello.py" data-hidden></textarea>
+<textarea class="file" data-path="hello/greeting_test.py" data-hidden></textarea>
+<script type="text/x-python" class="tests">
+def test_greeting_test_is_a_py_test(bazel):
+    t = bazel.target("//hello:greeting_test")
+    assert t.kind == "py_test", f"//hello:greeting_test should be a py_test, but it is a {t.kind}"
+
+def test_it_depends_on_the_library(bazel):
+    deps = bazel.query("deps(//hello:greeting_test, 1)")
+    assert "//hello:greeting" in deps, "greeting_test must list :greeting in deps"
+
+def test_bazel_test_selects_it(bazel):
+    result = bazel.test("//...")
+    assert result.ok, "bazel test //... fails:\n" + result.error
+    assert result.tests == ["//hello:greeting_test"], f"bazel test //... would run {result.tests}"
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p>A <code>py_test</code> looks like a <code>py_binary</code>: <code>name</code>, <code>srcs</code>, and
+          <code>deps</code>. Do not forget to load it.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="hello/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
+
+py_library(
+    name = "greeting",
+    srcs = ["greeting.py"],
+)
+
+py_binary(
+    name = "hello",
+    srcs = ["hello.py"],
+    deps = [":greeting"],
+)
+
+py_test(
+    name = "greeting_test",
+    srcs = ["greeting_test.py"],
+    deps = [":greeting"],
+)</code></pre>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m00-e3" data-title="Read the error, fix the label">
+      <div class="exercise-prompt">
+        <p>Someone renamed the library to <code>greeter</code> but forgot a reference. Run
+          <code>bazel build //...</code> under "Try commands" to see the error, then fix the BUILD file so everything
+          builds. Keep the library's new name.</p>
+      </div>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "first_build")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="hello/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_binary", "py_library")
+
+py_library(
+    name = "greeter",
+    srcs = ["greeting.py"],
+)
+
+py_binary(
+    name = "hello",
+    srcs = ["hello.py"],
+    deps = [":greeting"],
+)
+</textarea>
+<textarea class="file" data-path="hello/greeting.py" data-hidden></textarea>
+<textarea class="file" data-path="hello/hello.py" data-hidden></textarea>
+<script type="text/x-python" class="tests">
+def test_the_library_is_still_called_greeter(bazel):
+    assert bazel.target("//hello:greeter").kind == "py_library", "keep the py_library named greeter"
+
+def test_hello_depends_on_greeter(bazel):
+    assert "//hello:greeter" in bazel.query("deps(//hello:hello, 1)"), "//hello:hello should depend on :greeter"
+
+def test_everything_builds(bazel):
+    result = bazel.build("//...")
+    assert result.ok, "bazel build //... fails:\n" + result.error
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p>The error says <code>no such target '//hello:greeting'</code>, "referenced by '//hello:hello'". Which attribute
+          of <code>hello</code> mentions <code>:greeting</code>?</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="hello/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_binary", "py_library")
+
+py_library(
+    name = "greeter",
+    srcs = ["greeting.py"],
+)
+
+py_binary(
+    name = "hello",
+    srcs = ["hello.py"],
+    deps = [":greeter"],
+)</code></pre>
+        <p>The file is still <code>greeting.py</code>: target names and file names are independent. That is why
+          renaming a target needs updating every label that points at it, which <code>bazel query 'rdeps(//..., //hello:greeter)'</code>
+          (Module 09) finds for you.</p>
+      </details>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="lab">
+    <h2>Lab: your first real build</h2>
+    <p>The exercises proved the BUILD file is valid. Only real Bazel can show the binary printing and the test passing,
+      and show the second run being cached. This lab is the same workspace with the two fixes left for you.</p>
+    <div class="lab" data-id="m00-lab1" data-title="Your first real build">
+      <div class="lab-prompt">
+        <p>Make <code>bazel run //hello:hello</code> print <code>Hello, Bazel!</code> and make <code>bazel test //...</code>
+          pass, with a <code>py_test</code> named <code>greeting_test</code>.</p>
+        <ul class="checklist" data-id="m00-lab1-steps">
+          <li>Run <code>pixi run start m00-lab1</code>, then <code>cd work/m00-lab1</code></li>
+          <li>Run <code>pixi run bazel build //...</code> and read the first ERROR line</li>
+          <li>Add the missing <code>load()</code>; run <code>pixi run bazel run //hello:hello</code></li>
+          <li>Add the <code>py_test</code>; run <code>pixi run bazel test //...</code> twice and notice <code>(cached)</code> the second time</li>
+          <li>Back at the repository root, run <code>pixi run grade m00-lab1</code></li>
+        </ul>
+      </div>
+      <details class="hint"><summary>Hint</summary>
+        <p>It is exactly exercises 1 and 2 above, in one file. The grader runs four checks: the package loads,
+          <code>run</code> prints the greeting, the test target exists, and <code>bazel test //...</code> passes.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-label="hello/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
+
+py_library(
+    name = "greeting",
+    srcs = ["greeting.py"],
+)
+
+py_binary(
+    name = "hello",
+    srcs = ["hello.py"],
+    deps = [":greeting"],
+)
+
+py_test(
+    name = "greeting_test",
+    srcs = ["greeting_test.py"],
+    deps = [":greeting"],
+)</code></pre>
+        <p>The second <code>bazel test //...</code> prints <code>//hello:greeting_test (cached) PASSED</code> and
+          <code>Executed 0 out of 1 test</code>: nothing changed, so Bazel reused the result.</p>
+      </details>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="quiz">
+    <h2>Quiz</h2>
+    <div class="quiz" data-id="m00-quiz">
+<script type="application/json">
+{"title": "Orientation quiz", "passScore": 0.7, "questions": [
+  {"type": "single", "prompt": "Which file decides which Bazel release Bazelisk runs?", "options": ["MODULE.bazel", ".bazelversion", ".bazelrc", "BUILD.bazel"], "answer": 1, "explanation": "<p><code>.bazelversion</code> holds a version such as <code>9.3.2</code>. Bazelisk reads it, downloads that release once, and runs it, so every machine uses the same Bazel.</p>"},
+  {"type": "single", "prompt": "What makes a directory a Bazel <em>package</em>?", "options": ["It contains an __init__.py", "It contains a BUILD.bazel (or BUILD) file", "It is listed in MODULE.bazel", "It contains Python files"], "answer": 1, "explanation": "<p>A package is a directory with a BUILD file, plus its subdirectories that do not have their own BUILD file. <code>__init__.py</code> is a Python concept Bazel does not use to find packages.</p>"},
+  {"type": "text", "prompt": "Write the label of the target named <code>greeting</code> in the package <code>hello</code>, in its full form.", "answer": ["//hello:greeting"], "explanation": "<p><code>//</code> starts at the workspace root, <code>hello</code> is the package path, and <code>:greeting</code> is the target name. Inside <code>hello/BUILD.bazel</code> you can shorten it to <code>:greeting</code>.</p>"},
+  {"type": "single", "prompt": "With Bazel 9, what happens to this BUILD file?", "code": "py_binary(\n    name = \"app\",\n    srcs = [\"app.py\"],\n)", "lang": "starlark", "options": ["It builds: py_binary is built in", "Loading fails: name 'py_binary' is not defined", "Bazel loads rules_python automatically, with a warning", "Analysis fails: app.py is missing"], "answer": 1, "explanation": "<p>Bazel 9 does not autoload rule sets. Without <code>load(\"@rules_python//python:defs.bzl\", \"py_binary\")</code> the name is undefined and the package fails to load.</p>"},
+  {"type": "multi", "prompt": "Which of these can the in-page simulator tell you? Select all that apply.", "options": ["Whether a label points at an existing target", "Whether a test passes", "Which targets <code>//hello:hello</code> depends on", "How long a build takes", "Which tests <code>bazel test //...</code> would select"], "answer": [0, 2, 4], "explanation": "<p>The simulator models loading, analysis, and query. It never executes anything, so test results and timings come from labs with real Bazel.</p>"},
+  {"type": "single", "prompt": "You run <code>bazel test //...</code> twice without changing anything. What does the second run report?", "options": ["The test runs again: tests are never cached", "<code>(cached) PASSED</code>: Bazel reuses the result", "Nothing: Bazel skips tests it has seen", "An error: outputs already exist"], "answer": 1, "explanation": "<p>A test is an action like any other. Its inputs did not change, so Bazel reuses the stored result and labels it <code>(cached)</code>.</p>"},
+  {"type": "single", "prompt": "Which file replaced <code>WORKSPACE</code> for declaring external dependencies?", "options": ["MODULE.bazel", "BUILD.bazel", ".bazelrc", "deps.bzl"], "answer": 0, "explanation": "<p>Bzlmod reads <code>MODULE.bazel</code>. Bazel 8 disabled <code>WORKSPACE</code> by default and Bazel 9 removed it.</p>"},
+  {"type": "single", "prompt": "An error begins <code>ERROR: hello/BUILD.bazel:8:1:</code>. Where should you look?", "options": ["Line 1, column 8 of hello/BUILD.bazel", "Line 8, column 1 of hello/BUILD.bazel", "The eighth target in the package", "Line 8 of MODULE.bazel"], "answer": 1, "explanation": "<p>The format is <code>file:line:column</code>, the same as Python tracebacks and most compilers.</p>"},
+  {"type": "text", "prompt": "Bazel puts built outputs under a symlink in your workspace. What is its name?", "answer": ["bazel-bin", "bazel-bin/"], "explanation": "<p><code>bazel-bin</code> points into Bazel's output tree for the current configuration. <code>bazel-out</code> and <code>bazel-testlogs</code> sit beside it. Ignore them in git.</p>"},
+  {"type": "single", "prompt": "Why does Bazel run each action with only its declared inputs available?", "options": ["To save disk space", "So a forgotten dependency fails instead of working by accident", "Because Python requires it", "To make builds slower but safer for Windows"], "answer": 1, "explanation": "<p>Sandboxing makes undeclared dependencies visible. That keeps the graph honest, and an honest graph is what makes incremental builds and caching safe.</p>"},
+  {"type": "single", "prompt": "When is Bazel probably <strong>not</strong> worth adopting?", "options": ["A monorepo with Python, Go, and generated protobuf code", "A single small Python package with a fast test suite", "A team whose CI rebuilds everything on every commit", "A project that needs identical builds on every machine"], "answer": 1, "explanation": "<p>For one small package, Pixi and pytest are simpler. Bazel's costs (BUILD files, a new tool) pay off at scale, across languages, or when reproducibility matters.</p>"}
+]}
+</script>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="recap">
+    <h2>Recap</h2>
+    <ul>
+      <li>Bazel builds from a declared graph of targets, so it rebuilds and retests only what a change affects, and can share results through caches.</li>
+      <li>A workspace starts with <code>.bazelversion</code> (which Bazel), <code>MODULE.bazel</code> (which dependencies), and BUILD files (which targets).</li>
+      <li>Bazel 9 has no <code>WORKSPACE</code> and no autoloads: every rule set is declared in <code>MODULE.bazel</code> and loaded in BUILD files.</li>
+      <li>Labels like <code>//hello:greeting</code> name targets; <code>:greeting</code> is relative to the current package.</li>
+      <li>Sandboxes and exercises use an in-page simulator of loading, analysis, and query; labs use real Bazel through <code>pixi run start</code> and <code>pixi run grade</code>.</li>
+      <li>Read the first ERROR line, go to its <code>file:line:col</code>, and treat later lines as consequences.</li>
+    </ul>
+    <div class="flashcards" data-title="Orientation review">
+<script type="application/json">
+[
+  {"front": "What does <code>.bazelversion</code> do?", "back": "Pins the Bazel release. Bazelisk reads it, downloads that version, and runs it."},
+  {"front": "What is a package?", "back": "A directory with a BUILD.bazel (or BUILD) file, plus subdirectories without their own BUILD file."},
+  {"front": "What does <code>//hello:greeting</code> mean?", "back": "The target named greeting in the package hello, starting from the workspace root."},
+  {"front": "Why does <code>py_binary</code> need a <code>load()</code> in Bazel 9?", "back": "Bazel 9 does not autoload rule sets; py_binary comes from @rules_python//python:defs.bzl."},
+  {"front": "What replaced WORKSPACE?", "back": "MODULE.bazel and Bzlmod. Bazel 9 removed WORKSPACE support."},
+  {"front": "What does <code>(cached) PASSED</code> mean?", "back": "The test's inputs did not change, so Bazel reused the previous result instead of running it."},
+  {"front": "What can the in-page simulator not do?", "back": "Run anything: no test results, no compiling, no timings. Labs run real Bazel for that."},
+  {"front": "Where do build outputs go?", "back": "Under the bazel-bin symlink (with bazel-out and bazel-testlogs). Never commit them."},
+  {"front": "How do you start and grade a lab?", "back": "pixi run start &lt;id&gt;, work in work/&lt;id&gt;, then pixi run grade &lt;id&gt; from the repository root."}
+]
+</script>
+    </div>
+    <h3>Going further</h3>
+    <ul>
+      <li><a href="https://bazel.build/about/intro">Intro to Bazel</a> and <a href="https://bazel.build/about/why">Why Bazel?</a> on bazel.build</li>
+      <li><a href="https://github.com/bazelbuild/bazelisk">Bazelisk</a>: how <code>.bazelversion</code> is resolved</li>
+      <li><a href="https://blog.bazel.build/2026/01/20/bazel-9.html">Bazel 9 release announcement</a>: WORKSPACE removal and the end of autoloads</li>
+      <li><a href="https://registry.bazel.build/">Bazel Central Registry</a>: where <code>rules_python</code> and friends come from</li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>

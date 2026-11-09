@@ -1,0 +1,12 @@
+# Workspace-wide Bazel options for the harbor monorepo.
+
+# `--config=eu`: build for the EU region.
+common:eu --//config:region=eu
+
+# `--config=ci`: what the CI pipeline passes. Release builds are optimized, and
+# test logs are printed for failing tests only.
+common:ci -c opt
+test:ci --test_output=errors
+
+# Personal settings that should not be committed go in user.bazelrc.
+try-import %workspace%/user.bazelrc

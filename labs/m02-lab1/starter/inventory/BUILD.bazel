@@ -1,0 +1,20 @@
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+# The library reads prices.csv at run time (see stock.py).
+py_library(
+    name = "stock",
+    srcs = ["stock.py"],
+)
+
+py_test(
+    name = "stock_test",
+    srcs = ["stock_test.py"],
+    deps = [":stock"],
+)
+
+# Counts the items in the price list (every line but the header).
+genrule(
+    name = "item_count",
+    outs = ["item_count.txt"],
+    cmd = "tail -n +2 inventory/prices.csv | wc -l > $@",
+)

@@ -1,0 +1,9 @@
+load("@rules_go//go:def.bzl", "go_test")
+
+# The grader's own external test: it imports textutil by its import path from
+# another package, the way any other Go code in the repository would.
+go_test(
+    name = "textutil_ext_test",
+    srcs = ["textutil_ext_test.go"],
+    deps = ["//textutil"],
+)

@@ -1,0 +1,33 @@
+[[check]]
+name = "the workspace builds"
+command = ["build", "//..."]
+message = "Run `pixi run bazel build //...` in work/m09-lab1 and read the first ERROR line."
+
+[[check]]
+name = "every test passes"
+command = ["test", "//...", "--test_output=errors"]
+message = "//web:render_test needs the templates in its runfiles: keep data = [\"//web:templates\"] on the library that renders them."
+
+[[check]]
+name = "all four tests still exist"
+command = ["query", "tests(//...)"]
+stdout_lines = ["//billing:invoice_test", "//common:text_test", "//inventory:stock_test", "//web:render_test"]
+message = "Keep every test (and its name). Fix the graph, not the test list."
+
+[[check]]
+name = "billing no longer reaches the templates"
+command = ["query", "somepath(//billing:invoice_test, //web:templates)"]
+stdout_lines = []
+message = "Run this somepath query yourself: it shows the edge to cut. billing only needs common/text.py; give it a library that does not carry the templates."
+
+[[check]]
+name = "inventory no longer reaches the templates"
+command = ["query", "somepath(//inventory:stock_test, //web:templates)"]
+stdout_lines = []
+message = "Same fix for //inventory:stock: depend on the text-only library."
+
+[[check]]
+name = "a template edit affects only the render test"
+command = ["query", "kind(test, rdeps(//..., //web:templates/receipt.html))"]
+stdout_lines = ["//web:render_test"]
+message = "rdeps() of the template should reach only code that renders HTML. Which tests does it list now?"

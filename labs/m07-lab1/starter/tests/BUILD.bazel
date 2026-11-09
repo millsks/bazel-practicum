@@ -1,0 +1,9 @@
+load("@rules_python//python:defs.bzl", "py_test")
+
+# TODO: this test runs the Go binary //tools/wc. Ship the binary with the test
+# and tell the test where to find it (see wc_test.py).
+py_test(
+    name = "wc_test",
+    srcs = ["wc_test.py"],
+    deps = ["@rules_python//python/runfiles"],
+)

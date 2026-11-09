@@ -1,0 +1,3 @@
+#!/bin/sh
+# `bazel` for this course: Bazelisk reads .bazelversion and runs that Bazel.
+exec bazelisk "$@"
