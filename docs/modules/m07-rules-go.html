@@ -284,8 +284,8 @@ go_binary(
 <textarea class="file" data-path="version/version.go" data-hidden></textarea>
 </div>
     <aside class="callout sim">
-      <p>The simulator accepts any <code>go_sdk</code> tag and any <code>use_repo</code> of it, and it never downloads
-        anything. The <code>use_repo</code> and <code>go_version</code> errors above come from real Bazel only.</p>
+      <p>The simulator reports the <code>use_repo</code> and <code>go_version</code> errors above, but it never
+        downloads an SDK, so it cannot show which Go version a binary was built with.</p>
     </aside>
     <p><strong>Remember:</strong> <code>bazel_dep(name = "rules_go", ...)</code> plus
       <code>go_sdk.download(version = "1.25.3")</code>, no <code>use_repo</code>. The system Go is never used.</p>
@@ -715,10 +715,9 @@ Executed 2 out of 4 tests: 4 tests pass.</code></pre>
       end of <code>count.go</code> left all four tests <code>(cached)</code>. Actions are keyed on input
       <em>content</em>, so when a recompiled package comes out the same, nothing downstream runs again.</p>
     <aside class="callout sim">
-      <p>The simulator checks that <code>//tools/wc</code> is visible and is a valid <code>data</code> dependency, but it
-        does not expand <code>$(rlocationpath)</code> in <code>env</code> or <code>args</code>, so it misses the "not a
-        declared prerequisite" error. It also prints <code>bazel-bin/tools/wc/wc</code> for <code>bazel run</code>,
-        where real rules_go uses <code>wc_/wc</code>. Trust the real output above.</p>
+      <p>The simulator checks <code>$(rlocationpath)</code> in <code>env</code> and <code>args</code> (the "not a
+        declared prerequisite" error) and prints rules_go's <code>wc_/wc</code> path for <code>bazel run</code>, but it
+        never runs the tests.</p>
     </aside>
     <p>Predict, then run: which targets does the Python test reach, and which of them are Go?</p>
     <div class="runnable" data-predict data-title="The polyglot graph from the test's side" data-commands="bazel query 'kind(&quot;go_.* rule&quot;, deps(//tests:wc_test))'|bazel query 'labels(data, //tests:wc_test)'|bazel query 'rdeps(//..., //textutil)'|bazel test //...">

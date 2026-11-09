@@ -308,10 +308,8 @@ genrule(
       <code>//...</code> has no files), or <code>^ //...:*</code> to keep files too.</p>
     <aside class="callout sim">
       <p>The simulator shows only the edges you wrote, as if <code>--noimplicit_deps</code> were always on, and it never
-        lists external targets such as <code>@rules_python//python:none</code>. It also lacks <code>let</code>
-        expressions (below), the <code>minrank</code>/<code>maxrank</code>/<code>graph</code>/<code>build</code> output
-        formats, and file paths like <code>core/money.py</code> as targets: write <code>//core:money.py</code>
-        in sandboxes.</p>
+        lists external targets such as <code>@rules_python//python:none</code>, so its <code>minrank</code> and
+        <code>maxrank</code> lists are shorter than real Bazel's. It has no <code>--output=graph</code>.</p>
     </aside>
     <h3>Naming a sub-result with let</h3>
     <p>Long expressions repeat themselves. <code>let NAME = EXPR in BODY</code> names a set, and <code>$NAME</code> uses
@@ -526,12 +524,6 @@ py_binary(
       the route through <code>//catalog</code>. That difference matters when you are trying to remove a dependency: cut
       the edge <code>somepath</code> shows, run it again, and it may show you the next one. <code>allpaths</code> shows
       them all at once.</p>
-    <aside class="callout sim">
-      <p>The simulator prints <code>somepath</code> results sorted, like every other query. Real Bazel prints the path
-        in order. For <code>somepath(//app:server, //catalog:catalog.py)</code> real Bazel printed
-        <code>//app:server</code>, <code>//checkout:checkout</code>, <code>//catalog:catalog</code>,
-        <code>//catalog:catalog.py</code>: same set, path order.</p>
-    </aside>
     <h3>Seeing the paths as a picture</h3>
     <p><code>--output=graph</code> prints the result as <strong>Graphviz</strong> dot, with the edges between the
       targets in the set. Pipe it into <code>dot -Tsvg</code> (from the <code>graphviz</code> package, which
@@ -893,11 +885,11 @@ py_library(
 <textarea class="file" data-path="checkout/checkout.py" data-hidden></textarea>
 </div>
     <aside class="callout sim">
-      <p>The simulator's <code>cquery</code> resolves <code>select()</code> exactly, but prints plain sorted labels with no
-        configuration id, never lists implicit dependencies (real <code>cquery</code> without
-        <code>--noimplicit_deps</code> printed 33 lines for <code>deps(//app:server, 1)</code>), and has no
-        <code>--output=files</code>. Use it to check what is selected; read ids and paths
-        from real Bazel.</p>
+      <p>The simulator's <code>cquery</code> resolves <code>select()</code> exactly and prints <code>(null)</code> for
+        source files. Its configuration ids match real Bazel only for a plain host build; with other flags they are
+        stand-ins. It never lists implicit dependencies (real <code>cquery</code> without
+        <code>--noimplicit_deps</code> printed 33 lines for <code>deps(//app:server, 1)</code>) and has no
+        <code>--output=files</code>. Use it to check what is selected; read paths from real Bazel.</p>
     </aside>
     <p><strong>Remember:</strong> query answers "could"; cquery answers "does, with these flags". Configuration ids
       group targets by flags; <code>(null)</code> means a source file; <code>--output=files</code> finds outputs.</p>

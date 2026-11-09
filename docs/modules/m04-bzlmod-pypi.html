@@ -476,11 +476,6 @@ py_binary(
 </textarea>
 <textarea class="file" data-path="app/fetch.py" data-hidden></textarea>
 </div>
-    <aside class="callout sim">
-      <p>The simulator adds a hint in parentheses, <code>('requests' is not in //:requirements_lock.txt …)</code>, which
-        real Bazel does not print. It also accepts un-normalized labels such as <code>@pypi//python-dateutil</code> that
-        real Bazel rejects (see the tabs above), so trust the table, not the sandbox, on spelling.</p>
-    </aside>
     <h3>What is in the hub</h3>
     <p>Each package in the hub has a few targets. You will almost always use the default one:</p>
     <pre data-label="Real output (Bazel 9.3.2): bazel query @pypi//pytest:all"><code class="language-none">@pypi//pytest:_no_matching_repository
@@ -955,7 +950,7 @@ py_binary(
       <div class="exercise-prompt">
         <p>A teammate converted <code>//config:loader</code> from a <code>pyproject.toml</code> project. It imports
           <code>dateutil</code>, <code>yaml</code>, and <code>typing_extensions</code>, and they wrote one label per import.
-          Two labels fail; the third happens to pass in this simulator but fails in real Bazel. Rewrite
+          All three fail, each with <code>no such package</code>. Rewrite
           <code>deps</code> with the correct label for each package, using the names in the lock file.</p>
       </div>
 <textarea class="file" data-path="MODULE.bazel" data-readonly>

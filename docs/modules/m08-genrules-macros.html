@@ -258,9 +258,9 @@ genrule(
 <textarea class="file" data-path="gen/VERSION" data-hidden>1.4.0</textarea>
 </div>
     <aside class="callout sim">
-      <p>The simulator checks <code>$(location)</code> prerequisites, <code>$@</code>, <code>$&lt;</code>, and unknown
-        <code>$(NAME)</code> variables with Bazel's wording. It does not flag a bare shell <code>$f</code> or
-        <code>$HOME</code> (real Bazel does, as shown above), and it never runs the command.</p>
+      <p>The simulator checks <code>$(location)</code> prerequisites, <code>$@</code>, <code>$&lt;</code>, unknown
+        <code>$(NAME)</code> variables, and bare shell variables such as <code>$HOME</code> with Bazel's wording. It
+        never runs the command, so it cannot show the <code>set -u</code> failure.</p>
     </aside>
     <p><strong>Remember:</strong> let Bazel write paths with <code>$(location)</code>/<code>$(execpath)</code>; every
       label you expand must be declared; <code>$@</code> and <code>$&lt;</code> need exactly one file; write
@@ -328,9 +328,8 @@ action 'Executing genrule //gen:shout_tools'
     -c \
     'source external/bazel_tools/tools/genrule/genrule-setup.sh; bazel-out/k8-opt-exec/bin/tools/upper gen/words.txt bazel-out/k8-fastbuild/bin/gen/shout.txt')</code></pre>
     <aside class="callout sim">
-      <p>The simulator does not model configurations or a binary's multiple files, so it accepts a
-        <code>py_binary</code> in <code>srcs</code> with <code>$(location)</code>. The exercises check where you put the
-        binary; the lab shows the real error.</p>
+      <p>The simulator reports the "expands to more than one file" error for a binary in <code>srcs</code>, but it has
+        no <code>aquery</code> and no exec configuration ids: the outputs above are from real Bazel.</p>
     </aside>
     <p><strong>Remember:</strong> anything the command <em>runs</em> goes in <code>tools</code> (exec configuration);
       anything it <em>reads</em> goes in <code>srcs</code> (target configuration).</p>
@@ -417,7 +416,7 @@ run_binary(
       <p>In <code>bazel query --output=label_kind</code>, real Bazel lists <code>write_file</code> targets as
         <code>_write_file rule</code> and <code>copy_file</code> as <code>_copy_file rule</code>: those two public
         names are macros wrapping private rules. <code>run_binary</code> and <code>diff_test</code> appear under their
-        own names. (The simulator prints the public names.)</p>
+        own names.</p>
     </aside>
     <div class="runnable" data-title="skylib generators" data-commands="bazel build //golden:all|bazel query 'labels(tool, //golden:shout)'|bazel query 'kind(&quot;generated file&quot;, //golden:*)'">
 <textarea class="file" data-path="MODULE.bazel" data-readonly>
@@ -715,8 +714,9 @@ py_binary(
 </div>
     <aside class="callout sim">
       <p>The simulator evaluates local <code>.bzl</code> files, <code>native.*</code>, and private-symbol rules like
-        Bazel. It does not show <code>print()</code> output in the command box, does not support
-        <code>--output=build</code>, and does not record <code>generator_function</code>; those are real-Bazel only.</p>
+        Bazel, prints <code>DEBUG</code> lines, and records <code>generator_function</code>. Its
+        <code>--output=build</code> shows the attributes you wrote, not the defaults real Bazel adds, and its paths are
+        workspace-relative.</p>
     </aside>
     <p><strong>Remember:</strong> a legacy macro is a <code>.bzl</code> function that calls
       <code>native.*</code> and loaded rules; derive every name from <code>name</code>; pass
@@ -781,8 +781,9 @@ target '//memo:peek'</code></pre>
         attribute arrives as a <code>Label</code> object, not a string.</p>
     </aside>
     <aside class="callout sim">
-      <p>The simulator does not implement <code>macro()</code> (it reports <code>name 'macro' is not defined</code>).
-        Everything in this section is real Bazel 9.3.2 output; the exercises and labs use legacy macros, which you will
+      <p>The simulator implements basic <code>macro()</code>: typed <code>attr.*</code> attributes, the naming rule, and
+        macro-private visibility. It passes <code>label</code> attributes as strings rather than <code>Label</code>
+        objects, and it does not support macro inheritance. The exercises and labs use legacy macros, which you will
         meet in nearly every existing repository.</p>
     </aside>
     <p>Which to write? For new macros shared across a big repository, symbolic macros are the recommended choice: their

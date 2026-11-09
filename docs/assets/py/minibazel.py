@@ -149,6 +149,7 @@ _PY = {
 }
 _PY_EXE = {
     **_PY,
+    **_BINARY,
     "main": "label",
     "main_module": "string",
     "interpreter_args": "string_list",
@@ -258,7 +259,7 @@ RULES: dict[str, RuleClass] = {
             "missing_toolchain_error": "string",
         },
     ),
-    "constraint_setting": _rc("constraint_setting", {"default_constraint_value": "label"}),
+    "constraint_setting": _rc("constraint_setting", {"default_constraint_value": "nodep_label"}),
     "constraint_value": _rc("constraint_value", {"constraint_setting": "label"}, mandatory=("constraint_setting",)),
     "py_library": _rc("py_library", _PY, provides=("PyInfo",), needs={"deps": _PYDEP}, macro="py_library"),
     "py_binary": _rc(
@@ -416,6 +417,10 @@ _RULE_SETS: dict[str, dict[str, str]] = {
         "BuildSettingInfo": "BuildSettingInfo",
     },
 }
+# Public names that are macros around a private rule class: query prints the rule class (verified in 9.3.2).
+_RULE_CLASS_NAMES = {"write_file": "_write_file", "copy_file": "_copy_file", "build_test": "_empty_test"}
+# Rule-set rules that are really legacy macros: their targets get generator_function = the macro's name.
+_RULE_SET_MACROS = frozenset({"py_library", "py_binary", "py_test", "write_file", "copy_file", "build_test"})
 _RULE_SET_MODULE = {
     "rules_python": "rules_python",
     "rules_go": "rules_go",
@@ -435,6 +440,7 @@ _EXTERNAL_TARGETS = {
         "cpu:aarch64": "constraint_value",
         "cpu:cpu": "constraint_setting",
         "host:host": "platform",
+        ":incompatible": "constraint_value",
     },
     "bazel_tools": {"tools/python:python_bootstrap_template.txt": "source file"},
     "rules_python": {
@@ -456,6 +462,9 @@ class Target:
     location: str = ""
     generating_rule: Label | None = None
     external: bool = False
+    macro: str = ""  # the symbolic macro instance that declared this target, if any
+    explicit: tuple[str, ...] = ()  # attribute names written at the call, in order (for --output=build)
+    stack: tuple[tuple[str, str], ...] = ()  # (location, function) of each call that declared it, outermost first
 
     @property
     def is_rule(self) -> bool:
@@ -479,7 +488,7 @@ class Target:
 
     def kind_string(self) -> str:
         """The string ``kind()`` matches and ``--output=label_kind`` prints."""
-        return f"{self.kind} rule" if self.is_rule else self.kind
+        return f"{_RULE_CLASS_NAMES.get(self.kind, self.kind)} rule" if self.is_rule else self.kind
 
     def __str__(self) -> str:
         """The target's label."""
@@ -650,7 +659,17 @@ _SAFE_BUILTINS = {
 
 
 def _starlark_print(*args: Any, sep: str = " ") -> None:
-    _CURRENT.prints.append(sep.join(str(a) for a in args))
+    import sys
+
+    msg = sep.join(str(a) for a in args)
+    _CURRENT.prints.append(msg)
+    # Bazel prints "DEBUG: <file>:<line>:<col>: <message>"; the column is that of the "(" after print
+    frame: Any = sys._getframe(1)
+    path, line = frame.f_code.co_filename, frame.f_lineno
+    text = _CURRENT.files.get(path, "").splitlines()
+    src = text[line - 1] if 0 < line <= len(text) else ""
+    col = src.find("print(") + 6 if "print(" in src else 1
+    _CURRENT.events.append(f"DEBUG: {path}:{line}:{col}: {msg}")
 
 
 def _fail(*args: Any, attr: str | None = None, sep: str = " ") -> None:
@@ -661,8 +680,12 @@ def _fail(*args: Any, attr: str | None = None, sep: str = " ") -> None:
 class _Ctx:
     """Mutable state for the file being evaluated (prints go here)."""
 
-    def __init__(self) -> None:
+    def __init__(self, files: dict[str, str] | None = None) -> None:
         self.prints: list[str] = []
+        self.events: list[str] = []  # DEBUG/WARNING lines Bazel prints while loading
+        self.files = files or {}
+        self.macro_stack: list[tuple[str, str, str]] = []  # (macro instance name, function, location) being run
+        self.package: _Package | None = None
 
 
 _CURRENT = _Ctx()
@@ -716,6 +739,120 @@ def _tb_line(exc: BaseException, path: str) -> int:
     return line
 
 
+# ------------------------------------------------------------------------------------ symbolic macros
+
+
+@dataclass
+class _AttrSpec:
+    kind: str  # "label", "label_list", "string", "string_list", "int", "bool", "string_dict", "label_keyed..."
+    mandatory: bool = False
+    default: Any = None
+    configurable: bool = True
+
+
+def _attr_module() -> _Struct:
+    def maker(kind: str) -> Any:
+        def make(
+            mandatory: bool = False, default: Any = None, configurable: bool = True, doc: str = "", **_kw: Any
+        ) -> _AttrSpec:
+            return _AttrSpec(kind, mandatory, default, configurable)
+
+        return make
+
+    kinds = ("label", "label_list", "string", "string_list", "int", "bool", "string_dict", "label_keyed_string_dict")
+    return _Struct(**{k: maker(k) for k in kinds}, output=maker("string"), output_list=maker("string_list"))
+
+
+_ATTR_TYPES = {
+    "label": (str, "string"),
+    "string": (str, "string"),
+    "label_list": (list, "list"),
+    "string_list": (list, "list"),
+    "int": (int, "int"),
+    "bool": (bool, "bool"),
+    "string_dict": (dict, "dict"),
+    "label_keyed_string_dict": (dict, "dict"),
+}
+
+
+def _starlark_repr(value: Any) -> str:
+    import json
+
+    if isinstance(value, Select):
+        return repr(value)
+    if isinstance(value, bool):
+        return "True" if value else "False"
+    if isinstance(value, str):
+        return json.dumps(value)
+    if isinstance(value, list | tuple):
+        return "[" + ", ".join(_starlark_repr(v) for v in value) + "]"
+    if isinstance(value, dict):
+        return "{" + ", ".join(f"{_starlark_repr(k)}: {_starlark_repr(v)}" for k, v in value.items()) + "}"
+    return str(value)
+
+
+class _Macro:
+    """A symbolic macro (Bazel 8+): ``macro(implementation, attrs)`` in a .bzl file."""
+
+    def __init__(self, ws: Workspace, implementation: Any, attrs: dict[str, _AttrSpec] | None) -> None:
+        self.ws = ws
+        self.implementation = implementation
+        self.attrs = dict(attrs or {})
+        self.name = ""  # the symbol it is exported as, filled in when its .bzl file finishes loading
+
+    def __call__(self, *args: Any, **kwargs: Any) -> None:
+        pkg = _CURRENT.package
+        build_file = pkg.build_file if pkg else ""
+        where = self.ws._call_location(build_file) if pkg else ""
+        if args:
+            raise _Fail(f"{where}: Error: {self.name}() does not accept positional arguments")
+        name = kwargs.pop("name", None)
+        if not isinstance(name, str) or not name:
+            raise _Fail(f"{where}: Error: missing value for mandatory attribute 'name' in '{self.name}' macro")
+        visibility = kwargs.pop("visibility", None)
+        values: dict[str, Any] = {}
+        for attr, value in kwargs.items():
+            spec = self.attrs.get(attr)
+            if spec is None:
+                raise _Fail(f"{where}: Error: no such attribute '{attr}' in '{self.name}' macro")
+            py_type, type_name = _ATTR_TYPES.get(spec.kind, (object, "value"))
+            if not isinstance(value, Select) and not isinstance(value, py_type):
+                got = {str: "string", list: "list", dict: "dict", int: "int", bool: "bool"}.get(type(value), "value")
+                raise _Fail(
+                    f"{where}: Error: expected value of type '{type_name}' for attribute '{attr}' of "
+                    f"'{self.name}', but got {_starlark_repr(value)} ({got})"
+                )
+            values[attr] = value
+        for attr, spec in self.attrs.items():
+            if attr not in values:
+                if spec.mandatory:
+                    raise _Fail(
+                        f"{where}: Error: //{pkg.name if pkg else ''}:{name}: missing value for mandatory attribute "
+                        f"'{attr}' in '{self.name}' macro"
+                    )
+                default = spec.default
+                if default is None:
+                    default = {"label_list": [], "string_list": [], "int": 0, "bool": False}.get(spec.kind)
+                    default = {} if spec.kind.endswith("dict") else default
+                    default = "" if spec.kind == "string" else default
+                values[attr] = default
+            value = values[attr]
+            package = pkg.name if pkg else ""
+            if spec.kind == "label" and isinstance(value, str):
+                value = str(parse_label(value, package))  # a Label object in real Bazel; printed the same way
+            elif spec.kind == "label_list" and isinstance(value, list):
+                value = [str(parse_label(v, package)) for v in value]
+            if spec.configurable and not isinstance(value, Select) and value is not None:
+                value = Select({"//conditions:default": value}, package=package)  # configurable: arrives as select
+            values[attr] = value
+        vis = [*(visibility or []), f"//{pkg.name if pkg else ''}:__pkg__"]
+        _CURRENT.macro_stack.append((name, self.name, where))
+        try:
+            self.implementation(name=name, visibility=vis, **values)
+        finally:
+            _CURRENT.macro_stack.pop()
+
+
 # ------------------------------------------------------------------------------------------ module
 
 
@@ -730,20 +867,82 @@ class _ModuleInfo:
     python_versions: list[str] = field(default_factory=list)
     go_versions: list[str] = field(default_factory=list)
     registered_toolchains: list[str] = field(default_factory=list)
+    hub_names: dict[str, str] = field(default_factory=dict)  # apparent hub repo -> the hub_name pip.parse gave
+    warnings: list[str] = field(default_factory=list)  # printed at the top of every command's output
+
+
+# Tag attributes of the module extensions the simulator knows (rules_go 0.65.0, rules_python 2.4.6 sources).
+_GO_SDK_COMMON = (
+    "name", "goos", "goarch", "sdks", "experiments", "urls", "patches", "patch_strip", "strip_prefix",
+    "experimental_build_compiler_from_source",
+)  # fmt: skip
+_PIP_PARSE_ATTRS = (
+    "hub_name", "python_version", "requirements_lock", "requirements_linux", "requirements_darwin",
+    "requirements_windows", "requirements_by_platform", "experimental_requirement_cycles", "extra_hub_aliases",
+    "use_hub_alias_dependencies", "experimental_extra_index_urls", "experimental_index_url",
+    "experimental_index_url_overrides", "parallel_download", "pyproject_toml", "simpleapi_skip", "target_platforms",
+    "uv_lock", "whl_modifications", "add_libdir_to_library_search_path", "download_only",
+    "enable_implicit_namespace_pkgs", "environment", "envsubst", "extra_pip_args", "isolated", "pip_data_exclude",
+    "python_interpreter", "python_interpreter_target", "quiet", "timeout", "auth_patterns", "netrc",
+)  # fmt: skip
+_TAG_ATTRS: dict[tuple[str, str], tuple[str, ...]] = {
+    ("go_sdk", "download"): (*_GO_SDK_COMMON, "version"),
+    ("go_sdk", "from_file"): (*_GO_SDK_COMMON, "go_mod", "go_work"),
+    ("go_sdk", "host"): ("name", "version", "experiments"),
+    ("go_sdk", "nogo"): ("nogo", "includes", "excludes"),
+    ("go_sdk", "wrap"): ("root_file", "root_files", "version", "experiments", "goos", "goarch"),
+    ("pip", "parse"): _PIP_PARSE_ATTRS,
+    ("python", "toolchain"): ("configure_coverage_tool", "ignore_root_user_error", "is_default", "python_version"),
+}
+
+
+def _module_call_location(name: str = "") -> tuple[int, int, str]:
+    """(line, column of the call's '(' , source line) of the MODULE.bazel statement being evaluated."""
+    import sys
+
+    frame: Any = sys._getframe(1)
+    line = 1
+    while frame is not None:
+        if frame.f_code.co_filename == "MODULE.bazel":
+            line = frame.f_lineno
+            break
+        frame = frame.f_back
+    text = _MODULE_SOURCE[0].splitlines()
+    src = text[line - 1] if 0 < line <= len(text) else ""
+    col = src.find(name + "(") + len(name) + 1 if name and name + "(" in src else src.find("(") + 1
+    return line, max(col, 1), src.strip()
+
+
+_MODULE_SOURCE = [""]
 
 
 class _Extension:
-    def __init__(self, module: _ModuleInfo, bzl: str, name: str) -> None:
+    def __init__(self, module: _ModuleInfo, bzl: str, name: str, location: str = "MODULE.bazel") -> None:
         self._module = module
         self._bzl = bzl
         self._name = name
         self.declared: set[str] = set()
+        self._location = location
 
     def __getattr__(self, tag: str) -> Any:
         if tag.startswith("_"):
             raise AttributeError(tag)
 
         def call(**kw: Any) -> None:
+            allowed = _TAG_ATTRS.get((self._name, tag))
+            if allowed is not None:
+                import difflib
+
+                for attr in kw:
+                    if attr not in allowed:
+                        line, col, src = _module_call_location(tag)
+                        close = difflib.get_close_matches(attr, allowed, n=1, cutoff=0.6)
+                        hint = f" (did you mean '{close[0]}'?)" if close else ""
+                        raise BazelError(
+                            "ERROR: Traceback (most recent call last):\n"
+                            f'\tFile "MODULE.bazel", line {line}, column {col}, in <toplevel>\n\t\t{src}\n'
+                            f"Error: in '{tag}' tag, unknown attribute '{attr}' provided{hint}"
+                        )
             if self._bzl.endswith("pip.bzl") and tag == "parse":
                 hub = kw.get("hub_name")
                 lock = kw.get("requirements_lock") or kw.get("requirements_linux") or kw.get("requirements_darwin")
@@ -752,14 +951,19 @@ class _Extension:
                 if not lock:
                     raise _Fail("pip.parse: one of 'requirements_lock' or a platform-specific lock file is required")
                 self._module.pip_hubs[hub] = str(lock)
+                self._module.hub_names[hub] = str(hub)
                 self.declared.add(hub)
+                if hub == "pypi":
+                    own = self._module.name
+                    self._module.warnings.append(
+                        "DEBUG: /…/external/rules_python+/python/private/pypi/extension.bzl:397:26: WARNING: The "
+                        f"PyPI hub name 'pypi' is reserved (module '{own}'). Please rename your hub, otherwise a "
+                        f"future release will rename it to '{own}_pypi'."
+                    )
             elif self._bzl.endswith("python.bzl") and tag == "toolchain":
                 self._module.python_versions.append(str(kw.get("python_version", "")))
             elif self._bzl.endswith("extensions.bzl") and tag == "download" and "go" in self._bzl:
                 self._module.go_versions.append(str(kw.get("version", "")))
-                self.declared.add("go_sdk")
-            elif tag in ("from_file", "host"):
-                self.declared.add("go_sdk")
 
         return call
 
@@ -776,6 +980,7 @@ class _Package:
     default_testonly: bool = False
     errors: list[str] = field(default_factory=list)
     prints: list[str] = field(default_factory=list)
+    events: list[str] = field(default_factory=list)
 
 
 class Workspace:
@@ -815,6 +1020,8 @@ class Workspace:
             raise BazelError(f"ERROR: {exc}") from exc
         mod = self.module
         seen_module = [False]
+        dep_locations: dict[str, str] = {}
+        _MODULE_SOURCE[0] = source
 
         def module(name: str = "", version: str = "", **_: Any) -> None:
             if seen_module[0]:
@@ -830,8 +1037,13 @@ class Workspace:
             if not version and name not in ("platforms", "bazel_skylib"):
                 pass
             apparent = repo_name if repo_name is not None else name
+            line, col, _src = _module_call_location("bazel_dep")
             if apparent in mod.deps:
-                raise _Fail(f"The repo name '{apparent}' is already being used by another bazel_dep")
+                raise _Fail(
+                    f"Error in bazel_dep: The repo name '{apparent}' cannot be defined by a bazel_dep at "
+                    f"MODULE.bazel:{line}:{col} as it is already defined by a bazel_dep at {dep_locations[apparent]}"
+                )
+            dep_locations[apparent] = f"MODULE.bazel:{line}:{col}"
             mod.deps[apparent] = name
             if dev_dependency:
                 mod.dev_deps.add(apparent)
@@ -843,22 +1055,27 @@ class Workspace:
                     f"Unable to find package for @[unknown repo '{repo}' requested from @@]{bzl[len(repo) + 1 :]}: "
                     f"No repository visible as '@{repo}' from main repository."
                 )
-            return _Extension(mod, bzl, name)
+            line, col, _src = _module_call_location("use_extension")
+            return _Extension(mod, bzl, name, f"MODULE.bazel:{line}:{col}")
 
         def use_repo(ext: _Extension, *names: str, **aliases: str) -> None:
-            for n in names:
-                if n not in ext.declared and not (n == "go_sdk"):
-                    raise _Fail(
-                        f'module extension "{ext._name}" from "{ext._bzl}" does not generate repository '
-                        f'"{n}", yet it is imported as "{n}" in the usage at MODULE.bazel'
-                    )
-                mod.repos[n] = ext._name
-            for alias, n in aliases.items():
+            for alias, n in [*[(n, n) for n in names], *aliases.items()]:
                 if n not in ext.declared:
-                    raise _Fail(f'module extension "{ext._name}" does not generate repository "{n}"')
+                    if ext._name == "pip":
+                        # the pip extension runs only when a build needs the repository; until then a wrong name
+                        # simply leaves @alias invisible ("No repository visible as '@alias'")
+                        continue
+                    repo = ext._bzl[1:].split("//", 1)[0] if ext._bzl.startswith("@") else ""
+                    module_name = mod.deps.get(repo, repo)
+                    canon = f"@@{module_name}+//{ext._bzl.split('//', 1)[1]}" if repo else ext._bzl
+                    raise BazelError(
+                        f'ERROR: module extension {canon}%{ext._name} does not generate repository "{n}", yet it '
+                        f'is imported as "{alias}" in the usage at {ext._location}'
+                    )
                 mod.repos[alias] = ext._name
                 if n in mod.pip_hubs:
                     mod.pip_hubs[alias] = mod.pip_hubs[n]
+                    mod.hub_names[alias] = n
 
         def register_toolchains(*labels: str, **_: Any) -> None:
             mod.registered_toolchains.extend(labels)
@@ -953,14 +1170,27 @@ class Workspace:
         _check_starlark(tree, path, build_file=True)
         global _CURRENT
         saved = _CURRENT
-        _CURRENT = _Ctx()
+        _CURRENT = _Ctx(self.files)
+        _CURRENT.package = pkg
         try:
             env = self._build_env(pkg, path)
             _Exec.run(source, path, env)
         finally:
             pkg.prints.extend(_CURRENT.prints)
+            pkg.events.extend(_CURRENT.events)
             _CURRENT = saved
         self._attach_source_files(pkg)
+        # a rule named like one of its own outputs builds, but Bazel warns (verified wording)
+        for name, rule in list(pkg.targets.items()):
+            if rule.is_rule and rule.rule_class is not None:
+                for attr, akind in rule.rule_class.attrs.items():
+                    outs = rule.attrs.get(attr) if akind in ("output", "output_list") else None
+                    outs = [outs] if isinstance(outs, str) else outs if isinstance(outs, list) else []
+                    if name in outs:
+                        pkg.events.append(
+                            f"WARNING: {rule.location}: target '{name}' is both a rule and a file; please choose "
+                            "another name for the rule"
+                        )
 
     def _attach_source_files(self, pkg: _Package) -> None:
         """Create source-file targets for every file a rule in the package references (as Bazel does)."""
@@ -1011,6 +1241,50 @@ class Workspace:
             col = text[line - 1].index("(") + 1
         return f"{build_file}:{line}:{col}"
 
+    def _call_stack(self, build_file: str) -> tuple[tuple[str, str], ...]:
+        """(location, function) for each BUILD/.bzl frame of the current declaration, outermost first."""
+        import sys
+
+        frame: Any = sys._getframe(2)
+        chain: list[Any] = []
+        while frame is not None:
+            name = frame.f_code.co_filename
+            if name == build_file or (name.endswith(".bzl") and name in self.files):
+                chain.append(frame)
+            frame = frame.f_back
+        out = []
+        for f in reversed(chain):
+            text = self.files.get(f.f_code.co_filename, "").splitlines()
+            line = f.f_lineno
+            src = text[line - 1] if 0 < line <= len(text) else ""
+            col = src.index("(") + 1 if "(" in src else 1
+            fn = f.f_code.co_name
+            out.append((f"{f.f_code.co_filename}:{line}:{col}", "<toplevel>" if fn == "<module>" else fn))
+        return tuple(out)
+
+    def _generator(self, build_file: str, kind: str) -> tuple[str, str, str] | None:
+        """(generator_name, generator_function, generator_location) for a target declared through a macro.
+
+        Bazel records the outermost legacy macro called from the BUILD file; rule-set wrappers such as py_binary
+        count as macros too. A target declared directly in the BUILD file has none.
+        """
+        import sys
+
+        frame: Any = sys._getframe(2)
+        chain: list[Any] = []
+        while frame is not None:
+            chain.append(frame)
+            frame = frame.f_back
+        chain.reverse()  # outermost first
+        for i, f in enumerate(chain):
+            if f.f_code.co_filename == build_file and i + 1 < len(chain):
+                nxt = chain[i + 1]
+                fn = nxt.f_code.co_name
+                if nxt.f_code.co_filename.endswith(".bzl") and not fn.startswith("<"):
+                    name = nxt.f_locals.get("name", "")
+                    return str(name), fn, self._call_location(build_file)
+        return None
+
     def _crosses_subpackage(self, package: str, name: str) -> bool:
         path = f"{package}/{name}" if package else name
         return self.package_of_path(path) != package
@@ -1023,7 +1297,21 @@ class Workspace:
                 where = self._call_location(pkg.build_file)
                 if args:
                     raise _Fail(f"{where}: Error in {kind}: {kind}() does not accept positional arguments")
+                generator = _CURRENT.macro_stack[0] if _CURRENT.macro_stack else self._generator(pkg.build_file, kind)
+                if _CURRENT.macro_stack and "visibility" not in kwargs:
+                    kwargs = {**kwargs, "visibility": ["//visibility:private"]}  # private to the macro
                 self._declare(pkg, kind, kwargs, where)
+                target = pkg.targets.get(kwargs.get("name"))  # type: ignore[arg-type]
+                if target is not None:
+                    target.explicit = tuple(k for k in kwargs if k != "name")
+                    target.stack = self._call_stack(pkg.build_file)
+                    if _CURRENT.macro_stack:
+                        target.macro = _CURRENT.macro_stack[-1][0]
+                    if generator is not None:
+                        gen_name, gen_fn, gen_loc = generator
+                        target.attrs.setdefault("generator_name", gen_name)
+                        target.attrs.setdefault("generator_function", gen_fn)
+                        target.attrs.setdefault("generator_location", gen_loc)
 
             create.__name__ = kind
             return create
@@ -1163,7 +1451,11 @@ class Workspace:
             scope = _Exec.run(source, file_path, env)
         finally:
             self._bzl_stack.pop()
-        return {k: v for k, v in scope.items() if k not in env or env[k] is not v}
+        exported = {k: v for k, v in scope.items() if k not in env or env[k] is not v}
+        for k, v in exported.items():
+            if isinstance(v, _Macro) and not v.name:
+                v.name = k
+        return exported
 
     def _bzl_env(self, pkg: _Package, path: str, bzl_package: str) -> dict[str, Any]:
         native = self._native_functions(pkg, path)
@@ -1173,6 +1465,8 @@ class Workspace:
         env["Label"] = lambda s: str(parse_label(s, bzl_package))
         env["depset"] = lambda direct=None, **k: list(direct or [])
         env["native"] = _Struct(**{k: v for k, v in native.items() if not k.startswith("_")})
+        env["attr"] = _attr_module()
+        env["macro"] = lambda implementation, attrs=None, doc="", **_kw: _Macro(self, implementation, attrs)
 
         def load(module: str, *symbols: str, **aliases: str) -> None:
             loaded = self._load_bzl(module, _Package(bzl_package, path), path)
@@ -1215,7 +1509,13 @@ class Workspace:
         for attr, value in kwargs.items():
             attrs[attr] = self._coerce(kind, name, attr, rc.attrs[attr], value, pkg.name, path)
         if "visibility" not in attrs:
-            attrs["visibility"] = list(pkg.default_visibility)
+            # config_setting is visible to everyone unless it says otherwise (Bazel: config_setting_visibility_policy)
+            attrs["visibility"] = ["//visibility:public"] if kind == "config_setting" else list(pkg.default_visibility)
+        if kind in _RULE_SET_MACROS:
+            # rules_python and skylib wrap these rules in a legacy macro of the same name
+            attrs.setdefault("generator_name", name)
+            attrs.setdefault("generator_function", kind)
+            attrs.setdefault("generator_location", path)
         if "testonly" not in attrs:
             attrs["testonly"] = rc.test or pkg.default_testonly
         if rc.test:
@@ -1273,6 +1573,17 @@ class Workspace:
                             f"{where}: invalid label '{item}' in element {index} of attribute 'visibility' of "
                             f"'{kind}': invalid label '{item}': package name cannot contain '...'"
                         )
+            for index, item in enumerate(items):
+                if isinstance(item, Select):
+                    raise _Fail(
+                        f"{where}: expected value of type 'string' for element {index} of attribute '{attr}' of "
+                        f"'{kind}', but got {_select_repr(item)} (select)"
+                    )
+                if item is None and akind in ("label_list", "string_list"):
+                    raise _Fail(
+                        f"{where}: expected value of type 'string' for element {index} of attribute '{attr}' of "
+                        f"'{kind}', but got None (NoneType)"
+                    )
             if akind == "label_list":
                 for item in items:
                     try:
@@ -1292,10 +1603,10 @@ class Workspace:
                     if not isinstance(item, str) or item.startswith((":", "//", "@")):
                         raise _Fail(f"{where}: in {attr} attribute: output '{item}' must be a file name, not a label")
             return items
-        if akind in ("label", "output", "string"):
+        if akind in ("label", "output", "string", "nodep_label"):
             if not isinstance(value, str):
                 raise _Fail(f"{where}: expected value of type 'string' for attribute '{attr}' in '{kind}' rule")
-            if akind == "label":
+            if akind in ("label", "nodep_label"):
                 try:
                     parse_label(value, package)
                 except BazelError as exc:
@@ -1371,18 +1682,20 @@ class Workspace:
                 f"No repository visible as '@{label.repo}' from main repository"
             )
         if label.repo in self.module.pip_hubs:
-            wanted = _normalize_dist(label.package)
-            if label.name not in (label.package, "pkg", "whl", "data", "dist_info"):
-                raise BazelError(f"no such target '{label}'")
             available = self.pip_packages(label.repo)
-            if wanted not in available:
+            if label.package not in available:  # labels must use the normalized name exactly
+                hub = f"@@rules_python++pip+{self.module.hub_names.get(label.repo, label.repo)}"
                 raise BazelError(
-                    f"no such package '@@rules_python++pip+{label.repo}//{label.package}': BUILD file not found in "
-                    f"directory '{label.package}' of external repository @@rules_python++pip+{label.repo}. "
-                    f"('{label.package}' is not in {self.module.pip_hubs[label.repo]}; add it to your requirements "
-                    "and re-lock.)"
+                    f"no such package '{hub}//{label.package}': BUILD file not found in directory "
+                    f"'{label.package}' of external repository {hub}. Add a BUILD file to a directory to mark it "
+                    "as a package."
                 )
-            return Target(label, "py_library", {"visibility": ["//visibility:public"]}, external=True)
+            if label.name not in (label.package, *_PIP_HUB_TARGETS):
+                raise BazelError(
+                    f"no such target '{label}': target '{label.name}' not declared in package '{label.package}'"
+                )
+            kind = "py_library" if label.name in (label.package, "pkg") else "filegroup"
+            return Target(label, kind, {"visibility": ["//visibility:public"]}, external=True)
         module_name = self.module.deps.get(label.repo, label.repo)
         known = _EXTERNAL_TARGETS.get(module_name, {})
         key = f"{label.package}:{label.name}"
@@ -1415,6 +1728,19 @@ class Workspace:
     def all_targets(self, package: str) -> list[Target]:
         """Every target (rules and files) in a loaded package."""
         return list(self.package(package).targets.values())
+
+
+# What each package of a pip hub declares besides <name> itself (rules_python 2.4.6, `bazel query @pypi//pytest:all`).
+_PIP_HUB_TARGETS = (
+    "_no_matching_repository",
+    "data",
+    "dist_info",
+    "extracted_whl_files",
+    "pkg",
+    "srcs",
+    "whl",
+    "whl_file",
+)
 
 
 def _caller_globals() -> dict[str, Any]:
@@ -1517,6 +1843,16 @@ class Config:
     keep_going: bool = False
     values: dict[str, str] = field(default_factory=dict)
 
+    def is_default(self) -> bool:
+        """True for the configuration of a plain ``bazel build`` on the host (no options that change outputs)."""
+        return (
+            self.compilation_mode == "fastbuild"
+            and not self.defines
+            and not self.flags
+            and self.platform in ("@platforms//host", "@platforms//host:host", "@@platforms//host:host")
+            and self.host_os == "linux"
+        )
+
     @classmethod
     def parse(cls, args: list[str], ws: Workspace | None = None) -> tuple[Config, list[str]]:
         """Split command-line arguments into a Config and the remaining (non-flag) arguments."""
@@ -1545,9 +1881,12 @@ class Config:
             if a in ("-c",) or a.startswith("--compilation_mode"):
                 cfg.compilation_mode = take()
                 if cfg.compilation_mode not in ("fastbuild", "dbg", "opt"):
+                    spelled = (
+                        f"-c {cfg.compilation_mode}" if a == "-c" else f"--compilation_mode={cfg.compilation_mode}"
+                    )
                     raise BazelError(
-                        f"While parsing option --compilation_mode={cfg.compilation_mode}: Not a valid compilation "
-                        "mode: (should be dbg, opt or fastbuild)"
+                        f"While parsing option {spelled}: Not a valid compilation mode: '{cfg.compilation_mode}' "
+                        "(should be fastbuild, dbg or opt)"
                     )
                 cfg.values["compilation_mode"] = cfg.compilation_mode
             elif a.startswith("--define"):
@@ -1568,10 +1907,21 @@ class Config:
             elif a.startswith("--//") or a.startswith("--@"):
                 body = a[2:]
                 key, eq, val = body.partition("=")
-                value: Any = val if eq else "true"
-                cfg.flags[str(parse_label(key))] = value
+                kind, canon = _build_setting(ws, key)
+                if not eq:
+                    if kind not in ("bool_flag", "bool_setting"):
+                        if i + 1 >= len(args) or args[i + 1].startswith("-"):
+                            raise BazelError(f"{a} :: Expected value after {a}")
+                        i += 1
+                        val = args[i]
+                    else:
+                        val = "true"
+                cfg.flags[canon] = _flag_value(kind, key, val)
             elif a.startswith("--no//") or a.startswith("--no@"):
-                cfg.flags[str(parse_label(a[4:]))] = "false"
+                kind, canon = _build_setting(ws, a[4:])
+                if kind not in ("bool_flag", "bool_setting", ""):
+                    raise BazelError(f"{a[4:]} :: Illegal use of 'no' prefix on non-boolean option: {a[4:]}")
+                cfg.flags[canon] = "false"
             elif a.startswith("-") and a[1:2] in ("/", "@", ":"):
                 raise BazelError(f"Invalid options syntax: {a}")
             elif a.startswith("-"):
@@ -1588,6 +1938,48 @@ class Config:
             i += 1
         cfg.values.setdefault("compilation_mode", cfg.compilation_mode)
         return cfg, rest
+
+
+def _build_setting(ws: Workspace | None, text: str) -> tuple[str, str]:
+    """(rule kind, canonical label) of a ``--//pkg:flag`` option; errors like Bazel for unknown labels."""
+    try:
+        label = parse_label(text)
+    except BazelError as exc:
+        raise BazelError(f"{text} :: Error loading option {text}: {exc}") from exc
+    if ws is None:
+        return "", str(label)
+    try:
+        target = ws.target(label)
+    except BazelError as exc:
+        raise BazelError(f"{text} :: Error loading option {text}: {exc}") from exc
+    if target.kind == "external target":
+        return "", str(target.label)
+    if target.kind not in ("bool_flag", "string_flag", "bool_setting", "string_setting"):
+        raise BazelError(f"{text} :: Unrecognized option: {text}")
+    return target.kind, str(target.label)
+
+
+def _flag_value(kind: str, key: str, value: str) -> str:
+    """A build setting's command-line value; bool flags accept true/false/yes/no/1/0 (any case), as Bazel does."""
+    if kind in ("bool_flag", "bool_setting"):
+        low = value.lower()
+        if low in ("true", "yes", "1"):
+            return "true"
+        if low in ("false", "no", "0"):
+            return "false"
+        raise BazelError(f"While parsing option {key}={value}: '{value}' is not a boolean")
+    return value
+
+
+# Commands whose .bazelrc sections apply, in order (verified in Bazel 9.3.2: cquery reads test lines, query reads
+# no build lines). A later section beats an earlier one for the same option, whatever the order in the file.
+_RC_INHERITANCE = {
+    "build": ("common", "build"),
+    "run": ("common", "build", "run"),
+    "test": ("common", "build", "test"),
+    "cquery": ("common", "build", "test", "cquery"),
+    "query": ("common", "query"),
+}
 
 
 # Options the simulator accepts and ignores beyond recording them for config_setting(values = ...). Anything else
@@ -1662,26 +2054,35 @@ def _expand_bazelrc(ws: Workspace, args: list[str]) -> list[str]:
             continue
         cmd, *opts = raw.split()
         lines.setdefault(cmd, []).extend(opts)
-    command = ws._current_command
-    inherited = {"build": ["common", "build"], "test": ["common", "build", "test"], "query": ["common", "query"]}
-    inherited["cquery"] = ["common", "build", "cquery"]
-    prefix: list[str] = []
-    for section in inherited.get(command, ["common"]):
-        prefix.extend(lines.get(section, []))
+    sections = _RC_INHERITANCE.get(ws._current_command, ("common",))
     out: list[str] = []
-    for a in [*prefix, *args]:
-        if a.startswith("--config"):
-            name = a.split("=", 1)[1] if "=" in a else ""
-            found = False
-            for section in inherited.get(command, ["common"]):
-                extra = lines.get(f"{section}:{name}")
-                if extra:
-                    out.extend(extra)
-                    found = True
-            if not found:
-                raise BazelError(f"Config value '{name}' is not defined in any .rc file")
-        else:
-            out.append(a)
+
+    def expand(items: list[str], depth: int) -> None:
+        i = 0
+        while i < len(items):
+            a = items[i]
+            if a == "--config" and i + 1 < len(items):
+                i += 1
+                a = "--config=" + items[i]
+            if a.startswith("--config="):
+                name = a.split("=", 1)[1]
+                if depth > 10:
+                    raise BazelError(f"Config expansion has a cycle: config value {name} expands to itself.")
+                found = False
+                # --config=name expands in place, section by section in inheritance order
+                for section in sections:
+                    if f"{section}:{name}" in lines:
+                        expand(lines[f"{section}:{name}"], depth + 1)
+                        found = True
+                if not found:
+                    raise BazelError(f"Config value '{name}' is not defined in any .rc file")
+            else:
+                out.append(a)
+            i += 1
+
+    for section in sections:
+        expand(lines.get(section, []), 0)
+    expand(list(args), 0)
     return out
 
 
@@ -1698,6 +2099,8 @@ class _Analyzer:
         self.done: set[Label] = set()
         self.stack: list[Label] = []
         self.missing_inputs: list[str] = []
+        self._incompatible: dict[Label, list[tuple[Label, str]] | None] = {}
+        self._platform_cache: set[str] | None = None
 
     def resolve(self, target: Target, attr: str) -> Any:
         """The attribute value in this configuration."""
@@ -1735,7 +2138,15 @@ class _Analyzer:
                     f"in {attr} attribute of {target.kind} rule {target.label}: '{label}' does not have mandatory "
                     "providers: 'ConfigMatchingProvider'"
                 )
-            if self._matches(cond):
+            try:
+                hit = self._matches(cond)
+            except BazelError as exc:
+                if "in string_flag rule" not in str(exc):
+                    raise
+                raise BazelError(
+                    f"{exc}\nERROR: {target.location}: errors encountered resolving select() keys for {target.label}"
+                ) from exc
+            if hit:
                 matching.append((label, cond))
         if not matching:
             if "//conditions:default" in conditions:
@@ -1772,7 +2183,8 @@ class _Analyzer:
         for k, v in (cond.attrs.get("define_values") or {}).items():
             out.add(("define", f"{k}={v}"))
         for k, v in (cond.attrs.get("flag_values") or {}).items():
-            out.add(("flag", f"{k}={v}"))
+            # keys are labels: ":env" and "//config:env" in package config are the same setting
+            out.add(("flag", f"{parse_label(k, cond.label.package)}={str(v).lower()}"))
         for c in cond.attrs.get("constraint_values") or []:
             out.add(("constraint", str(parse_label(c, cond.label.package))))
         return out
@@ -1800,9 +2212,117 @@ class _Analyzer:
             constraints.add(str(parse_label(c, label.package)))
         return constraints
 
+    def has_constraint(self, value: str) -> bool:
+        """Whether the target platform has constraint ``value`` (a canonical label), counting setting defaults."""
+        if value in ("@platforms//:incompatible",):
+            return False
+        if self._platform_cache is None:
+            self._platform_cache = self.platform_constraints()
+        have = self._platform_cache
+        if value in have:
+            return True
+        # a constraint_setting's default_constraint_value applies when the platform sets no value for it
+        try:
+            cv = self.ws.target(value)
+        except BazelError:
+            return False
+        if cv.kind != "constraint_value" or cv.external:
+            return False
+        setting_text = cv.attrs.get("constraint_setting")
+        if not setting_text:
+            return False
+        setting_label = parse_label(setting_text, cv.label.package)
+        try:
+            setting = self.ws.target(setting_label)
+        except BazelError:
+            return False
+        default = setting.attrs.get("default_constraint_value")
+        if not default or parse_label(default, setting_label.package) != cv.label:
+            return False
+        for other in have:
+            try:
+                t = self.ws.target(other)
+            except BazelError:
+                continue
+            if t.kind == "constraint_value" and not t.external:
+                s2 = t.attrs.get("constraint_setting")
+                if s2 and parse_label(s2, t.label.package) == setting_label:
+                    return False
+        return True
+
+    def platform_label(self) -> str:
+        """The target platform as real Bazel prints it in messages (canonical, ``@@`` for other repositories)."""
+        if self.cfg.platform in ("@platforms//host", "@platforms//host:host", "@@platforms//host:host"):
+            return "@@platforms//host:host"
+        return _canonical(parse_label(self.cfg.platform))
+
+    def config_id(self, target: Target, length: int = 6) -> str:
+        """A short configuration id: real Bazel's for the default host configuration, a stable stand-in otherwise."""
+        test = bool(target.rule_class and target.rule_class.test)
+        if self.cfg.is_default():
+            return ("e722a217" if test else "a7a71fd8")[:length]
+        import hashlib
+
+        key = repr(sorted(self.cfg.values.items())) + repr(sorted(self.cfg.flags.items())) + self.cfg.platform
+        key += repr(sorted(self.cfg.defines.items())) + ("test" if test else "")
+        return hashlib.sha256(key.encode()).hexdigest()[:length]
+
+    def incompatible(self, label: Label) -> list[tuple[Label, str]] | None:
+        """The dependency chain that makes ``label`` incompatible with the target platform, or None.
+
+        Each entry is (label, reason); only the last has a reason (the constraint that was not met).
+        """
+        if label in self._incompatible:
+            return self._incompatible[label]
+        self._incompatible[label] = None  # cycles are reported elsewhere
+        result: list[tuple[Label, str]] | None = None
+        try:
+            target = self.ws.target(label)
+        except BazelError:
+            return None
+        if target.kind == "generated file" and target.generating_rule is not None:
+            result = self.incompatible(target.generating_rule)
+        elif target.is_rule and target.rule_class is not None:
+            try:
+                wanted = self.resolve(target, "target_compatible_with") or []
+            except BazelError:
+                wanted = []
+            for c in wanted:
+                canon = parse_label(c, label.package)
+                if not self.has_constraint(str(canon)):
+                    reason = f"target platform ({self.platform_label()}) didn't satisfy constraint {_canonical(canon)}"
+                    result = [(label, reason)]
+                    break
+            if result is None:
+                try:
+                    edges = self.edges(target)
+                except BazelError:
+                    edges = []
+                for attr, dep in edges:
+                    if attr == "$config_conditions":
+                        continue
+                    chain = self.incompatible(dep)
+                    if chain:
+                        result = [(label, ""), *chain]
+                        break
+        self._incompatible[label] = result
+        return result
+
+    def incompatible_message(self, label: Label) -> str:
+        """Bazel's error for an explicitly requested incompatible target."""
+        chain = self.incompatible(label) or []
+        lines = []
+        for lbl, reason in chain:
+            line = f"    {lbl} ({self.config_id(self.ws.target(lbl), 6)})"
+            lines.append(f"{line}   <-- {reason}" if reason else line)
+        return (
+            f"Analysis of target '{label}' failed; build aborted: Target {label} is incompatible and cannot be "
+            "built, but was explicitly requested.\nDependency chain:\n" + "\n".join(lines)
+        )
+
     def _matches(self, cond: Target) -> bool:
         if cond.kind == "constraint_value" or (cond.external and cond.kind == "constraint_value"):
-            return str(cond.label) in self.platform_constraints()
+            return self.has_constraint(str(cond.label))
         pkg = cond.label.package
         for k, v in (cond.attrs.get("values") or {}).items():
             have = self.cfg.values.get(k)
@@ -1821,7 +2341,8 @@ class _Analyzer:
         for k, v in (cond.attrs.get("flag_values") or {}).items():
             flag_label = parse_label(k, pkg)
             setting = self.ws.target(flag_label)
-            current = self.cfg.flags.get(str(flag_label))
+            self._check_flag_value(setting)
+            current = self.cfg.flags.get(str(setting.label))
             if current is None:
                 default = setting.attrs.get("build_setting_default")
                 current = (
@@ -1831,13 +2352,25 @@ class _Analyzer:
                     current = self.ws.module.python_versions[0] if self.ws.module.python_versions else ""
             if str(current).lower() != str(v).lower():
                 return False
-        constraints = cond.attrs.get("constraint_values") or []
-        if constraints:
-            have = self.platform_constraints()
-            for c in constraints:
-                if str(parse_label(c, pkg)) not in have:
-                    return False
+        for c in cond.attrs.get("constraint_values") or []:
+            if not self.has_constraint(str(parse_label(c, pkg))):
+                return False
         return True
+
+    def _check_flag_value(self, setting: Target) -> None:
+        """bazel_skylib's string_flag fails analysis for a value outside ``values`` (verified wording)."""
+        allowed = setting.attrs.get("values")
+        value = self.cfg.flags.get(str(setting.label))
+        if setting.kind != "string_flag" or not allowed or value is None or value in allowed:
+            return
+        shown = "[" + ", ".join(f'"{v}"' for v in allowed) + "]"
+        raise BazelError(
+            f"{setting.location}: in string_flag rule {setting.label}: \nTraceback (most recent call last):\n"
+            '\tFile "/…/external/bazel_skylib+/rules/common_settings.bzl", line 157, column 13, in _string_impl\n'
+            '\t\tfail("Error setting " + _no_at_str(ctx.label) + ": invalid value \'" + value + "\'. Allowed '
+            'values are " + str(allowed_values))\n'
+            f"Error in fail: Error setting {setting.label}: invalid value '{value}'. Allowed values are {shown}"
+        )
 
     # ---------------------------------------------------------------- dependency edges
 
@@ -1899,6 +2432,14 @@ class _Analyzer:
             return
         rc = target.rule_class
         if rc is None:
+            return
+        if target.macro and not _macro_name_ok(target.name, target.macro):
+            self.errors.append(
+                f"{target.location}: in {target.kind} rule {target.label}: Target {target.label} declared in symbolic "
+                f"macro '{target.macro}' violates macro naming rules and cannot be built. Name must be the same as "
+                "the macro's name, or the macro's name followed by '_' (recommended), '-', or '.', and a non-empty "
+                "string."
+            )
             return
         try:
             edges = self.edges(target)
@@ -2023,10 +2564,16 @@ class _Analyzer:
 
     def visible(self, dep: Target, user: Target) -> bool:
         """Bazel's visibility check: may ``user`` depend on ``dep``?"""
+        owner = dep
+        if dep.kind == "generated file" and dep.generating_rule is not None:
+            owner = self.ws.target(dep.generating_rule)
+        if owner.macro and owner.macro != user.macro and not dep.external:
+            # a symbolic macro's targets are private to the macro, even within the package (verified in 9.3.2)
+            vis = owner.attrs.get("visibility") or ["//visibility:private"]
+            return self._allowed(vis, owner.label.package, user.label.package, set())
         if dep.external or dep.label.package == user.label.package:
             return True
-        if dep.kind == "generated file" and dep.generating_rule is not None:
-            dep = self.ws.target(dep.generating_rule)
+        dep = owner
         if dep.kind == "source file":
             vis = dep.attrs.get("visibility")
             if vis is None:
@@ -2081,6 +2628,11 @@ class _Analyzer:
 
     def _rule_specific(self, target: Target) -> None:
         where = target.location
+        if target.kind == "string_flag":
+            try:
+                self._check_flag_value(target)
+            except BazelError as exc:
+                self.errors.append(str(exc))
         if target.kind in ("py_binary", "py_test"):
             srcs = self.resolve(target, "srcs") or []
             main = self.resolve(target, "main")
@@ -2118,6 +2670,8 @@ class _Analyzer:
                 )
         if target.kind == "genrule":
             self._check_make_vars(target)
+        elif target.rule_class is not None and target.kind != "genrule":
+            self._check_location_attrs(target)
         if target.kind in ("go_binary", "go_test", "go_library"):
             srcs = self.resolve(target, "srcs") or []
             embed = self.resolve(target, "embed") or []
@@ -2136,6 +2690,154 @@ class _Analyzer:
 
         return any(version == v or minor(version) == v or version == minor(v) for v in registered)
 
+    _PREREQ_ATTRS = ("srcs", "deps", "data", "tools", "tool", "embed")
+
+    def _prerequisites(self, target: Target) -> set[str]:
+        pkg = target.label.package
+        out: set[str] = set()
+        for attr in self._PREREQ_ATTRS:
+            if target.rule_class is None or attr not in target.rule_class.attrs:
+                continue
+            value = self.resolve(target, attr)
+            if value is None:
+                continue
+            for item in [value] if isinstance(value, str) else value:
+                try:
+                    out.add(str(parse_label(item, pkg)))
+                except BazelError:
+                    pass
+        for attr in ("outs", "out"):
+            value = target.attrs.get(attr)
+            if isinstance(value, str):
+                out.add(str(Label("", pkg, value)))
+            elif isinstance(value, list):
+                out.update(str(Label("", pkg, o)) for o in value)
+        return out
+
+    def _location_refs(self, text: str) -> list[tuple[str, str]]:
+        return [
+            (m.group(1), m.group(2).strip())
+            for m in re.finditer(
+                r"\$\((location|locations|execpath|execpaths|rootpath|rootpaths|rlocationpath|rlocationpaths)"
+                r"\s+([^)]+)\)",
+                text,
+            )
+        ]
+
+    def _check_location_attrs(self, target: Target) -> None:
+        """$(location)-style variables in ``args`` and ``env`` must name a declared prerequisite (verified wording)."""
+        rc = target.rule_class
+        if rc is None:
+            return
+        pkg = target.label.package
+        texts: list[tuple[str, str]] = []
+        args = self.resolve(target, "args") if "args" in rc.attrs else None
+        texts.extend(("args", a) for a in args or [] if isinstance(a, str))
+        env = self.resolve(target, "env") if "env" in rc.attrs else None
+        texts.extend((f"env[{k}]", v) for k, v in (env or {}).items() if isinstance(v, str))
+        if not texts:
+            return
+        prereq: set[str] | None = None
+        suffix = (
+            f". Since this rule was created by the macro '{rc.macro}', the error might have been caused by the "
+            "macro implementation"
+            if rc.macro
+            else ""
+        )
+        for attr, text in texts:
+            for _fn, ref in self._location_refs(text):
+                if prereq is None:
+                    prereq = self._prerequisites(target)
+                try:
+                    label = str(parse_label(ref, pkg))
+                except BazelError as exc:
+                    self.errors.append(f"{target.location}: {exc}")
+                    continue
+                if label not in prereq:
+                    # Starlark rules (run_binary) expand with ctx.expand_location: no attribute in the message
+                    where = (
+                        f"in {target.kind} rule {target.label}"
+                        if target.kind == "run_binary"
+                        else f"in {attr} attribute of {target.kind} rule {target.label}"
+                    )
+                    self.errors.append(
+                        f"{target.location}: {where}: label '{label}' in $(location) expression is not a declared "
+                        f"prerequisite of this rule{suffix if target.kind != 'run_binary' else ''}"
+                    )
+
+    def _files_of(self, label: Label, seen: set[Label] | None = None) -> list[str]:
+        """The files a label stands for in a genrule's srcs (target configuration), as execution paths."""
+        seen = seen if seen is not None else set()
+        if label in seen:
+            return []
+        seen.add(label)
+        bin_dir = f"bazel-out/k8-{self.cfg.compilation_mode}/bin"
+        try:
+            t = self.ws.target(label)
+        except BazelError:
+            return []
+        rel = f"{label.package}/{label.name}" if label.package else label.name
+        if t.external:
+            return [f"external/{label.repo}+/{rel}"]
+        if t.kind == "source file":
+            return [rel]
+        if t.kind == "generated file":
+            return [f"{bin_dir}/{rel}"]
+        pkg = label.package
+        prefix = f"{pkg}/" if pkg else ""
+        if t.kind in ("filegroup", "py_library"):
+            files: list[str] = []
+            for x in self.resolve(t, "srcs") or []:
+                files.extend(self._files_of(parse_label(x, pkg), seen))
+            return files
+        if t.kind == "genrule":
+            return [f"{bin_dir}/{prefix}{o}" for o in t.attrs.get("outs") or []]
+        if t.kind in ("go_binary", "go_test"):
+            return [f"{bin_dir}/{prefix}{t.name}_/{t.name}"]
+        if t.kind in ("py_binary", "py_test", "sh_binary", "sh_test"):
+            files = [f"{bin_dir}/{prefix}{t.name}"]
+            for x in self.resolve(t, "srcs") or []:
+                files.extend(self._files_of(parse_label(x, pkg), seen))
+            return files
+        if t.kind in ("write_file", "copy_file") and t.attrs.get("out"):
+            return [f"{bin_dir}/{prefix}{t.attrs['out']}"]
+        return [f"{bin_dir}/{prefix}{t.name}"]
+
+    @staticmethod
+    def _bare_dollar(cmd: str) -> str:
+        """Bazel's error for a shell-style $NAME or ${NAME} in a genrule command, or '' when there is none."""
+        i = 0
+        while i < len(cmd):
+            if cmd[i] != "$":
+                i += 1
+                continue
+            nxt = cmd[i + 1 : i + 2]
+            if nxt == "":
+                return "unterminated $"
+            if nxt in ("$", "@", "<", "("):
+                if nxt == "(":
+                    end = cmd.find(")", i)
+                    i = end + 1 if end >= 0 else len(cmd)
+                else:
+                    i += 2
+                continue
+            if nxt == "{":
+                end = cmd.find("}", i)
+                name = cmd[i + 2 : end] if end >= 0 else cmd[i + 2 :]
+                return (
+                    f"'${{{name}}}' syntax is not supported; use '$({name})' instead for \"Make\" variables, or "
+                    "escape the '$' as '$$' if you intended this for the shell"
+                )
+            m = re.match(r"[A-Za-z0-9_]+", cmd[i + 1 :])
+            if m:
+                name = m.group(0)
+                return (
+                    f"'${name}' syntax is not supported; use '$({name})' instead for \"Make\" variables, or escape "
+                    "the '$' as '$$' if you intended this for the shell"
+                )
+            i += 2
+        return ""
+
     def _check_make_vars(self, target: Target) -> None:
         cmds = [target.attrs.get(k) for k in ("cmd", "cmd_bash")]
         cmd = next((c for c in cmds if isinstance(c, str) and c), None)
@@ -2148,11 +2850,13 @@ class _Analyzer:
         srcs = self.resolve(target, "srcs") or []
         tools = self.resolve(target, "tools") or []
         prereq = {str(parse_label(x, pkg)) for x in [*srcs, *tools]} | {str(Label("", pkg, o)) for o in outs}
+        in_srcs = {str(parse_label(x, pkg)) for x in srcs} - {str(parse_label(x, pkg)) for x in tools}
         where = f"{target.location}: in cmd attribute of genrule rule {target.label}"
-        for m in re.finditer(
-            r"\$\((location|locations|execpath|execpaths|rootpath|rootpaths|rlocationpath)\s+([^)]+)\)", cmd
-        ):
-            ref = m.group(2).strip()
+        bare = self._bare_dollar(cmd)
+        if bare:
+            self.errors.append(f"{where}: {bare}")
+            return
+        for fn, ref in self._location_refs(cmd):
             try:
                 label = str(parse_label(ref, pkg))
             except BazelError as exc:
@@ -2160,8 +2864,18 @@ class _Analyzer:
                 continue
             if label not in prereq:
                 self.errors.append(
-                    f"{where}: label '{label}' in $({m.group(1)}) expression is not a declared prerequisite of this rule"
+                    f"{where}: label '{label}' in $(location) expression is not a declared prerequisite of this rule"
                 )
+            elif not fn.endswith("s") and label in in_srcs:
+                # a label in srcs (target configuration) stands for all its files; in tools, for its executable
+                files = self._files_of(parse_label(label))
+                if not files:
+                    self.errors.append(f"{where}: label '{label}' in $(location) expression expands to no files")
+                elif len(files) > 1:
+                    self.errors.append(
+                        f"{where}: label '{label}' in $(location) expression expands to more than one file, please "
+                        f"use $(locations {label}) instead.  Files (at most 5 shown) are: [{', '.join(files[:5])}]"
+                    )
         if "$@" in cmd and len(outs) != 1:
             self.errors.append(f"{where}: variable '$@' : more than one output file")
         if "$<" in cmd and len(srcs) != 1:
@@ -2230,9 +2944,13 @@ class _Query:
         tokens = self._tokenize(expr)
         self.tokens = tokens
         self.pos = 0
+        self.vars: dict[str, set[Label]] = {}
+        self.path_order: list[Label] | None = None
         result = self._expr()
         if self.pos != len(self.tokens):
             raise BazelError(f"syntax error at '{self.tokens[self.pos][1]}'")
+        if self.path_order is not None and set(self.path_order) == result:
+            return list(self.path_order)  # a bare somepath() prints the path in order, start to end
         # Bazel sorts by repository, then package, then name: //tools:gen before //tools/exp:x.
         return sorted(result, key=lambda lbl: (lbl.repo != "", lbl.repo, lbl.package, lbl.name))
 
@@ -2279,12 +2997,38 @@ class _Query:
         left = self._primary()
         while (tok := self._peek()) is not None and tok[0] == "op":
             self.pos += 1
+            self.path_order = None
             right = self._primary()
             left = left | right if tok[1] == "+" else left & right if tok[1] == "^" else left - right
         return left
 
     def _primary(self) -> set[Label]:
         kind, value = self._next()
+        if kind == "word" and value == "let":
+            name_tok = self._next()
+            eq = self._next()
+            if name_tok[0] != "word" or eq[1] != "=":
+                raise BazelError(f"syntax error in let expression of '{self.expr}'")
+            value_set = self._expr()
+            if self._next()[1] != "in":
+                raise BazelError(f"syntax error in let expression of '{self.expr}': expected 'in'")
+            saved = self.vars.get(name_tok[1])
+            self.vars[name_tok[1]] = value_set
+            body = self._expr()
+            if saved is None:
+                self.vars.pop(name_tok[1], None)
+            else:
+                self.vars[name_tok[1]] = saved
+            self.path_order = None
+            return body
+        if kind == "word" and value.startswith("$"):
+            name = value[1:]
+            if name not in self.vars:
+                raise BazelError(
+                    f'Evaluation of subquery "{value}" failed (did you want to use --keep_going?): undefined '
+                    f"variable '{name}'"
+                )
+            return set(self.vars[name])
         if kind == "(":
             out = self._expr()
             if self._next()[0] != ")":
@@ -2379,7 +3123,10 @@ class _Query:
         if fn in ("somepath", "allpaths"):
             need(2)
             src, dst = self._arg_expr(args[0]), self._arg_expr(args[1])
-            return self.paths(src, dst, all_paths=fn == "allpaths")
+            found = self.paths(src, dst, all_paths=fn == "allpaths")
+            if fn == "somepath":
+                self.path_order = list(self._last_path)
+            return found
         if fn == "kind":
             need(2)
             pat = re.compile(self._arg_word(args[0]))
@@ -2451,7 +3198,22 @@ class _Query:
 
     def pattern(self, text: str) -> set[Label]:
         """Expand a target pattern: //..., //pkg/..., //pkg:all, //pkg:*, or a single label."""
+        if not text.startswith(("//", ":", "@")) and "/" in text and text in self.ws.files and ":" not in text:
+            # a workspace-relative file path names the file's target in its owning package: core/x.py -> //core:x.py
+            owner = self.ws.package_of_path(text)
+            if owner is not None:
+                rel = text[len(owner) + 1 :] if owner else text
+                return {self.ws.target(Label("", owner, rel)).label}
         if text.startswith("@"):
+            repo = text.lstrip("@").split("//", 1)[0]
+            body = text.split("//", 1)[1] if "//" in text else ""
+            if repo in self.ws.module.pip_hubs and (body.endswith("...") or body.endswith((":all", ":*"))):
+                dists = sorted(self.ws.pip_packages(repo))
+                if not body.endswith("..."):
+                    pkg = body.split(":", 1)[0]
+                    self.ws.target(Label(repo, pkg, pkg))  # errors for a package that is not in the hub
+                    dists = [pkg]
+                return {Label(repo, d, n) for d in dists for n in (d, *_PIP_HUB_TARGETS)}
             return {self.ws.target(parse_label(text)).label}
         t = text
         if t.startswith(":"):
@@ -2554,7 +3316,10 @@ class _Query:
             level += 1
         return seen
 
+    _last_path: list[Label] = []  # noqa: RUF012 - the most recent somepath() result, start to end
+
     def paths(self, src: set[Label], dst: set[Label], *, all_paths: bool) -> set[Label]:
+        self._last_path = []
         if all_paths:
             forward = self.closure(src, None, forward=True)
             reverse = self.rclosure(forward, dst & forward, None)
@@ -2570,6 +3335,7 @@ class _Query:
                     while node is not None:
                         path.append(node)
                         node = parent[node]
+                    self._last_path = list(reversed(path))
                     return set(path)
                 for dep in self.deps_of(cur):
                     if dep not in parent:
@@ -2605,6 +3371,52 @@ class _Query:
         if t.rule_class is not None and t.rule_class.test:
             return {lbl}
         return set()
+
+
+def _select_repr(value: Select) -> str:
+    """A select() the way Bazel prints it in errors: Label values as Label("...")."""
+    parts = []
+    for kind, part in value.parts:
+        if kind == "select":
+            body = ", ".join(
+                f'"{k}": ' + (f'Label("{v}")' if isinstance(v, str) and v.startswith("//") else _starlark_repr(v))
+                for k, v in part.items()
+            )
+            parts.append(f"select({{{body}}})")
+        else:
+            parts.append(_starlark_repr(part))
+    return " + ".join(parts)
+
+
+def _build_value(value: Any, akind: str, package: str) -> str:
+    """An attribute value as ``bazel query --output=build`` prints it (labels canonical, strings double-quoted)."""
+    import json
+
+    if isinstance(value, Select):
+        return repr(value)
+    if isinstance(value, bool):
+        return "True" if value else "False"
+    if isinstance(value, str):
+        if akind in ("label", "output"):
+            value = str(parse_label(value, package))
+        return json.dumps(value)
+    if isinstance(value, list):
+        items = value
+        if akind in ("label_list", "output_list"):
+            items = [str(parse_label(v, package)) for v in value]
+        return "[" + ", ".join(_build_value(v, "", package) for v in items) + "]"
+    if isinstance(value, dict):
+        return "{" + ", ".join(f"{json.dumps(str(k))}: {_build_value(v, '', package)}" for k, v in value.items()) + "}"
+    return str(value)
+
+
+def _macro_name_ok(name: str, macro: str) -> bool:
+    return name == macro or any(name.startswith(macro + sep) and len(name) > len(macro) + 1 for sep in "_-.")
+
+
+def _canonical(label: Label) -> str:
+    """A label as Bazel prints it in analysis messages: ``@@repo//pkg:name`` outside the main repository."""
+    return f"@@{label.repo}//{label.package}:{label.name}" if label.repo else str(label)
 
 
 def _tag_match(target: Target, filters: list[str]) -> bool:
@@ -2653,6 +3465,7 @@ class Result:
     targets: list[str] = field(default_factory=list)
     tests: list[str] = field(default_factory=list)
     phase: str = ""
+    skipped: list[str] = field(default_factory=list)  # incompatible targets a wildcard skipped (tests: SKIPPED)
 
     def __bool__(self) -> bool:
         """A result is truthy when the command succeeded."""
@@ -2724,6 +3537,7 @@ class Bazel:
         self._ensure_module()
         self.ws._current_command = "query"
         universe: list[str] | None = None
+        flags = tuple(_expand_bazelrc(self.ws, list(flags)))  # query reads common and query lines only
         for flag in flags:
             if flag.startswith("--universe_scope="):
                 universe = [p for p in flag.split("=", 1)[1].split(",") if p]
@@ -2745,6 +3559,7 @@ class Bazel:
         # Patterns apply left to right: "-- //... -//x/..." excludes, "-- -//x/... //..." adds them back.
         include: set[Label] = set()
         exclude: set[Label] = set()
+        self._explicit: set[Label] = set()
         q = _Query(self.ws, None, configured=False)
         q.skip_manual = skip_manual
         for p in patterns:
@@ -2752,8 +3567,12 @@ class Bazel:
                 removed = q.pattern(p[1:])
                 include -= removed
                 exclude |= removed
+                self._explicit -= removed
             else:
-                include |= q.pattern(p)
+                found = q.pattern(p)
+                include |= found
+                if not _is_wildcard(p):
+                    self._explicit |= found
         return include, exclude
 
     def build(self, *args: str) -> Result:
@@ -2799,24 +3618,51 @@ class Bazel:
                 targets = set(test_labels)
             else:
                 targets = targets | test_labels
+        # target_compatible_with: wildcards skip incompatible targets; naming one is an error.
+        skipped: set[Label] = set()
+        for lbl in sorted(targets, key=str):
+            if an.incompatible(lbl):
+                if lbl in self._explicit:
+                    msg = an.incompatible_message(lbl)
+                    out = f"ERROR: {msg}\nERROR: Build did NOT complete successfully"
+                    if command == "test":
+                        out += "\nERROR: No test targets were found, yet testing was requested"
+                    return Result(False, out, [msg], phase="analysis")
+                skipped.add(lbl)
+        targets -= skipped
+        skipped_tests = sorted(str(t) for t in test_labels & skipped)
+        test_labels -= skipped
         for lbl in sorted(targets, key=str):
             an.check(lbl)
         errors = list(dict.fromkeys(an.errors))
         built = sorted(str(t) for t in targets)
         tests = sorted(str(t) for t in test_labels)
+        skip_list = sorted(str(t) for t in skipped)
         if errors:
             out = "\n".join(f"ERROR: {e}" for e in errors)
             out += "\nERROR: Analysis of target failed; build aborted\nERROR: Build did NOT complete successfully"
-            return Result(False, out, errors, built, tests, phase="analysis")
+            return Result(False, out, errors, built, tests, phase="analysis", skipped=skip_list)
         missing = sorted(set(an.missing_inputs))
         if missing:
             errs = [f"missing input file '{m}'" for m in missing]
             out = "\n".join(f"ERROR: {e}" for e in errs) + "\nERROR: Build did NOT complete successfully"
-            return Result(False, out, errs, built, tests, phase="execution")
-        lines = [f"INFO: Analyzed {len(built)} target{'s' if len(built) != 1 else ''} (simulated)."]
+            return Result(False, out, errs, built, tests, phase="execution", skipped=skip_list)
+        lines = [
+            f"INFO: Analyzed {len(built) + len(skip_list)} target{'s' if len(built) + len(skip_list) != 1 else ''} (simulated)."
+        ]
+        if skip_list and not built:
+            lines.extend(f"Target {t} was skipped" for t in skip_list)
         if command == "test":
+            for t in skipped_tests:
+                lines.append(f"{t:<72}SKIPPED")
             for t in tests:
                 lines.append(f"{t:<60} (would run)")
+            if not tests and skipped_tests:
+                n = len(skipped_tests)
+                lines.append(
+                    f"Executed 0 out of {n} test{'s' if n != 1 else ''}: {n} {'was' if n == 1 else 'were'} skipped."
+                )
+                return Result(True, "\n".join(lines), [], built, tests, phase="done", skipped=skip_list)
             if not tests:
                 lines.append("ERROR: No test targets were found, yet testing was requested")
                 return Result(
@@ -2827,13 +3673,91 @@ class Bazel:
                     tests,
                     "analysis",
                 )
-            lines.append(f"Executed 0 out of {len(tests)} tests (the simulator analyzes; it does not run tests).")
+            total = len(tests) + len(skipped_tests)
+            skipped_note = (
+                f": {len(skipped_tests)} {'was' if len(skipped_tests) == 1 else 'were'} skipped"
+                if skipped_tests
+                else ""
+            )
+            lines.append(
+                f"Executed 0 out of {total} tests{skipped_note} (the simulator analyzes; it does not run tests)."
+            )
         else:
             lines.append("INFO: Build completed successfully (analysis only: the simulator does not run actions).")
-        return Result(True, "\n".join(lines), [], built, tests, phase="done")
+        return Result(True, "\n".join(lines), [], built, tests, phase="done", skipped=skip_list)
 
     def run_command(self, command_line: str) -> Result:
-        """Run a command line such as ``bazel query 'deps(//app:hello)'`` and format its output like Bazel."""
+        """Run a command line such as ``bazel query 'deps(//app:hello)'`` and format its output like Bazel.
+
+        DEBUG lines from print() and loading WARNINGs come first, for packages this command loaded (Bazel caches
+        loaded packages, so a second command prints them only if the package changed).
+        """
+        before = set(self.ws._packages)
+        result = self._run_command(command_line)
+        events = list(self.ws.module.warnings)
+        for name, pkg in self.ws._packages.items():
+            if name not in before:
+                events.extend(pkg.events)
+        if events:
+            result.output = "\n".join([*events, result.output]) if result.output else "\n".join(events)
+        return result
+
+    def _cquery_suffix(self, an: _Analyzer, label: str) -> str:
+        t = self.ws.target(parse_label(label))
+        if t.kind == "source file":
+            return "(null)"
+        if t.kind == "generated file" and t.generating_rule is not None:
+            t = self.ws.target(t.generating_rule)
+        return f"({an.config_id(t, 7)})"
+
+    def _format_build(self, label: str) -> str:
+        t = self.ws.target(parse_label(label))
+        if not t.is_rule or t.external:
+            return ""
+        lines = [f"# {t.location}", f"{t.kind}("]
+        lines.append(f'  name = "{t.name}",')
+        order = ["visibility"] if "visibility" in t.explicit else []
+        order += [a for a in ("generator_name", "generator_function", "generator_location") if a in t.attrs]
+        order += [a for a in t.explicit if a != "visibility"]
+        rc = t.rule_class
+        for attr in order:
+            value = t.attrs.get(attr)
+            akind = rc.attrs.get(attr, "") if rc else ""
+            lines.append(f"  {attr} = {_build_value(value, akind, t.label.package)},")
+        lines.append(")")
+        lines.append(f"# Rule {t.name} instantiated at (most recent call last):")
+        frames = t.stack or ((t.location, "<toplevel>"),)
+        width = max(len(loc) for loc, _ in frames)
+        lines.extend(f"#   {loc:<{width}} in {fn}" for loc, fn in frames)
+        return "\n".join(lines)
+
+    def _ranks(self, labels: list[str], *, longest: bool) -> list[tuple[int, str]]:
+        """``--output=minrank`` / ``maxrank``: each target's shortest or longest distance from a root.
+
+        A root is a target nothing else in the result depends on; only edges inside the result count.
+        """
+        q = _Query(self.ws, None, configured=False)
+        members = [parse_label(lbl) for lbl in labels]
+        inside = set(members)
+        edges = {m: [d for d in q.deps_of(m) if d in inside] for m in members}
+        has_parent = {d for ds in edges.values() for d in ds}
+        rank: dict[Label, int] = {m: 0 for m in members if m not in has_parent}
+        frontier = list(rank)
+        while frontier:
+            nxt = []
+            for m in frontier:
+                for d in edges[m]:
+                    r = rank[m] + 1
+                    if d not in rank or (longest and r > rank[d] and r <= len(members)):
+                        rank[d] = r
+                        nxt.append(d)
+            frontier = nxt
+        return sorted(
+            ((r, str(lbl)) for lbl, r in rank.items()),
+            key=lambda x: (x[0], x[1].startswith("@"), x[1]),
+        )
+
+    def _run_command(self, command_line: str) -> Result:
         import shlex
 
         try:
@@ -2856,14 +3780,30 @@ class Bazel:
                 cfg_flags = [f for f in flags if not f.startswith("--output")]
                 labels = self.query(exprs[0], *cfg_flags) if cmd == "query" else self.cquery(exprs[0], *cfg_flags)
                 labels = list(dict.fromkeys(labels))  # each target once, even if reached through two equal labels
+                suffix: Any = lambda _lbl: ""  # noqa: E731
+                if cmd == "cquery":
+                    self.ws._current_command = "cquery"
+                    an = _Analyzer(self.ws, Config.parse(list(cfg_flags), self.ws)[0])
+                    suffix = lambda lbl: " " + self._cquery_suffix(an, lbl)  # noqa: E731
                 if fmt == "label_kind":
-                    text = "\n".join(f"{self.ws.target(parse_label(lbl)).kind_string()} {lbl}" for lbl in labels)
+                    text = "\n".join(
+                        f"{self.ws.target(parse_label(lbl)).kind_string()} {lbl}{suffix(lbl)}" for lbl in labels
+                    )
                 elif fmt == "package":
                     text = "\n".join(sorted({lbl.split(":")[0].lstrip("/") for lbl in labels}))
                 elif fmt == "label":
-                    text = "\n".join(labels)
+                    text = "\n".join(f"{lbl}{suffix(lbl)}" for lbl in labels)
+                elif fmt in ("minrank", "maxrank") and cmd == "query":
+                    text = "\n".join(f"{r} {lbl}" for r, lbl in self._ranks(labels, longest=fmt == "maxrank"))
+                elif fmt == "build" and cmd == "query":
+                    text = "\n".join(b for b in (self._format_build(lbl) for lbl in labels) if b)
                 else:
-                    raise BazelError(f"the simulator supports --output=label, label_kind, and package, not '{fmt}'")
+                    supported = (
+                        "label, label_kind, and package"
+                        if cmd == "cquery"
+                        else ("label, label_kind, package, minrank, maxrank, and build")
+                    )
+                    raise BazelError(f"the simulator supports --output={supported}, not '{fmt}'")
                 if not labels:
                     text = "INFO: Empty results"
                 return Result(True, text, targets=labels)
@@ -2879,7 +3819,10 @@ class Bazel:
                 if t.rule_class is None or not t.rule_class.executable:
                     msg = f"Cannot run target {t.label}: Not executable"
                     return Result(False, f"ERROR: {msg}", [msg])
-                res.output += f"\nINFO: Running command line: bazel-bin/{t.label.package}/{t.label.name} (simulated: not executed)"
+                path = f"{t.label.package}/{t.name}"
+                if t.kind in ("go_binary", "go_test"):
+                    path = f"{t.label.package}/{t.name}_/{t.name}"  # rules_go's output layout
+                res.output += f"\nINFO: Running command line: bazel-bin/{path} (simulated: not executed)"
                 return res
             if cmd == "version":
                 return Result(True, f"Bazel {BAZEL_VERSION} (simulated)")
@@ -2904,6 +3847,17 @@ _VALUE_OPTIONS = frozenset(
         "--test_size_filters",
     }
 )
+
+
+def _is_wildcard(pattern: str) -> bool:
+    """True for target patterns that name many targets (//..., //pkg:all, //pkg:*), which skip incompatible ones."""
+    body = pattern.split(":", 1)
+    return (
+        pattern.endswith("...")
+        or "/...:" in pattern
+        or "...:" in pattern
+        or (len(body) == 2 and body[1] in ("all", "*", "all-targets"))
+    )
 
 
 def _split_flags(words: list[str]) -> tuple[list[str], list[str]]:

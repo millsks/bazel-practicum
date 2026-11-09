@@ -452,11 +452,6 @@ ERROR: /…/ws/app/BUILD.bazel:3:10: errors encountered resolving select() keys 
 ERROR: Analysis of target '//app:banner' failed; build aborted</code></pre>
     <p>Build settings are also ordinary targets. They have visibility, show up in <code>bazel query</code>, and can be
       read by your own rules (later in the course). <code>--define</code> has none of that.</p>
-    <aside class="callout sim">
-      <p>The simulator accepts any flag label and any value: a misspelled <code>--//config:...</code> or an unlisted value
-        quietly selects the default branch instead of failing. Real Bazel reports both errors above; Lab 1 checks the
-        <code>invalid value</code> one.</p>
-    </aside>
     <p>Try it. Run the commands, then change <code>prod</code> to <code>staging</code> in the second one.</p>
     <div class="runnable" data-title="A string_flag and a bool_flag" data-commands="bazel cquery 'labels(data, //app:banner)' --//config:env=prod|bazel cquery 'labels(data, //app:banner)'|bazel cquery 'labels(data, //app:banner)' --//config:verbose|bazel cquery 'labels(data, //app:banner)' --//config:env=prod --//config:verbose|bazel query 'labels(data, //app:banner)'">
 <textarea class="file" data-path="MODULE.bazel" data-readonly>
@@ -643,8 +638,9 @@ ERROR: Build did NOT complete successfully</code></pre>
       it depends on a target that is. Incompatibility flows up the graph. With
       <code>--platforms=//platforms_demo:linux_gpu</code>, the same build succeeds.</p>
     <aside class="callout sim">
-      <p>The simulator does not model <code>target_compatible_with</code>: it accepts the attribute but never skips a
-        target or reports one as incompatible. Every output above is from real Bazel, and Lab 2 grades it.</p>
+      <p>The simulator skips incompatible targets and reports explicit requests with the same message, but it does not
+        run tests: where real Bazel prints <code>PASSED</code>, it prints <code>(would run)</code>. Lab 2 runs them for
+        real.</p>
     </aside>
     <p><strong>Remember:</strong> constraint settings are dimensions, constraint values are choices, platforms are named
       combinations. <code>--platforms</code> picks the target platform; <code>select()</code> can branch on it, and
@@ -699,9 +695,10 @@ app/banner.py</code></pre>
       </div>
     </div>
     <aside class="callout sim">
-      <p>The simulator's <code>cquery</code> resolves <code>select()</code> like Bazel, but prints labels without the
-        configuration hash, and supports <code>--output=label</code>, <code>label_kind</code>, and <code>package</code>
-        only.</p>
+      <p>The simulator's <code>cquery</code> resolves <code>select()</code> like Bazel. For a plain build on the host it
+        prints real Bazel's configuration ids (<code>a7a71fd</code>, or <code>e722a21</code> for tests); with other
+        flags it prints a stand-in id, so do not compare those with a real run. It supports
+        <code>--output=label</code>, <code>label_kind</code>, and <code>package</code> only.</p>
     </aside>
     <p>Predict the first two outputs before you run them. Notice that the select's condition,
       <code>//config:s3</code>, is a dependency too, in both answers. (Real Bazel's lists are longer: they include the
@@ -1155,7 +1152,8 @@ def test_existing_conditions_are_kept(bazel):
       <details class="hint"><summary>Hint</summary>
         <p>The first error wants a <code>//conditions:default</code> branch. The second wants a condition that is more
           specialized than both: a <code>config_setting</code> with <em>both</em> the <code>values</code> entry and the
-          <code>flag_values</code> entry. Write its flag key exactly as <code>:prod</code> does (<code>":env"</code>).</p>
+          <code>flag_values</code> entry. The flag key is a label, so <code>":env"</code> and
+          <code>"//config:env"</code> name the same setting.</p>
       </details>
       <details class="solution"><summary>Show solution</summary>
 <pre data-path="config/BUILD.bazel"><code class="language-starlark">load("@bazel_skylib//rules:common_settings.bzl", "string_flag")
@@ -1203,8 +1201,8 @@ config_setting(
     <h2>Labs: configured builds for real</h2>
     <p>The exercises checked which branch a <code>select()</code> picks. These labs check what that means for a real
       program: which file actually lands in the runfiles, what <code>bazel run</code> prints under each flag, how real
-      Bazel rejects a bad flag value, and how it skips a target on a platform that cannot run it. The simulator models
-      none of those.</p>
+      Bazel rejects a bad flag value, and how it skips a target on a platform that cannot run it. The simulator
+      reports the errors, but it cannot run the program or the tests.</p>
 
     <div class="lab" data-id="m06-lab1" data-title="A banner chosen by a build flag">
       <div class="lab-prompt">

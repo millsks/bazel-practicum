@@ -1,5 +1,6 @@
 """The Bazel simulator (docs/assets/py/minibazel.py). Expected texts were captured from real Bazel 9.3.2 runs."""
 
+import re
 import textwrap
 from types import ModuleType
 from typing import Any
@@ -269,7 +270,10 @@ def test_module_errors() -> None:
     late = ws({}, module='bazel_dep(name = "x", version = "1")\nmodule(name = "a")\n').build("//...")
     assert "must be called before any other functions" in late.error
     dup = ws({}, module='bazel_dep(name = "x", version = "1")\nbazel_dep(name = "x", version = "2")\n')
-    assert "The repo name 'x' is already being used by another bazel_dep" in dup.build("//...").error
+    assert (
+        "Error in bazel_dep: The repo name 'x' cannot be defined by a bazel_dep at MODULE.bazel:2:10 as it is already "
+        "defined by a bazel_dep at MODULE.bazel:1:10"
+    ) in dup.build("//...").error
     assert "syntax error" in ws({}, module="module(\n").build("//...").error
     assert "f-strings" in ws({}, module='x = f"{1}"\n').build("//...").error
 
@@ -279,10 +283,18 @@ def test_use_extension_requires_the_dep() -> None:
     assert "No repository visible as '@rules_python' from main repository" in ws({}, module=module).build("//...").error
 
 
-def test_use_repo_requires_a_declared_hub() -> None:
-    module = MODULE + 'pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")\nuse_repo(pip, "pypi")\n'
-    error = ws({}, module=module).build("//...").error
-    assert 'does not generate repository "pypi"' in error
+def test_use_repo_of_an_undeclared_hub_only_hides_it() -> None:
+    # rules_python's pip extension is evaluated lazily: a wrong use_repo name is not a MODULE.bazel error, the
+    # repository is simply not visible when a label uses it (verified in 9.3.2)
+    module = MODULE + textwrap.dedent(
+        """
+        pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
+        pip.parse(hub_name = "weather_pypi", requirements_lock = "//:requirements_lock.txt")
+        use_repo(pip, "pypi")
+        """
+    )
+    bazel = ws({"p/BUILD.bazel": PY + 'py_library(name = "x", deps = ["@pypi//six"])\n'}, module=module)
+    assert bazel.build("//p:all").error.count("No repository visible as '@pypi' from main repository") == 1
 
 
 def test_pip_parse_requires_hub_and_lock() -> None:
@@ -316,10 +328,54 @@ def test_pip_hub_targets_exist_only_when_pinned() -> None:
     assert bazel.ws.pip_packages("pypi") == {"six", "pyyaml"}
     assert bazel.target("@pypi//six").kind == "py_library"
     bad = pip_ws(PY + 'py_library(name = "bad", deps = ["@pypi//requests"])\n').build("//p:bad")
-    assert "no such package '@@rules_python++pip+pypi//requests'" in bad.error
-    assert "is not in //:requirements_lock.txt; add it to your requirements and re-lock" in bad.error
+    assert (
+        "no such package '@@rules_python++pip+pypi//requests': BUILD file not found in directory 'requests' of "
+        "external repository @@rules_python++pip+pypi. Add a BUILD file to a directory to mark it as a package."
+    ) in bad.error
+    assert "re-lock" not in bad.error
     with pytest.raises(mb.BazelError, match="no such target '@pypi//six:nope'"):
         bazel.target("@pypi//six:nope")
+
+
+@pytest.mark.parametrize("spelling", ["PyYAML", "py-yaml", "Pyyaml"])
+def test_pip_hub_labels_must_be_normalized_exactly(spelling: str) -> None:
+    error = pip_ws(PY + f'py_library(name = "x", deps = ["@pypi//{spelling}"])\n').build("//p:x").error
+    assert f"no such package '@@rules_python++pip+pypi//{spelling}'" in error
+
+
+def test_pip_hub_error_uses_the_real_hub_name_and_query_lists_hub_targets() -> None:
+    module = PIP_MODULE.replace('hub_name = "pypi"', 'hub_name = "weather_pypi"').replace(
+        'use_repo(pip, "pypi", deps = "pypi")', 'use_repo(pip, pypi = "weather_pypi")'
+    )
+    files = {"MODULE.bazel": module, "requirements_lock.txt": LOCK, "BUILD.bazel": ""}
+    files["p/BUILD.bazel"] = PY + 'py_library(name = "x", deps = ["@pypi//requests"])\n'
+    bazel = mb.Bazel(files)
+    assert "no such package '@@rules_python++pip+weather_pypi//requests'" in bazel.build("//p:x").error
+    assert bazel.query("@pypi//six:all") == [
+        "@pypi//six:_no_matching_repository",
+        "@pypi//six:data",
+        "@pypi//six:dist_info",
+        "@pypi//six:extracted_whl_files",
+        "@pypi//six:pkg",
+        "@pypi//six:six",
+        "@pypi//six:srcs",
+        "@pypi//six:whl",
+        "@pypi//six:whl_file",
+    ]
+    assert len(bazel.query("@pypi//...")) == 18
+    assert bazel.target("@pypi//six:whl").kind == "filegroup"
+    assert "The PyPI hub name 'pypi' is reserved" not in bazel.run_command("bazel build //p:x").output
+
+
+def test_reserved_pypi_hub_name_warns() -> None:
+    bazel = pip_ws(PY + 'py_library(name = "ok", deps = ["@pypi//six"])\n')
+    warning = (
+        "WARNING: The PyPI hub name 'pypi' is reserved (module 'demo'). Please rename your hub, otherwise a future "
+        "release will rename it to 'demo_pypi'."
+    )
+    for line in ("bazel build //p:ok", "bazel query //p:ok", "bazel test //p:ok"):
+        out = bazel.run_command(line).output
+        assert out.startswith("DEBUG: ") and warning in out.splitlines()[0], line
 
 
 def test_pip_hub_not_imported_is_not_visible() -> None:
@@ -338,7 +394,6 @@ def test_go_sdk_and_toolchains_in_module() -> None:
         """
         go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk")
         go_sdk.download(version = "1.25.3")
-        use_repo(go_sdk, "go_sdk")
         register_toolchains("//tools:all")
         single_version_override(module_name = "rules_go", version = "0.65.0")
         """
@@ -346,7 +401,29 @@ def test_go_sdk_and_toolchains_in_module() -> None:
     bazel = ws({}, module=module)
     assert bazel.ws.module.go_versions == ["1.25.3"]
     assert bazel.ws.module.registered_toolchains == ["//tools:all"]
-    assert "go_sdk" in bazel.ws.visible_repos()
+    assert "go_sdk" not in bazel.ws.visible_repos()
+
+
+def test_go_sdk_has_no_use_repo_and_checks_tag_attributes() -> None:
+    head = MODULE + 'go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk")\n'
+    error = ws({}, module=head + 'go_sdk.download(version = "1.25.3")\nuse_repo(go_sdk, "go_sdk")\n').build("//...")
+    assert (
+        'ERROR: module extension @@rules_go+//go:extensions.bzl%go_sdk does not generate repository "go_sdk", yet it '
+        'is imported as "go_sdk" in the usage at MODULE.bazel:9:23'
+    ) == error.output
+    bad = ws({}, module=head + 'go_sdk.download(go_version = "1.25.3")\n').build("//...").output
+    assert bad == (
+        "ERROR: Traceback (most recent call last):\n"
+        '\tFile "MODULE.bazel", line 10, column 16, in <toplevel>\n'
+        '\t\tgo_sdk.download(go_version = "1.25.3")\n'
+        "Error: in 'download' tag, unknown attribute 'go_version' provided (did you mean 'version'?)"
+    )
+    py = MODULE + 'python = use_extension("@rules_python//python/extensions:python.bzl", "python")\n'
+    py += 'python.toolchain(version = "3.13")\n'
+    assert "unknown attribute 'version' provided (did you mean 'python_version'?)" in ws({}, module=py).build().error
+    pip = MODULE + 'pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")\n'
+    pip += 'pip.parse(hub_name = "x", requirements = "//:r.txt")\n'
+    assert "Error: in 'parse' tag, unknown attribute 'requirements' provided" in ws({}, module=pip).build().error
 
 
 # ---------------------------------------------------------------------------------------------- analysis
@@ -817,7 +894,13 @@ def test_python_version_flag_defaults_to_the_toolchain(sel: Any) -> None:
 
 def test_invalid_compilation_mode(sel: Any) -> None:
     result = sel.build("//c:a", "-c", "fast")
-    assert "Not a valid compilation mode: (should be dbg, opt or fastbuild)" in result.error
+    assert result.error == (
+        "While parsing option -c fast: Not a valid compilation mode: 'fast' (should be fastbuild, dbg or opt)"
+    )
+    assert (
+        "While parsing option --compilation_mode=fast: Not a valid"
+        in sel.build("//c:a", "--compilation_mode=fast").error
+    )
     assert "Expected value after -c" in sel.build("//c:a", "-c").error
 
 
@@ -1396,3 +1479,534 @@ def test_attr_query_sees_default_test_size() -> None:
     sim = load_simulator(REPO_ROOT / "docs")
     b = sim.Bazel(_m05_ws('py_test(name = "t", srcs = ["t.py"])\n'))
     assert b.query("attr(size, medium, //...)") == ["//pkg:t"]
+
+
+# ------------------------------------------------- behaviors verified against real Bazel 9.3.2 (M06-M09 authors)
+
+ENV_BUILD = (
+    FLAGS
+    + """
+string_flag(name = "env", build_setting_default = "dev", values = ["dev", "staging", "prod"])
+bool_flag(name = "verbose", build_setting_default = False)
+config_setting(name = "prod", flag_values = {":env": "prod"})
+config_setting(name = "staging", flag_values = {":env": "staging"})
+config_setting(name = "opt", values = {"compilation_mode": "opt"})
+config_setting(name = "prod_opt", values = {"compilation_mode": "opt"}, flag_values = {"//config:env": "prod"})
+config_setting(name = "loud", flag_values = {":verbose": "true"})
+filegroup(name = "pick", srcs = select({
+    ":prod_opt": ["a.txt"],
+    ":prod": ["b.txt"],
+    ":opt": ["c.txt"],
+    "//conditions:default": ["d.txt"],
+}))
+filegroup(name = "envpick", srcs = select({":prod": ["b.txt"], ":staging": ["c.txt"], "//conditions:default": ["d.txt"]}))
+filegroup(name = "vpick", srcs = select({":loud": ["b.txt"], "//conditions:default": ["d.txt"]}))
+"""
+)
+
+
+def env_ws(rc: str = "") -> Any:
+    files = {"MODULE.bazel": MODULE, "config/BUILD.bazel": ENV_BUILD, ".bazelrc": rc}
+    files.update({f"config/{n}.txt": "" for n in "abcd"})
+    return mb.Bazel(files)
+
+
+def test_flag_values_keys_are_canonical_labels_for_specialization() -> None:
+    bazel = env_ws()
+    assert bazel.cquery("labels(srcs, //config:pick)", "-c", "opt", "--//config:env=prod") == ["//config:a.txt"]
+    assert bazel.build("//config:pick", "-c", "opt", "--//config:env=prod").ok
+
+
+def test_unknown_build_setting_on_the_command_line() -> None:
+    result = env_ws().build("//config:pick", "--//config:enviroment=prod")
+    assert result.phase == "options"
+    assert result.error == (
+        "//config:enviroment :: Error loading option //config:enviroment: no such target '//config:enviroment': "
+        "target 'enviroment' not declared in package 'config' defined by config/BUILD.bazel"
+    )
+    assert env_ws().build("//config:pick", "--//config:pick=1").error == (
+        "//config:pick :: Unrecognized option: //config:pick"
+    )
+    assert env_ws().build("//config:pick", "--//config:env").error == (
+        "--//config:env :: Expected value after --//config:env"
+    )
+    assert env_ws().build("//config:pick", "--no//config:env").error == (
+        "//config:env :: Illegal use of 'no' prefix on non-boolean option: //config:env"
+    )
+
+
+def test_string_flag_value_must_be_listed() -> None:
+    result = env_ws().build("//config:envpick", "--//config:env=qa")
+    assert not result.ok
+    assert (
+        'Error in fail: Error setting //config:env: invalid value \'qa\'. Allowed values are ["dev", "staging", "prod"]'
+    ) in result.error
+    assert "errors encountered resolving select() keys for //config:envpick" in result.error
+    with pytest.raises(mb.BazelError, match="invalid value 'qa'"):
+        env_ws().cquery("labels(srcs, //config:envpick)", "--//config:env=qa")
+    # analyzing the flag itself fails too, even when no select reads it
+    assert "invalid value 'qa'" in env_ws().build("//config:env", "--//config:env=qa").error
+
+
+@pytest.mark.parametrize(
+    ("value", "picked"), [("true", "b"), ("True", "b"), ("1", "b"), ("yes", "b"), ("no", "d"), ("0", "d")]
+)
+def test_bool_flag_values(value: str, picked: str) -> None:
+    assert env_ws().cquery("labels(srcs, //config:vpick)", f"--//config:verbose={value}") == [f"//config:{picked}.txt"]
+
+
+@pytest.mark.parametrize("value", ["maybe", "2", ""])
+def test_bool_flag_rejects_other_values(value: str) -> None:
+    error = env_ws().build("//config:vpick", f"--//config:verbose={value}").error
+    assert error == f"While parsing option //config:verbose={value}: '{value}' is not a boolean"
+
+
+@pytest.mark.parametrize(
+    ("rc", "command", "expected"),
+    [
+        ("test --//config:env=prod\n", "cquery", "b"),  # cquery reads test lines
+        ("run --//config:env=prod\n", "cquery", "d"),  # ...but not run lines
+        ("cquery --//config:env=prod\n", "cquery", "b"),
+        ("query --//config:env=prod\n", "cquery", "d"),
+        ("build --//config:env=staging\ncommon --//config:env=prod\n", "cquery", "c"),  # build beats common
+        ("test --//config:env=staging\nbuild --//config:env=prod\n", "cquery", "c"),  # test beats build
+        ("test:prod --//config:env=prod\n", "cquery --config=prod", "b"),
+    ],
+)
+def test_bazelrc_inheritance_and_precedence(rc: str, command: str, expected: str) -> None:
+    flags = command.split()[1:]
+    assert env_ws(rc).cquery("labels(srcs, //config:envpick)", *flags) == [f"//config:{expected}.txt"]
+
+
+def test_bazelrc_config_is_looked_up_in_the_commands_sections() -> None:
+    rc = "build:prod --//config:env=prod\ntest:only --//config:env=prod\n"
+    with pytest.raises(mb.BazelError, match=r"Config value 'prod' is not defined in any \.rc file"):
+        env_ws(rc).query("//config:envpick", "--config=prod")
+    assert "Config value 'only' is not defined" in env_ws(rc).build("//config:envpick", "--config=only").error
+
+
+def test_bazelrc_config_expands_in_place() -> None:
+    bazel = env_ws("build:prod --//config:env=prod\nbuild:prod -c opt\n")
+    assert bazel.cquery("labels(srcs, //config:envpick)", "--config=prod", "--//config:env=staging") == [
+        "//config:c.txt"
+    ]
+    assert bazel.cquery("labels(srcs, //config:envpick)", "--//config:env=staging", "--config=prod") == [
+        "//config:b.txt"
+    ]
+    assert bazel.cquery("labels(srcs, //config:pick)", "--config", "prod") == ["//config:a.txt"]
+    nested = env_ws("build:a --config=b\nbuild:b --//config:env=staging\n")
+    assert nested.cquery("labels(srcs, //config:envpick)", "--config=a") == ["//config:c.txt"]
+    loop = env_ws("build:a --config=a\n")
+    assert "Config expansion has a cycle" in loop.build("//config:pick", "--config=a").error
+
+
+COMPAT_FILES = {
+    "platforms/BUILD.bazel": """
+constraint_setting(name = "accelerator", default_constraint_value = ":cpu_only")
+constraint_value(name = "cpu_only", constraint_setting = ":accelerator", visibility = ["//visibility:public"])
+constraint_value(name = "gpu", constraint_setting = ":accelerator", visibility = ["//visibility:public"])
+platform(name = "gpu_host", parents = ["@platforms//host"], constraint_values = [":gpu"])
+""",
+    "gpu/BUILD.bazel": PY
+    + """
+py_test(name = "cpu_math_test", srcs = ["cpu_math_test.py"])
+py_test(name = "train_test", srcs = ["train_test.py"], target_compatible_with = ["//platforms:gpu"])
+filegroup(name = "gpu_lib", target_compatible_with = ["//platforms:gpu"])
+py_test(name = "uses_gpu_test", srcs = ["cpu_math_test.py"], main = "cpu_math_test.py", data = [":gpu_lib"])
+filegroup(name = "never", target_compatible_with = ["@platforms//:incompatible"])
+filegroup(name = "uses_never", srcs = [":never"])
+filegroup(name = "sel_compat", target_compatible_with = select({
+    "//platforms:gpu": [],
+    "//conditions:default": ["@platforms//:incompatible"],
+}))
+filegroup(name = "cpu_only_lib", target_compatible_with = ["//platforms:cpu_only"])
+""",
+    "gpu/cpu_math_test.py": "",
+    "gpu/train_test.py": "",
+    "only/BUILD.bazel": PY
+    + 'py_test(name = "t", srcs = ["t.py"], target_compatible_with = ["@platforms//:incompatible"])\n',
+    "only/t.py": "",
+}
+
+
+def test_wildcards_skip_incompatible_targets() -> None:
+    bazel = ws(COMPAT_FILES)
+    result = bazel.test("//gpu:all")
+    assert result.ok, result.output
+    assert result.tests == ["//gpu:cpu_math_test"]
+    assert result.skipped == [
+        "//gpu:gpu_lib",
+        "//gpu:never",
+        "//gpu:sel_compat",
+        "//gpu:train_test",
+        "//gpu:uses_gpu_test",
+        "//gpu:uses_never",
+    ]
+    lines = result.output.splitlines()
+    assert "//gpu:train_test" + " " * 56 + "SKIPPED" in lines
+    assert "//gpu:uses_gpu_test" + " " * 53 + "SKIPPED" in lines
+    assert "Executed 0 out of 3 tests: 2 were skipped (the simulator analyzes; it does not run tests)." in lines
+    assert "//gpu:cpu_only_lib" in bazel.build("//gpu:all").targets  # default_constraint_value counts
+    on_gpu = bazel.test("//gpu:all", "--platforms=//platforms:gpu_host")
+    assert on_gpu.skipped == ["//gpu:cpu_only_lib", "//gpu:never", "//gpu:uses_never"]
+    assert "//gpu:train_test" in on_gpu.tests
+
+
+def test_only_skipped_tests_is_not_an_error() -> None:
+    result = ws(COMPAT_FILES).test("//only:all")
+    assert result.ok
+    assert result.output.splitlines()[1:] == [
+        "Target //only:t was skipped",
+        "//only:t" + " " * 64 + "SKIPPED",
+        "Executed 0 out of 1 test: 1 was skipped.",
+    ]
+    assert ws(COMPAT_FILES).build("//only:all").ok
+
+
+def test_explicitly_requested_incompatible_target_fails() -> None:
+    bazel = ws(COMPAT_FILES)
+    assert bazel.build("//gpu:uses_never").error == (
+        "Analysis of target '//gpu:uses_never' failed; build aborted: Target //gpu:uses_never is incompatible and "
+        "cannot be built, but was explicitly requested.\nDependency chain:\n    //gpu:uses_never (a7a71f)\n"
+        "    //gpu:never (a7a71f)   <-- target platform (@@platforms//host:host) didn't satisfy constraint "
+        "@@platforms//:incompatible"
+    )
+    test = bazel.test("//gpu:train_test")
+    assert not test.ok
+    assert (
+        "    //gpu:train_test (e722a2)   <-- target platform (@@platforms//host:host) didn't satisfy constraint "
+        "//platforms:gpu"
+    ) in test.error
+    assert test.output.endswith("ERROR: No test targets were found, yet testing was requested")
+    chain = bazel.build("//gpu:uses_gpu_test").error
+    assert "    //gpu:uses_gpu_test (e722a2)\n    //gpu:gpu_lib (a7a71f)   <-- target platform" in chain
+    assert "satisfy constraint @@platforms//:incompatible" in bazel.build("//gpu:sel_compat").error
+    assert bazel.build("//gpu:sel_compat", "--platforms=//platforms:gpu_host").ok
+    assert not bazel.build("//gpu:all", "//gpu:never").ok  # explicit wins even next to a wildcard
+    assert bazel.build("//gpu:train_test", "--platforms=//platforms:gpu_host").ok
+
+
+def test_cquery_prints_configuration_ids() -> None:
+    bazel = ws(COMPAT_FILES)
+    out = bazel.run_command("bazel cquery 'deps(//gpu:cpu_math_test, 1)'").output.splitlines()
+    assert out == ["//gpu:cpu_math_test (e722a21)", "//gpu:cpu_math_test.py (null)"]
+    assert bazel.run_command("bazel cquery //gpu:never").output == "//gpu:never (a7a71fd)"
+    opt = bazel.run_command("bazel cquery //gpu:never -c opt").output
+    assert re.fullmatch(r"//gpu:never \([0-9a-f]{7}\)", opt) and "a7a71fd" not in opt
+    assert bazel.cquery("//gpu:never") == ["//gpu:never"]  # the API stays plain labels
+
+
+def test_location_variables_in_args_and_env_must_be_prerequisites() -> None:
+    files = {
+        "tools/wc/BUILD.bazel": GO
+        + 'go_binary(name = "wc", srcs = ["main.go"], visibility = ["//visibility:public"])\n',
+        "tests/BUILD.bazel": PY
+        + 'py_test(name = "env_test", srcs = ["t.py"], main = "t.py", env = {"WC_BIN": "$(rlocationpath //tools/wc)"})\n'
+        + 'py_test(name = "args_test", srcs = ["t.py"], main = "t.py", args = ["$(rootpath //tools/wc)"])\n'
+        + 'py_binary(name = "ok", srcs = ["t.py"], main = "t.py", data = ["//tools/wc"], '
+        + 'args = ["$(rlocationpath //tools/wc)"], env = {"X": "$(location //tools/wc)"})\n',
+        "tests/t.py": "",
+        "tools/wc/main.go": "",
+    }
+    bazel = ws(files)
+    assert bazel.build("//tests:env_test").error == (
+        "tests/BUILD.bazel:2:8: in env[WC_BIN] attribute of py_test rule //tests:env_test: label '//tools/wc:wc' in "
+        "$(location) expression is not a declared prerequisite of this rule. Since this rule was created by the macro "
+        "'py_test', the error might have been caused by the macro implementation"
+    )
+    assert "in args attribute of py_test rule //tests:args_test: label '//tools/wc:wc' in $(location)" in (
+        bazel.build("//tests:args_test").error
+    )
+    assert bazel.build("//tests:ok").ok
+
+
+def test_run_binary_location_message() -> None:
+    files = {
+        "rb/BUILD.bazel": 'load("@bazel_skylib//rules:run_binary.bzl", "run_binary")\n'
+        + PY
+        + 'py_binary(name = "upper", srcs = ["upper.py"])\n'
+        + 'run_binary(name = "r", tool = ":upper", outs = ["r.txt"], args = ["$(location :words.txt)"])\n'
+    }
+    assert ws(files).build("//rb:r").error == (
+        "rb/BUILD.bazel:4:11: in run_binary rule //rb:r: label '//rb:words.txt' in $(location) expression is not a "
+        "declared prerequisite of this rule"
+    )
+
+
+def test_bazel_run_go_binary_path() -> None:
+    files = {"tools/wc/BUILD.bazel": GO + 'go_binary(name = "wc", srcs = ["main.go"])\n', "tools/wc/main.go": ""}
+    out = ws(files).run_command("bazel run //tools/wc").output
+    assert "INFO: Running command line: bazel-bin/tools/wc/wc_/wc (simulated: not executed)" in out
+
+
+GENRULE_FILES = {
+    "e/BUILD.bazel": PY
+    + 'load("@bazel_skylib//rules:write_file.bzl", "write_file")\n'
+    + 'load("@bazel_skylib//rules:copy_file.bzl", "copy_file")\n'
+    + 'load("@bazel_skylib//rules:build_test.bzl", "build_test")\n'
+    + """
+genrule(name = "home", outs = ["home.txt"], cmd = "echo $HOME > $@")
+genrule(name = "brace", outs = ["brace.txt"], cmd = "echo ${HOME} > $@")
+genrule(name = "loop", srcs = ["a.txt"], outs = ["loop.txt"], cmd = "for f in $(SRCS); do cat $f; done > $@")
+genrule(name = "ok", srcs = ["a.txt"], outs = ["ok.txt"], cmd = "for f in $(SRCS); do cat $$f; done > $@ # $$HOME")
+genrule(name = "endd", outs = ["endd.txt"], cmd = "echo > $@ $")
+filegroup(name = "two", srcs = ["a.txt", "b.txt"])
+filegroup(name = "none")
+genrule(name = "multi", srcs = [":two"], outs = ["multi.txt"], cmd = "cat $(location :two) > $@")
+genrule(name = "multis", srcs = [":two"], outs = ["multis.txt"], cmd = "cat $(locations :two) > $@")
+genrule(name = "empty", srcs = [":none"], outs = ["empty.txt"], cmd = "cat $(location :none) > $@")
+py_binary(name = "upper", srcs = ["upper.py"])
+genrule(name = "pysrc", srcs = [":upper"], outs = ["pysrc.txt"], cmd = "$(location :upper) > $@")
+genrule(name = "pyexec", srcs = [":upper"], outs = ["pyexec.txt"], cmd = "$(execpath :upper) > $@")
+genrule(name = "pytool", tools = [":upper"], outs = ["pytool.txt"], cmd = "$(location :upper) > $@")
+genrule(name = "gen2", outs = ["x.txt", "y.txt"], cmd = "touch $(OUTS)")
+genrule(name = "gen2use", srcs = [":gen2"], outs = ["gen2use.txt"], cmd = "cat $(location :gen2) > $@")
+genrule(name = "version.txt", outs = ["version.txt"], cmd = "echo 1 > $@")
+write_file(name = "wf", out = "wf.txt", content = ["a"])
+copy_file(name = "cf", src = "a.txt", out = "cf.txt")
+build_test(name = "bt", targets = [":wf"])
+""",
+    "e/a.txt": "",
+    "e/b.txt": "",
+    "e/upper.py": "",
+}
+
+
+def quiet(output: str) -> list[str]:
+    """Output lines without loading WARNING lines."""
+    return [line for line in output.splitlines() if not line.startswith("WARNING: ")]
+
+
+@pytest.mark.parametrize(
+    ("target", "message"),
+    [
+        (
+            "home",
+            "'$HOME' syntax is not supported; use '$(HOME)' instead for \"Make\" variables, or escape the '$' as '$$' if you intended this for the shell",
+        ),
+        ("brace", "'${HOME}' syntax is not supported; use '$(HOME)' instead for \"Make\" variables"),
+        ("loop", "'$f' syntax is not supported; use '$(f)' instead"),
+        ("endd", "unterminated $"),
+        (
+            "multi",
+            "label '//e:two' in $(location) expression expands to more than one file, please use $(locations //e:two) instead.  Files (at most 5 shown) are: [e/a.txt, e/b.txt]",
+        ),
+        ("empty", "label '//e:none' in $(location) expression expands to no files"),
+        (
+            "pysrc",
+            "label '//e:upper' in $(location) expression expands to more than one file, please use $(locations //e:upper) instead.  Files (at most 5 shown) are: [bazel-out/k8-fastbuild/bin/e/upper, e/upper.py]",
+        ),
+        ("pyexec", "label '//e:upper' in $(location) expression expands to more than one file"),
+        (
+            "gen2use",
+            "label '//e:gen2' in $(location) expression expands to more than one file, please use $(locations //e:gen2) instead.  Files (at most 5 shown) are: [bazel-out/k8-fastbuild/bin/e/x.txt, bazel-out/k8-fastbuild/bin/e/y.txt]",
+        ),
+    ],
+)
+def test_genrule_command_errors(target: str, message: str) -> None:
+    error = ws(GENRULE_FILES).build(f"//e:{target}").error
+    assert f"in cmd attribute of genrule rule //e:{target}: {message}" in error
+
+
+def test_genrule_commands_that_work() -> None:
+    bazel = ws(GENRULE_FILES)
+    for target in ("ok", "multis", "pytool", "version.txt", "gen2"):
+        assert bazel.build(f"//e:{target}").ok, (target, bazel.build(f"//e:{target}").error)
+
+
+def test_rule_named_like_its_output_warns() -> None:
+    bazel = ws(GENRULE_FILES)
+    out = bazel.run_command("bazel build //e:version.txt").output
+    warning = (
+        "WARNING: e/BUILD.bazel:22:8: target 'version.txt' is both a rule and a file; please choose another name for "
+        "the rule"
+    )
+    assert out.splitlines()[0] == warning
+    assert warning not in bazel.run_command("bazel build //e:version.txt").output  # the package is cached now
+
+
+def test_skylib_kinds_are_private_rule_classes() -> None:
+    bazel = ws(GENRULE_FILES)
+    kinds = bazel.run_command("bazel query 'kind(\"_write_file|_copy_file|_empty_test\", //e:all)' --output=label_kind")
+    assert quiet(kinds.output) == ["_empty_test rule //e:bt", "_copy_file rule //e:cf", "_write_file rule //e:wf"]
+    assert bazel.query("kind(write_file, //e:all)") == ["//e:wf"]
+
+
+LEGACY_MACRO_FILES = {
+    "mac/BUILD.bazel": "",
+    "mac/m.bzl": """
+def _helper(name):
+    native.filegroup(name = name + "_inner")
+
+def twice(name, visibility = None):
+    print("twice:", name)
+    native.filegroup(name = name, visibility = visibility)
+    _helper(name)
+""",
+    "e/BUILD.bazel": PY
+    + 'load("//mac:m.bzl", "twice")\ntwice(name = "tw")\nfilegroup(name = "plain")\n'
+    + 'py_binary(name = "pb", srcs = ["pb.py"])\n',
+}
+
+
+def test_legacy_macro_generator_attributes() -> None:
+    bazel = ws(LEGACY_MACRO_FILES)
+    assert bazel.query("attr(generator_function, twice, //e:all)") == ["//e:tw", "//e:tw_inner"]
+    assert bazel.query("attr(generator_name, tw, //e:all)") == ["//e:tw", "//e:tw_inner"]
+    assert bazel.query("attr(generator_function, py_binary, //e:all)") == ["//e:pb"]
+    assert bazel.target("//e:plain").attrs.get("generator_function") is None
+
+
+def test_print_shows_as_debug_lines_once() -> None:
+    bazel = ws(LEGACY_MACRO_FILES)
+    out = bazel.run_command("bazel query //e:all").output.splitlines()
+    assert out[0] == "DEBUG: mac/m.bzl:6:10: twice: tw"
+    assert "DEBUG" not in bazel.run_command("bazel query //e:all").output
+
+
+def test_query_output_build() -> None:
+    bazel = ws(LEGACY_MACRO_FILES)
+    assert bazel.run_command("bazel query //e:tw_inner --output=build").output.splitlines()[1:] == [
+        "# e/BUILD.bazel:3:6",
+        "filegroup(",
+        '  name = "tw_inner",',
+        '  generator_name = "tw",',
+        '  generator_function = "twice",',
+        '  generator_location = "e/BUILD.bazel:3:6",',
+        ")",
+        "# Rule tw_inner instantiated at (most recent call last):",
+        "#   e/BUILD.bazel:3:6 in <toplevel>",
+        "#   mac/m.bzl:8:12    in twice",
+        "#   mac/m.bzl:3:21    in _helper",
+    ]
+    two = ws(GENRULE_FILES).run_command("bazel query //e:two --output=build").output
+    assert quiet(two) == [
+        "# e/BUILD.bazel:11:10",
+        "filegroup(",
+        '  name = "two",',
+        '  srcs = ["//e:a.txt", "//e:b.txt"],',
+        ")",
+        "# Rule two instantiated at (most recent call last):",
+        "#   e/BUILD.bazel:11:10 in <toplevel>",
+    ]
+
+
+SYM_FILES = {
+    "mac/BUILD.bazel": "",
+    "mac/sym.bzl": """
+def _impl(name, visibility, src, n, extra):
+    native.genrule(name = name + "_gen", srcs = [src], outs = [name + ".upper.txt"], cmd = "cat $< > $@")
+    native.filegroup(name = name, srcs = [name + ".upper.txt"], visibility = visibility)
+
+shouted = macro(
+    implementation = _impl,
+    attrs = {
+        "src": attr.label(mandatory = True, allow_single_file = True, configurable = False),
+        "n": attr.int(default = 3),
+        "extra": attr.string_list(),
+    },
+)
+
+def _bad_impl(name, visibility):
+    native.filegroup(name = "gen")
+
+bad = macro(implementation = _bad_impl)
+
+def _cfg_impl(name, visibility, src):
+    native.filegroup(name = name, srcs = [src])
+
+cfgm = macro(implementation = _cfg_impl, attrs = {"src": attr.label()})
+""",
+    "memo/BUILD.bazel": 'load("//mac:sym.bzl", "shouted", "bad")\nshouted(name = "c", src = "c.txt")\n'
+    + 'filegroup(name = "peek", srcs = [":c.upper.txt"])\nfilegroup(name = "ok", srcs = [":c"])\nbad(name = "b")\n',
+    "memo/c.txt": "",
+}
+
+
+def test_symbolic_macro_targets_and_rules() -> None:
+    bazel = ws(SYM_FILES)
+    assert bazel.query("//memo:all") == ["//memo:c", "//memo:c_gen", "//memo:gen", "//memo:ok", "//memo:peek"]
+    assert bazel.build("//memo:c", "//memo:ok").ok
+    assert bazel.query("attr(generator_function, shouted, //memo:all)") == ["//memo:c", "//memo:c_gen"]
+    assert bazel.build("//memo:gen").error == (
+        "memo/BUILD.bazel:5:4: in filegroup rule //memo:gen: Target //memo:gen declared in symbolic macro 'b' "
+        "violates macro naming rules and cannot be built. Name must be the same as the macro's name, or the macro's "
+        "name followed by '_' (recommended), '-', or '.', and a non-empty string."
+    )
+    peek = bazel.build("//memo:peek").error
+    assert "in filegroup rule //memo:peek: Visibility error:\ntarget '//memo:c.upper.txt' is not visible from" in peek
+
+
+@pytest.mark.parametrize(
+    ("call", "message"),
+    [
+        (
+            'shouted(name = "d", src = ["c.txt"])',
+            "expected value of type 'string' for attribute 'src' of 'shouted', but got [\"c.txt\"] (list)",
+        ),
+        ('shouted(name = "d", src = "c.txt", out = "x")', "no such attribute 'out' in 'shouted' macro"),
+        ('shouted(name = "d")', "//sm:d: missing value for mandatory attribute 'src' in 'shouted' macro"),
+        (
+            'cfgm(name = "d", src = "c.txt")',
+            "expected value of type 'string' for element 0 of attribute 'srcs' of 'filegroup', but got select({\"//conditions:default\": Label(\"//sm:c.txt\")}) (select)",
+        ),
+    ],
+)
+def test_symbolic_macro_attribute_errors(call: str, message: str) -> None:
+    files = {**SYM_FILES, "sm/BUILD.bazel": f'load("//mac:sym.bzl", "shouted", "cfgm")\n{call}\n'}
+    assert message in ws(files).build("//sm:all").error
+
+
+def test_query_let_expressions() -> None:
+    bazel = ws(GENRULE_FILES)
+    assert bazel.query("let t = kind(genrule, //e:all) in rdeps(//e:all, //e:a.txt) ^ $t") == [
+        "//e:loop",
+        "//e:multi",
+        "//e:multis",
+        "//e:ok",
+    ]
+    with pytest.raises(mb.BazelError, match="undefined variable 'u'"):
+        bazel.query("let t = //e:two in $u")
+
+
+def test_query_file_paths_as_patterns() -> None:
+    bazel = ws(GENRULE_FILES)
+    assert bazel.query("e/a.txt") == ["//e:a.txt"]
+    assert bazel.query("set(e/a.txt e/upper.py)") == ["//e:a.txt", "//e:upper.py"]
+    assert bazel.query("e/a.txt + e/b.txt") == ["//e:a.txt", "//e:b.txt"]
+    assert bazel.build("e/a.txt").ok
+
+
+def test_somepath_prints_in_path_order(q: Any) -> None:
+    assert q.query("somepath(//a:app, //b:l3)") == ["//a:app", "//a:l1", "//a:l2", "//b:l3"]
+    files = {
+        "z/BUILD.bazel": 'filegroup(name = "a", srcs = [":m"])\nfilegroup(name = "m", srcs = ["//b:x"])\n',
+        "b/BUILD.bazel": 'filegroup(name = "x", visibility = ["//visibility:public"])\n',
+    }
+    bazel = ws(files)
+    assert bazel.query("somepath(//z:a, //b:x)") == ["//z:a", "//z:m", "//b:x"]
+    assert bazel.query("somepath(//z:a, //b:x) + //z:a") == ["//b:x", "//z:a", "//z:m"]  # sorted again
+
+
+def test_query_ranks() -> None:
+    bazel = ws(GENRULE_FILES)
+    assert quiet(bazel.run_command("bazel query 'deps(//e:gen2use)' --output=minrank").output) == [
+        "0 //e:gen2use",
+        "1 //e:gen2",
+    ]
+    files = {
+        "r/BUILD.bazel": 'filegroup(name = "a", srcs = [":b", ":c"])\nfilegroup(name = "b", srcs = [":c"])\n'
+        + 'filegroup(name = "c")\n'
+    }
+    bazel = ws(files)
+    assert bazel.run_command("bazel query 'deps(//r:a)' --output=minrank").output == "0 //r:a\n1 //r:b\n1 //r:c"
+    assert bazel.run_command("bazel query 'deps(//r:a)' --output=maxrank").output == "0 //r:a\n1 //r:b\n2 //r:c"
+    assert "not 'graph'" in bazel.run_command("bazel query //r:a --output=graph").output
+
+
+def test_config_setting_is_public_by_default() -> None:
+    files = {
+        "pv/BUILD.bazel": 'package(default_visibility = ["//visibility:private"])\n'
+        + 'config_setting(name = "cs", values = {"compilation_mode": "opt"})\nfilegroup(name = "fg")\n'
+    }
+    assert ws(files).query("attr(visibility, public, //pv:all)") == ["//pv:cs"]
