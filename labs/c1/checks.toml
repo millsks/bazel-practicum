@@ -1,5 +1,5 @@
-# Capstone 1 checks, grouped by milestone. The grader adds two packages to your copy:
-#   //grading/outsider  targets outside //services that try to use private targets (they must fail)
+# Capstone 1 checks, grouped by milestone. The grader adds three packages to your copy:
+#   //grading/outsider, //grading/outsider_go  targets that try to use private targets (they must fail)
 #   //services/grading  a second service package that uses //libs/pricing (it must pass)
 
 # ---------------------------------------------------------------- Milestone 1: modules and packages
@@ -51,7 +51,7 @@ message = "Only the pricing library reads the catalog: give //data:catalog visib
 
 [[check]]
 name = "M1: the Go money package is private to the fmtcli tool"
-command = ["build", "//grading/outsider:uses_money"]
+command = ["build", "//grading/outsider_go:uses_money"]
 expect = "failure"
 output_contains = ["target '//tools/fmtcli/money:money' is not visible from"]
 message = "Give //tools/fmtcli/money visibility = [\"//tools/fmtcli:__pkg__\"]; the binary is the public face of the tool."

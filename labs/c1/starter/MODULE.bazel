@@ -1,0 +1,12 @@
+module(name = "harbor")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(python_version = "3.13", is_default = True)
+
+# TODO(M1): the BUILD files you write will load from rules_go and bazel_skylib.
+#           Every rule set needs a bazel_dep, and Go needs a hermetic SDK (1.25.3).
+
+# TODO(M2): create a pip hub from //:requirements_lock.txt and make it visible as @pypi.
+#           rules_python reserves the hub name "pypi": name the hub after this module.

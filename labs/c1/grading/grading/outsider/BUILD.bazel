@@ -1,7 +1,6 @@
-load("@rules_go//go:def.bzl", "go_binary")
 load("@rules_python//python:defs.bzl", "py_library")
 
-# Grader probes: packages outside //services that try to reach private targets.
+# Grader probes: targets outside //services that try to use private Python targets.
 # Each must FAIL to build with "is not visible from". Tagged manual so //... skips them.
 
 py_library(
@@ -14,11 +13,4 @@ py_library(
     name = "uses_catalog",
     tags = ["manual"],
     deps = ["//data:catalog"],
-)
-
-go_binary(
-    name = "uses_money",
-    srcs = ["main.go"],
-    tags = ["manual"],
-    deps = ["//tools/fmtcli/money"],
 )

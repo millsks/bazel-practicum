@@ -1,0 +1,2 @@
+# TODO(M4): a string_flag named "region" (values "us" and "eu", default "us")
+#           and a config_setting named "eu" that other packages can select() on.

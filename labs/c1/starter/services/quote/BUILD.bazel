@@ -1,0 +1,27 @@
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
+
+py_library(
+    name = "quote_lib",
+    srcs = ["quote.py"],
+    deps = ["//libs/pricing"],
+)
+
+# bazel run //services/quote -- WIDGET=2 GADGET
+py_binary(
+    name = "quote",
+    srcs = ["main.py"],
+    deps = [":quote_lib"],
+)
+
+py_test(
+    name = "quote_test",
+    size = "large",
+    srcs = ["quote_test.py"],
+    deps = [":quote_lib"],
+)
+
+py_test(
+    name = "exhaustive_test",
+    srcs = ["exhaustive_test.py"],
+    deps = [":quote_lib"],
+)

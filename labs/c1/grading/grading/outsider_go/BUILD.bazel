@@ -1,0 +1,10 @@
+load("@rules_go//go:def.bzl", "go_binary")
+
+# Grader probe: a Go program outside //tools/fmtcli that imports the private money
+# package. It must FAIL to build with "is not visible from". Tagged manual.
+go_binary(
+    name = "uses_money",
+    srcs = ["main.go"],
+    tags = ["manual"],
+    deps = ["//tools/fmtcli/money"],
+)

@@ -1,0 +1,7 @@
+load("@rules_python//python:defs.bzl", "py_binary")
+
+# A code generator: catalog.csv in, a Python module out.
+py_binary(
+    name = "catalog_gen",
+    srcs = ["catalog_gen.py"],
+)

@@ -1,0 +1,10 @@
+# Workspace-wide Bazel options for the harbor monorepo.
+
+# TODO(M4): `--config=eu` should set the region flag to eu.
+
+# `--config=ci`: what the CI pipeline passes.
+build:ci -c opt
+test:ci --test_output=errors
+
+# Personal settings that should not be committed go in user.bazelrc.
+try-import %workspace%/user.bazelrc
