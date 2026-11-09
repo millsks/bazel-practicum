@@ -260,15 +260,12 @@ RULES: dict[str, RuleClass] = {
     ),
     "constraint_setting": _rc("constraint_setting", {"default_constraint_value": "label"}),
     "constraint_value": _rc("constraint_value", {"constraint_setting": "label"}, mandatory=("constraint_setting",)),
-    "py_library": _rc(
-        "py_library", _PY, provides=("PyInfo",), needs={"deps": _PYDEP}, exts={"srcs": (".py",)}, macro="py_library"
-    ),
+    "py_library": _rc("py_library", _PY, provides=("PyInfo",), needs={"deps": _PYDEP}, macro="py_library"),
     "py_binary": _rc(
         "py_binary",
         _PY_EXE,
         provides=("PyInfo",),
         needs={"deps": _PYDEP},
-        exts={"srcs": (".py",)},
         executable=True,
         macro="py_binary",
     ),
@@ -277,7 +274,6 @@ RULES: dict[str, RuleClass] = {
         {**_PY_EXE, **_TEST},
         provides=("PyInfo",),
         needs={"deps": _PYDEP},
-        exts={"srcs": (".py",)},
         test=True,
         executable=True,
         macro="py_test",
@@ -1262,6 +1258,14 @@ class Workspace:
                     else f"{where}: expected a list for attribute '{attr}' in '{kind}' rule"
                 )
             items = list(value)
+            if akind == "visibility":
+                for index, item in enumerate(items):
+                    pkg_part = item.split(":", 1)[0]
+                    if "..." in pkg_part.split("/"):
+                        raise _Fail(
+                            f"{where}: invalid label '{item}' in element {index} of attribute 'visibility' of "
+                            f"'{kind}': invalid label '{item}': package name cannot contain '...'"
+                        )
             if akind == "label_list":
                 for item in items:
                     try:
@@ -1909,11 +1913,16 @@ class _Analyzer:
                 self.check(dep_label)
                 continue
             if attr not in ("$implicit_tests",) and not self.visible(dep, target):
+                hint = (
+                    ". To set the visibility of that source file target, use the exports_files() function"
+                    if dep.kind == "source file"
+                    else ""
+                )
                 self.errors.append(
                     f"{where}: in {target.kind} rule {target.label}: Visibility error:\n"
                     f"target '{dep.label}' is not visible from\ntarget '{target.label}'\n"
                     "Recommendation: modify the visibility declaration if you think the dependency is legitimate. "
-                    "For more info see https://bazel.build/concepts/visibility"
+                    f"For more info see https://bazel.build/concepts/visibility{hint}"
                 )
             if (
                 dep.is_rule
@@ -1969,7 +1978,27 @@ class _Analyzer:
                 if path not in self.ws.files:
                     self.missing_inputs.append(str(dep.label))
             self.check(dep_label)
+        self._check_visibility_labels(target)
         self._rule_specific(target)
+
+    def _check_visibility_labels(self, target: Target) -> None:
+        """A visibility entry other than public/private/__pkg__/__subpackages__ must name a package_group."""
+        for v in target.attrs.get("visibility") or []:
+            if v in ("//visibility:public", "//visibility:private"):
+                continue
+            label = parse_label(v, target.label.package)
+            if label.name in ("__pkg__", "__subpackages__"):
+                continue
+            try:
+                group = self.ws.target(label)
+            except BazelError as exc:
+                text = str(exc)
+                if text.startswith("no such target"):
+                    text += f" and referenced by '{target.label}'"
+                self.errors.append(f"{target.location}: {text}")
+                continue
+            if group.kind != "package_group":
+                self.errors.append(f"{target.location}: Label '{label}' does not refer to a package group.")
 
     def _provides(self, dep: Target, needs: tuple[str, ...]) -> bool:
         if dep.kind == "alias":
@@ -2466,6 +2495,12 @@ class _Query:
             for v in values:
                 out.append((attr, parse_label(v, target.label.package)))
         out.extend(("$config_conditions", c) for c in _condition_labels(target))
+        # query also follows visibility labels that name package groups (not public/private/__pkg__/...)
+        for v in target.attrs.get("visibility") or [] if target.is_rule else []:
+            if v not in ("//visibility:public", "//visibility:private"):
+                label = parse_label(v, target.label.package)
+                if label.name not in ("__pkg__", "__subpackages__"):
+                    out.append(("$visibility", label))
         if target.kind == "test_suite" and not target.attrs.get("tests"):
             for t in self.ws.all_targets(target.label.package):
                 if t.rule_class is not None and t.rule_class.test and "manual" not in t.tags:

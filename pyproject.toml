@@ -19,7 +19,7 @@ practicum = "practicum.cli:main"
 packages = ["src/practicum"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/practicum", "README.md", "LICENSE"]
+include = ["/src/practicum", "/README.md", "/LICENSE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

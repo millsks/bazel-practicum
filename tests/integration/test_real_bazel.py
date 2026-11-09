@@ -97,7 +97,12 @@ def _real(workspace: Path, words: list[str]) -> tuple[bool, list[str]]:
     command, rest = words[0], words[1:]
     args = [command, "--nobuild", *rest] if command == "build" else [command, *rest]
     done = subprocess.run(
-        ["bazelisk", "--max_idle_secs=60", *args], cwd=workspace, capture_output=True, text=True, timeout=900, check=False
+        ["bazelisk", "--max_idle_secs=60", *args],
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+        timeout=900,
+        check=False,
     )
     labels = sorted(line for line in done.stdout.splitlines() if line.startswith("//"))
     return done.returncode == 0, labels

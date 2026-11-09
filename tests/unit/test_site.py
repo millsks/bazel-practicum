@@ -7,11 +7,17 @@ from practicum.site import check_site, load_curriculum, registered_visualizers, 
 from tests.conftest import page, write_manifest
 
 
-def quiz(questions: list[dict[str, object]]) -> str:
+def quiz(questions: list[object]) -> str:
     return json.dumps({"questions": questions})
 
 
-GOOD_SINGLE = {"type": "single", "prompt": "p", "options": ["a", "b"], "answer": 1, "explanation": "e"}
+GOOD_SINGLE: dict[str, object] = {
+    "type": "single",
+    "prompt": "p",
+    "options": ["a", "b"],
+    "answer": 1,
+    "explanation": "e",
+}
 
 
 def test_validate_quiz_accepts_every_type() -> None:

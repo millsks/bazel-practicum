@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Roadmap · Bazel Practicum</title>
+<link rel="stylesheet" href="../assets/css/course.css">
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/viz.js" defer></script>
+<script src="../assets/js/viz-bazel.js" defer></script>
+<script src="../assets/js/course.js" defer></script>
+</head>
+<body data-root="../" data-page="ref-roadmap">
+<main class="lesson">
+  <header class="lesson-hero">
+    <p class="eyebrow">Reference · The path</p>
+    <h1>Roadmap: Levels 2-3</h1>
+    <p class="lede">Level 1 teaches you to build a polyglot monorepo with Bazel 9. Level 2 makes that monorepo fast and
+      reproducible for a whole team: toolchains, remote caching and execution, CI, containers, and generated BUILD files.
+      Level 3 teaches you to extend Bazel itself with Starlark rules, providers, and aspects. This page describes both
+      and shows where Level 1 prepares you for each.</p>
+    <div class="lesson-meta"><span>⏱ Level 1 about 25-30 hours; Levels 2-3 planned</span><span>Level 1 available now</span></div>
+    <ul class="objectives">
+      <li>See every level, stage, and capstone in order</li>
+      <li>Know what Level 2 and Level 3 cover, and why each topic matters</li>
+      <li>See which Level 1 module each later topic builds on</li>
+      <li>Check yourself against the gate before moving on</li>
+    </ul>
+  </header>
+
+  <section class="lesson-section" id="overview">
+    <h2>The whole path at a glance</h2>
+    <pre class="mermaid">
+flowchart TD
+  M0[M00 Orientation] --> S1
+  subgraph L1[Level 1 Building with Bazel - available]
+    S1[Stage 1 Foundations] --> S2[Stage 2 Growing the monorepo] --> C1[Capstone 1 Polyglot monorepo]
+  end
+  C1 --> G1{{Gate 1}}
+  G1 --> S3
+  subgraph L2[Level 2 Bazel for a team - planned]
+    S3[Stage 3 Toolchains and hermeticity] --> S4[Stage 4 Remote cache and execution, CI] --> S5[Stage 5 Containers and Gazelle] --> C2[Capstone 2 A team-ready monorepo]
+  end
+  C2 --> G2{{Gate 2}}
+  G2 --> S6
+  subgraph L3[Level 3 Extending Bazel - planned]
+    S6[Stage 6 Starlark rules and providers] --> S7[Stage 7 Aspects and testing rules] --> C3[Capstone 3 A small rule set]
+  end
+</pre>
+    <table>
+      <thead><tr><th>Level</th><th>Stages</th><th>Capstone</th><th>Status</th></tr></thead>
+      <tbody>
+        <tr><td>1 Building with Bazel</td><td>M00; 1 Foundations (M01-M04); 2 Growing the monorepo (M05-M09)</td><td>c1 Polyglot monorepo</td><td><span class="tag">available</span></td></tr>
+        <tr><td>2 Bazel for a team</td><td>3 Toolchains and hermeticity; 4 Remote cache and execution, CI; 5 Containers with rules_oci, Gazelle</td><td>A team-ready monorepo</td><td><span class="tag">planned</span></td></tr>
+        <tr><td>3 Extending Bazel</td><td>6 Starlark rules and providers; 7 Aspects and testing rules</td><td>A small rule set of your own</td><td><span class="tag">planned</span></td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="lesson-section" id="gate-1">
+    <h2>Gate 1: are you ready for Level 2?</h2>
+    <p>You are ready when you can do these without looking anything up:</p>
+    <ul class="checklist" data-id="roadmap-gate1">
+      <li>Write BUILD files for a new Python package and a new Go package from a blank page</li>
+      <li>Add a PyPI dependency (lock file, hub, <code>@pypi//name</code>) and a BCR module</li>
+      <li>Explain the three phases and say which one a given error comes from</li>
+      <li>Fix a visibility error without making the target public</li>
+      <li>Write a <code>config_setting</code> and a <code>select()</code>, and check it with <code>cquery</code></li>
+      <li>Generate a file with a <code>genrule</code> or <code>run_binary</code> and test it with <code>diff_test</code></li>
+      <li>Answer "which tests does this change affect?" with <code>bazel query</code></li>
+      <li>Pass Capstone 1 with <code>pixi run grade c1</code></li>
+    </ul>
+  </section>
+
+  <section class="lesson-section" id="level-2">
+    <h2>Level 2: Bazel for a team</h2>
+    <p>Level 1 makes a monorepo correct. Level 2 makes it fast for everyone and identical everywhere. Each stage ends
+      with labs against real Bazel, as in Level 1.</p>
+
+    <h3>Stage 3: Toolchains and hermeticity</h3>
+    <p>A <strong>toolchain</strong> is how a rule finds its compiler or interpreter for a given platform, without
+      hard-coding a path. You have already used two: the Python interpreter from <code>python.toolchain</code> and the
+      Go SDK from <code>go_sdk.download</code>. Stage 3 opens the box.</p>
+    <ul>
+      <li><code>toolchain_type</code>, <code>toolchain()</code>, and <code>register_toolchains</code>: how Bazel picks
+        one toolchain per type for the target and execution platforms, and how to read
+        <code>--toolchain_resolution_debug</code> when it says "No matching toolchains found".</li>
+      <li>Execution versus target platforms, and cross-compiling a Go binary for <code>linux_arm64</code> from a Mac.</li>
+      <li>Hermeticity audits: finding actions that read the host (<code>/usr/bin</code>, <code>$HOME</code>, the network)
+        with sandboxing, <code>--incompatible_strict_action_env</code>, and <code>aquery</code>.</li>
+      <li>Hermetic C/C++ (for Python extensions and cgo) and why it is the hardest toolchain to pin.</li>
+    </ul>
+    <p><strong>Level 1 prepares you with:</strong> the Python and Go toolchains
+      (<a href="../modules/m03-rules-python.html">M03</a>, <a href="../modules/m07-rules-go.html">M07</a>), platforms and
+      <code>constraint_value</code>s in <code>select()</code> (<a href="../modules/m06-configuration.html">M06</a>), and
+      the sandbox and hermeticity ideas of <a href="../modules/m02-build-graph.html#hermeticity">M02</a>.</p>
+
+    <h3>Stage 4: Remote caching, remote execution, and CI</h3>
+    <p>Because every action's key is a hash of its command and inputs, its result can come from any machine that ran the
+      same action. That is the payoff of everything in Level 1.</p>
+    <ul>
+      <li><code>--disk_cache</code> first, then a remote cache (<code>--remote_cache=grpcs://...</code>) shared by CI and
+        developers: who may write to it, and why CI usually writes and laptops only read.</li>
+      <li>Remote execution (<code>--remote_executor</code>): running actions on a build farm, and the hermeticity it
+        demands.</li>
+      <li>Diagnosing cache misses: comparing execution logs between two machines to find the input that differs.</li>
+      <li>CI with Bazel: a <code>build:ci</code> config in <code>.bazelrc</code>, caching the repository cache and Bazelisk
+        downloads, and running only affected targets with <code>bazel query</code>.</li>
+      <li>Build event protocol (<code>--build_event_json_file</code>) and result UIs.</li>
+    </ul>
+    <p><strong>Level 1 prepares you with:</strong> action keys and <code>(cached) PASSED</code>
+      (<a href="../modules/m02-build-graph.html#incremental">M02</a>), <code>.bazelrc</code> and <code>--config</code>
+      (<a href="../modules/m06-configuration.html">M06</a>), and <code>rdeps</code> for affected tests
+      (<a href="../modules/m09-query-debugging.html">M09</a>).</p>
+
+    <h3>Stage 5: Containers with rules_oci, and Gazelle</h3>
+    <ul>
+      <li><strong>rules_oci</strong>: building OCI container images from your Python service and Go CLI without a Docker
+        daemon (<code>oci_image</code>, layers from <code>tar</code> rules, base images pulled by digest), and pushing
+        them from CI. Images become ordinary, cacheable build outputs.</li>
+      <li>Running container structure tests as <code>bazel test</code> targets.</li>
+      <li><strong>Gazelle</strong>: generating and updating BUILD files from your sources. For Go it reads
+        <code>import</code>s; with the rules_python Gazelle plugin it does the same for Python. You will learn what it
+        writes, the <code># gazelle:</code> directives that steer it, and how to keep hand-written and generated BUILD
+        files side by side.</li>
+    </ul>
+    <p><strong>Level 1 prepares you with:</strong> writing BUILD files by hand, so you can review what Gazelle generates
+      (<a href="../modules/m01-workspaces-targets.html">M01</a>, <a href="../modules/m07-rules-go.html">M07</a>), and
+      generated files and <code>run_binary</code> (<a href="../modules/m08-genrules-macros.html">M08</a>).</p>
+  </section>
+
+  <section class="lesson-section" id="level-3">
+    <h2>Level 3: Extending Bazel</h2>
+    <p>Macros (M08) can only arrange existing rules. When no rule does what you need, you write one. Level 3 is about
+      the Starlark that rule sets such as rules_python and rules_go are made of.</p>
+
+    <h3>Stage 6: Starlark rules and providers</h3>
+    <ul>
+      <li><code>rule()</code> and its implementation function: <code>ctx.attr</code>, <code>ctx.files</code>,
+        <code>ctx.actions.run</code>/<code>run_shell</code>/<code>write</code>, and declaring outputs.</li>
+      <li><strong>Providers</strong>: the typed data a target hands to the targets that depend on it. You met
+        <code>PyInfo</code> and <code>GoInfo</code> as "does not have mandatory providers" errors; here you define your
+        own with <code>provider()</code> and collect them across the graph with <code>depset</code>s.</li>
+      <li>Executable and test rules, runfiles, and <code>DefaultInfo</code>.</li>
+      <li>Custom build settings: writing the rule behind a <code>string_flag</code>, and transitions that change
+        configuration for part of the graph.</li>
+      <li>Module extensions: how <code>pip.parse</code> and <code>go_sdk.download</code> create repositories.</li>
+    </ul>
+    <p><strong>Level 1 prepares you with:</strong> Starlark in BUILD and <code>.bzl</code> files and macros
+      (<a href="../modules/m08-genrules-macros.html">M08</a>), providers as an analysis-time contract
+      (<a href="../modules/m02-build-graph.html#providers">M02</a>), the three phases
+      (<a href="../modules/m02-build-graph.html#phases">M02</a>), and module extensions from the user side
+      (<a href="../modules/m04-bzlmod-pypi.html">M04</a>).</p>
+
+    <h3>Stage 7: Aspects and testing rules</h3>
+    <ul>
+      <li><strong>Aspects</strong>: running extra analysis along the dependency graph without editing any BUILD file, the
+        way type checkers and linters (mypy, ruff, nogo) are wired into Bazel builds.</li>
+      <li>Testing rules with <code>bazel_skylib</code>'s <code>unittest.bzl</code> and <code>analysistest</code>: asserting
+        on the actions and providers a rule creates, and that it fails with the right message.</li>
+      <li>Documenting rules with Stardoc and publishing a module to a registry.</li>
+    </ul>
+    <p><strong>Level 1 prepares you with:</strong> <code>aquery</code> and <code>cquery</code>
+      (<a href="../modules/m09-query-debugging.html">M09</a>) and <code>diff_test</code>/<code>build_test</code>
+      (<a href="../modules/m08-genrules-macros.html">M08</a>).</p>
+  </section>
+
+  <section class="lesson-section" id="meanwhile">
+    <h2>While Levels 2-3 are being written</h2>
+    <ul>
+      <li><a href="https://bazel.build/extending/toolchains">Toolchains</a>,
+        <a href="https://bazel.build/remote/caching">remote caching</a>, and
+        <a href="https://bazel.build/remote/rbe">remote execution</a> on bazel.build</li>
+      <li><a href="https://github.com/bazel-contrib/rules_oci">rules_oci</a> and
+        <a href="https://github.com/bazel-contrib/bazel-gazelle">Gazelle</a></li>
+      <li><a href="https://bazel.build/extending/rules">Rules</a>, <a href="https://bazel.build/extending/aspects">aspects</a>,
+        and <a href="https://bazel.build/rules/testing">testing rules</a></li>
+      <li><a href="https://registry.bazel.build/">Bazel Central Registry</a>: read real rule sets' source</li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>

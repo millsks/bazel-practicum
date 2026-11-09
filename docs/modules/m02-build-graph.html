@@ -264,10 +264,6 @@ Recommendation: modify the visibility declaration if you think the dependency is
     <p>There are two good ways to share files across packages. <strong>Export the file</strong> when another package
       needs that one file by name. <strong>Wrap it in a visible <code>filegroup</code></strong> when you want to hand
       out a set of files under one stable name, so the owner can add or rename files without breaking users.</p>
-    <aside class="callout sim">
-      <p>The simulator reports both cases as a plain visibility error. Real Bazel's two messages are above; both are
-        fixed by <code>exports_files</code>.</p>
-    </aside>
     <p><strong>Remember:</strong> files are targets with visibility too; in Bazel 9 another package can use a source
       file only if its package exports it.</p>
   </section>

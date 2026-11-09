@@ -1,3 +1,4 @@
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -172,16 +173,16 @@ def test_stage_lab_without_grading_dir(fake_repo: Path) -> None:
 def test_stage_lab_requires_module_bazel(fake_repo: Path) -> None:
     lab = get_lab(fake_repo, "m01-lab1")
     (lab.starter_dir / "MODULE.bazel").unlink()
-    with pytest.raises(LabError, match="has no MODULE.bazel"):
+    with pytest.raises(LabError, match=r"has no MODULE\.bazel"):
         stage_lab(fake_repo, lab, Source.STARTER)
 
 
 def test_find_bazel_prefers_bazelisk(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(labs.shutil, "which", lambda name: f"/bin/{name}" if name == "bazelisk" else None)
+    monkeypatch.setattr(shutil, "which", lambda name: f"/bin/{name}" if name == "bazelisk" else None)
     assert find_bazel() == "/bin/bazelisk"
-    monkeypatch.setattr(labs.shutil, "which", lambda name: "/bin/bazel" if name == "bazel" else None)
+    monkeypatch.setattr(shutil, "which", lambda name: "/bin/bazel" if name == "bazel" else None)
     assert find_bazel() == "/bin/bazel"
-    monkeypatch.setattr(labs.shutil, "which", lambda name: None)
+    monkeypatch.setattr(shutil, "which", lambda name: None)
     with pytest.raises(LabError, match="bazelisk not found"):
         find_bazel()
 
@@ -322,7 +323,7 @@ def test_run_reports_timeouts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     def slow(*args: object, **kwargs: object) -> None:
         raise subprocess.TimeoutExpired(cmd="bazel", timeout=5, output=b"partial", stderr=None)
 
-    monkeypatch.setattr(labs.subprocess, "run", slow)
+    monkeypatch.setattr(subprocess, "run", slow)
     code, out, err = labs._run(["bazel"], tmp_path, 5)
     assert code == 124
     assert out == "partial"

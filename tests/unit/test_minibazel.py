@@ -106,7 +106,7 @@ def test_no_module_bazel() -> None:
     result = bazel.build("//...")
     assert result.phase == "loading"
     assert "only supported from within a workspace (below a directory having a MODULE.bazel file)" in result.error
-    with pytest.raises(mb.BazelError, match="MODULE.bazel"):
+    with pytest.raises(mb.BazelError, match=r"MODULE\.bazel"):
         bazel.query("//...")
 
 
@@ -508,7 +508,7 @@ def test_package_group_with_negative_spec_anywhere() -> None:
 def test_package_group_includes() -> None:
     files = {
         "lib/BUILD.bazel": 'package_group(name = "g", includes = [":h"])\npackage_group(name = "h", packages = ["//b"])\n'
-        'filegroup(name = "p", visibility = [":g", ":missing"])\n',
+        'filegroup(name = "p", visibility = [":g"])\n',
         "b/BUILD.bazel": 'filegroup(name = "u", srcs = ["//lib:p"])\n',
         "c/BUILD.bazel": 'filegroup(name = "u", srcs = ["//lib:p"])\n',
     }
@@ -575,8 +575,20 @@ def test_providers_through_alias_and_external() -> None:
 
 
 def test_misplaced_source_file() -> None:
-    files = {"a/BUILD.bazel": PY + 'py_library(name = "l", srcs = ["notes.txt"])\n', "a/notes.txt": ""}
-    assert "source file '//a:notes.txt' is misplaced here (expected .py)" in build_error(files)
+    files = {
+        "a/BUILD.bazel": GO + 'go_library(name = "l", srcs = ["notes.txt"], importpath = "l")\n',
+        "a/notes.txt": "",
+    }
+    assert "source file '//a:notes.txt' is misplaced here (expected .go, .s, .S, .h, .c, .cc)" in build_error(files)
+
+
+def test_py_rules_accept_any_file_in_srcs() -> None:
+    files = {
+        "y/BUILD.bazel": PY + 'py_binary(name = "y", srcs = ["hello.py", "c.yaml"], main = "hello.py")\n',
+        "y/hello.py": "",
+        "y/c.yaml": "",
+    }
+    assert ws(files).build("//y:y").ok
 
 
 def test_testonly() -> None:
@@ -1257,7 +1269,7 @@ def test_query_subtraction_without_space_and_sort_order() -> None:
     bazel = ws(files)
     assert bazel.query("//...") == ["//lib:l", "//tools:gen", "//tools/exp:x"]
     assert bazel.query("//... -//lib/...") == ["//tools:gen", "//tools/exp:x"]
-    with pytest.raises(mb.BazelError, match="invalid package name '...-//lib': package names may not contain '//'"):
+    with pytest.raises(mb.BazelError, match=r"invalid package name '\.\.\.-//lib': package names may not contain '//'"):
         bazel.query("//...-//lib/...")
 
 
@@ -1318,3 +1330,34 @@ def test_python_version_needs_a_registered_toolchain() -> None:
     default = mb.Bazel({"MODULE.bazel": MODULE, "p/BUILD.bazel": build, "p/v.py": ""})
     assert default.build("//p:v314").ok
     assert not default.build("//p:v313").ok
+
+
+def test_source_file_visibility_error_mentions_exports_files() -> None:
+    error = _vis('filegroup(name = "fg", srcs = ["f.txt"])\n', "//b:f.txt").error
+    assert error.endswith(
+        "For more info see https://bazel.build/concepts/visibility. To set the visibility of that source file "
+        "target, use the exports_files() function"
+    )
+    assert "exports_files() function" not in _vis('filegroup(name = "lib")\n').error
+
+
+def test_visibility_entries_must_name_package_groups() -> None:
+    files = {
+        "app/BUILD.bazel": 'filegroup(name = "w")\n',
+        "v1/BUILD.bazel": 'filegroup(name = "p", visibility = ["//app"])\n',
+        "v2/BUILD.bazel": 'filegroup(name = "p", visibility = ["//app/..."])\n',
+        "v3/BUILD.bazel": 'filegroup(name = "p", visibility = ["//app:w"])\n',
+    }
+    bazel = ws(files)
+    assert (
+        "v1/BUILD.bazel:1:10: no such target '//app:app': target 'app' not declared in package 'app' defined by "
+        "app/BUILD.bazel and referenced by '//v1:p'"
+    ) in bazel.build("//v1:p").error
+    loading = bazel.build("//v2:p")
+    assert loading.phase == "loading"
+    assert (
+        "//v2:p: invalid label '//app/...' in element 0 of attribute 'visibility' of 'filegroup': invalid label "
+        "'//app/...': package name cannot contain '...'"
+    ) in loading.error
+    assert "v3/BUILD.bazel:1:10: Label '//app:w' does not refer to a package group." in bazel.build("//v3:p").error
+    assert bazel.query("deps(//v3:p)") == ["//app:w", "//v3:p"]

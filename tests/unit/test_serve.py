@@ -1,10 +1,11 @@
 import threading
 import urllib.request
+import webbrowser
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
 
-from practicum import serve as serve_module
 from practicum.serve import make_server, serve
 
 
@@ -27,12 +28,12 @@ def test_server_serves_site_files(tmp_path: Path) -> None:
 
 def test_serve_opens_browser_and_stops(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     opened: list[str] = []
-    monkeypatch.setattr(serve_module.webbrowser, "open", opened.append)
+    monkeypatch.setattr(webbrowser, "open", opened.append)
 
     def stop_immediately(self: object) -> None:
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(serve_module.ThreadingHTTPServer, "serve_forever", stop_immediately)
+    monkeypatch.setattr(ThreadingHTTPServer, "serve_forever", stop_immediately)
     with pytest.raises(KeyboardInterrupt):
         serve(tmp_path, port=0)
     assert opened and opened[0].startswith("http://127.0.0.1:")
@@ -40,7 +41,7 @@ def test_serve_opens_browser_and_stops(tmp_path: Path, monkeypatch: pytest.Monke
 
 def test_serve_without_browser(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     opened: list[str] = []
-    monkeypatch.setattr(serve_module.webbrowser, "open", opened.append)
-    monkeypatch.setattr(serve_module.ThreadingHTTPServer, "serve_forever", lambda self: None)
+    monkeypatch.setattr(webbrowser, "open", opened.append)
+    monkeypatch.setattr(ThreadingHTTPServer, "serve_forever", lambda self: None)
     serve(tmp_path, port=0, open_browser=False)
     assert opened == []

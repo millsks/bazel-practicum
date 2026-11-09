@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Command Reference · Bazel Practicum</title>
+<link rel="stylesheet" href="../assets/css/course.css">
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/viz.js" defer></script>
+<script src="../assets/js/viz-bazel.js" defer></script>
+<script src="../assets/js/course.js" defer></script>
+</head>
+<body data-root="../" data-page="ref-commands">
+<main class="lesson">
+  <header class="lesson-hero">
+    <p class="eyebrow">Reference · Commands</p>
+    <h1>Command Reference</h1>
+    <p class="lede">The <code>bazel</code> commands, flags, target patterns, and query functions this course uses, with
+      what each is for. This page is for looking things up; the modules teach each one properly.</p>
+    <div class="lesson-meta"><span>⏱ Look things up as you go</span><span>Bazel 9.3.2 through Bazelisk</span></div>
+    <ul class="objectives">
+      <li>Pick the right command: build, run, test, query, cquery, aquery, mod, info, clean</li>
+      <li>Find the flag that changes configuration, test selection, or output</li>
+      <li>Write target patterns and query expressions without guessing</li>
+    </ul>
+  </header>
+
+  <section class="lesson-section" id="running">
+    <h2>Running Bazel in this course</h2>
+    <p>Pixi installs Bazelisk, which reads <code>.bazelversion</code> and runs that Bazel (9.3.2 everywhere here).
+      Inside this repository, <code>pixi run bazel ...</code> works from any directory; <code>pixi shell</code> puts
+      <code>bazel</code> on <code>PATH</code> for a whole session.</p>
+    <pre data-label="Terminal"><code class="language-bash">pixi run bazel version          # which Bazel Bazelisk runs
+pixi run bazel build //...       # build every rule target in the main repository
+pixi run bazel test //...        # build, then run every non-manual test</code></pre>
+    <aside class="callout pixi">
+      <p>For a workspace outside this repository: <code>pixi add bazelisk</code>, write <code>9.3.2</code> to
+        <code>.bazelversion</code>, and run <code>pixi run bazelisk ...</code>.</p>
+    </aside>
+    <p>Everything a command does is <code>bazel [startup options] &lt;command&gt; [options] &lt;targets&gt;</code>. Bazel
+      rejects options it does not know (<code>ERROR: --name :: Unrecognized option: --name</code>), so arguments for
+      your own program go after <code>--</code>.</p>
+  </section>
+
+  <section class="lesson-section" id="commands">
+    <h2>Commands</h2>
+    <table>
+      <thead><tr><th>Command</th><th>What it does</th><th>Taught in</th></tr></thead>
+      <tbody>
+        <tr><td><code>bazel build PATTERNS</code></td><td>Loads, analyzes, and runs the actions needed for the targets' outputs (under <code>bazel-bin/</code>).</td><td><a href="../modules/m01-workspaces-targets.html#commands">M01</a></td></tr>
+        <tr><td><code>bazel run TARGET -- ARGS</code></td><td>Builds one executable target, then runs it from its runfiles tree. <code>ARGS</code> go to your program; <code>BUILD_WORKSPACE_DIRECTORY</code> tells it where the workspace is.</td><td><a href="../modules/m01-workspaces-targets.html#commands">M01</a>, <a href="../modules/m03-rules-python.html#runfiles">M03</a></td></tr>
+        <tr><td><code>bazel test PATTERNS</code></td><td>Builds the targets, then runs the tests among them (and the tests their <code>test_suite</code>s name). Unchanged tests report <code>(cached) PASSED</code>.</td><td><a href="../modules/m05-testing.html">M05</a></td></tr>
+        <tr><td><code>bazel coverage PATTERNS</code></td><td>Like <code>test</code>, collecting coverage data.</td><td>M05</td></tr>
+        <tr><td><code>bazel query EXPR</code></td><td>Asks questions of the target graph <em>before</em> configuration: every branch of every <code>select()</code>, plus implicit and toolchain dependencies.</td><td><a href="../modules/m09-query-debugging.html">M09</a></td></tr>
+        <tr><td><code>bazel cquery EXPR</code></td><td>Query after configuration: <code>select()</code> resolved for the flags you pass. Labels print with a configuration id, such as <code>//app:hello (a7a71fd)</code>.</td><td><a href="../modules/m06-configuration.html">M06</a>, M09</td></tr>
+        <tr><td><code>bazel aquery EXPR</code></td><td>The actions (commands, inputs, outputs, mnemonics) analysis creates.</td><td>M09</td></tr>
+        <tr><td><code>bazel mod graph</code>, <code>bazel mod deps M</code></td><td>The resolved Bzlmod dependency graph, as a tree.</td><td><a href="../modules/m04-bzlmod-pypi.html">M04</a></td></tr>
+        <tr><td><code>bazel info [KEY]</code></td><td>Paths and settings: <code>bazel-bin</code>, <code>output_base</code>, <code>execution_root</code>, ...</td><td>M02</td></tr>
+        <tr><td><code>bazel fetch</code></td><td>Downloads external repositories without building.</td><td>M04</td></tr>
+        <tr><td><code>bazel clean</code></td><td>Deletes outputs. Almost never needed: the cache is keyed by content. <code>--expunge</code> also deletes fetched repositories.</td><td><a href="../modules/m02-build-graph.html#incremental">M02</a></td></tr>
+        <tr><td><code>bazel shutdown</code></td><td>Stops this workspace's Bazel server (it otherwise idles in memory).</td><td>M02</td></tr>
+        <tr><td><code>bazel version</code></td><td>Prints the Bazel version.</td><td><a href="../modules/m00-orientation.html#labs">M00</a></td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="lesson-section" id="patterns">
+    <h2>Target patterns</h2>
+    <table>
+      <thead><tr><th>Pattern</th><th>Means</th></tr></thead>
+      <tbody>
+        <tr><td><code>//app:hello</code></td><td>One target. <code>//app</code> is short for <code>//app:app</code>.</td></tr>
+        <tr><td><code>//app:all</code></td><td>Every rule target in the package <code>app</code>.</td></tr>
+        <tr><td><code>//app:*</code> or <code>//app:all-targets</code></td><td>Every target in the package, files included.</td></tr>
+        <tr><td><code>//app/...</code></td><td>Every rule target in <code>app</code> and every package below it.</td></tr>
+        <tr><td><code>//...</code></td><td>Every rule target in the main repository (not files).</td></tr>
+        <tr><td><code>-- //... -//tools/...</code></td><td>Exclusion. Negative patterns are only allowed after <code>--</code> and apply left to right: <code>-- -//tools/... //...</code> adds the excluded targets back.</td></tr>
+      </tbody>
+    </table>
+    <p>Wildcards (<code>...</code>, <code>:all</code>, <code>:*</code>) skip targets tagged <code>manual</code>; name one
+      explicitly to build it. A <code>test_suite</code> that lists a manual test still runs it.</p>
+    <p>Without <code>--</code>, a negative pattern is an error: <code>bazel build //... -//tools/...</code> prints
+      <code>ERROR: Invalid options syntax: -//tools/...</code>.</p>
+  </section>
+
+  <section class="lesson-section" id="flags">
+    <h2>Common flags</h2>
+    <h3>Configuration (changes what is built)</h3>
+    <table>
+      <thead><tr><th>Flag</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td><code>-c opt</code> (<code>--compilation_mode</code>)</td><td><code>fastbuild</code> (default), <code>dbg</code>, or <code>opt</code>. Matched by <code>config_setting(values = {"compilation_mode": "opt"})</code>.</td></tr>
+        <tr><td><code>--define=key=value</code></td><td>A free-form key matched by <code>config_setting(define_values = {...})</code>.</td></tr>
+        <tr><td><code>--//pkg:flag=value</code>, <code>--//pkg:flag</code>, <code>--no//pkg:flag</code></td><td>Sets a user-defined build setting (<code>bool_flag</code>, <code>string_flag</code> from <code>bazel_skylib</code>).</td></tr>
+        <tr><td><code>--platforms=//:linux_arm64</code></td><td>The target platform; <code>select()</code> on <code>constraint_value</code>s follows it.</td></tr>
+        <tr><td><code>--config=NAME</code></td><td>Expands the <code>build:NAME</code> (and <code>common:NAME</code>, <code>test:NAME</code>, ...) lines of <code>.bazelrc</code>.</td></tr>
+      </tbody>
+    </table>
+    <h3>Tests</h3>
+    <table>
+      <thead><tr><th>Flag</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td><code>--test_output=errors|all|streamed|summary</code></td><td>How much test output to print. <code>errors</code> shows the log of failing tests.</td></tr>
+        <tr><td><code>--test_tag_filters=-slow,integration</code></td><td>Run only tests with (or, with <code>-</code>, without) these tags. Size counts as a tag.</td></tr>
+        <tr><td><code>--test_size_filters=small,medium</code></td><td>Run only tests of these sizes.</td></tr>
+        <tr><td><code>--build_tests_only</code></td><td>Build only the tests that will run, not every target matched.</td></tr>
+        <tr><td><code>--test_filter=NAME</code></td><td>Passed to the test as <code>TESTBRIDGE_TEST_ONLY</code>; the test framework decides what it means.</td></tr>
+        <tr><td><code>--test_arg=ARG</code></td><td>An argument for the test program (repeat for several).</td></tr>
+        <tr><td><code>--runs_per_test=N</code>, <code>--nocache_test_results</code></td><td>Rerun tests to hunt flakiness; ignore cached results.</td></tr>
+      </tbody>
+    </table>
+    <h3>Builds and debugging</h3>
+    <table>
+      <thead><tr><th>Flag</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td><code>--keep_going</code> (<code>-k</code>)</td><td>Keep building independent targets after an error.</td></tr>
+        <tr><td><code>--nobuild</code></td><td>Stop after analysis: checks the graph without running actions.</td></tr>
+        <tr><td><code>--verbose_failures</code></td><td>Print the full command line of a failing action.</td></tr>
+        <tr><td><code>--disk_cache=PATH</code></td><td>A local cache shared between workspaces and <code>bazel clean</code>s.</td></tr>
+        <tr><td><code>--explain=FILE --verbose_explanations</code></td><td>Writes why each action ran (for example "no entry in the cache").</td></tr>
+        <tr><td><code>--announce_rc</code></td><td>Prints which <code>.bazelrc</code> lines applied.</td></tr>
+        <tr><td><code>--toolchain_resolution_debug=REGEX</code></td><td>Explains toolchain selection ("No matching toolchains found").</td></tr>
+      </tbody>
+    </table>
+    <aside class="callout pro">
+      <p>Put team-wide flags in a checked-in <code>.bazelrc</code> (<code>common --keep_going</code>,
+        <code>test --test_output=errors</code>, a <code>build:ci</code> config) instead of shell aliases, so every developer
+        and CI run the same build.</p>
+    </aside>
+  </section>
+
+  <section class="lesson-section" id="query">
+    <h2>Query functions</h2>
+    <p>Quote query expressions in the shell: <code>bazel query 'deps(//app:hello)'</code>. Results are sorted labels
+      (by package, then name: <code>//tools:gen</code> before <code>//tools/exp:x</code>).</p>
+    <table>
+      <thead><tr><th>Expression</th><th>Returns</th></tr></thead>
+      <tbody>
+        <tr><td><code>deps(X)</code>, <code>deps(X, N)</code></td><td>X and everything it depends on (to depth N).</td></tr>
+        <tr><td><code>rdeps(U, X)</code>, <code>rdeps(U, X, N)</code></td><td>Targets in universe U that depend on X: "what breaks if I change this?"</td></tr>
+        <tr><td><code>allrdeps(X)</code></td><td>Reverse deps in the whole loaded graph; requires <code>--universe_scope=//...</code> (or <code>--infer_universe_scope</code>), otherwise it is an unknown function.</td></tr>
+        <tr><td><code>somepath(A, B)</code>, <code>allpaths(A, B)</code></td><td>One path, or every target on any path, from A to B.</td></tr>
+        <tr><td><code>kind(REGEX, X)</code></td><td>Targets whose kind matches, such as <code>py_test</code> or <code>"source file"</code>.</td></tr>
+        <tr><td><code>attr(NAME, REGEX, X)</code></td><td>Targets whose attribute matches, such as <code>attr(tags, manual, //...)</code>.</td></tr>
+        <tr><td><code>filter(REGEX, X)</code></td><td>Targets whose label matches.</td></tr>
+        <tr><td><code>labels(ATTR, X)</code></td><td>The labels in one attribute, such as <code>labels(srcs, //app:hello)</code>.</td></tr>
+        <tr><td><code>tests(X)</code></td><td>The tests in X, with <code>test_suite</code>s expanded.</td></tr>
+        <tr><td><code>siblings(X)</code></td><td>Every target in the packages of X.</td></tr>
+        <tr><td><code>buildfiles(X)</code></td><td>The BUILD and .bzl files that define X.</td></tr>
+        <tr><td><code>set(A B C)</code></td><td>A literal set of labels (space-separated).</td></tr>
+        <tr><td><code>X + Y</code>, <code>X - Y</code>, <code>X ^ Y</code></td><td>Union, difference, intersection (also <code>union</code>, <code>except</code>, <code>intersect</code>). Write spaces around <code>-</code>: <code>//...-//a/...</code> is one (invalid) pattern.</td></tr>
+      </tbody>
+    </table>
+    <h3>Output formats</h3>
+    <table>
+      <thead><tr><th>Flag</th><th>Prints</th></tr></thead>
+      <tbody>
+        <tr><td><code>--output=label</code> (default)</td><td><code>//app:hello</code></td></tr>
+        <tr><td><code>--output=label_kind</code></td><td><code>py_binary rule //app:hello</code></td></tr>
+        <tr><td><code>--output=package</code></td><td>The packages of the results: <code>app</code></td></tr>
+        <tr><td><code>--output=build</code></td><td>Each rule as it would appear in a BUILD file (with macros expanded).</td></tr>
+        <tr><td><code>--output=location</code></td><td><code>/path/to/ws/app/BUILD.bazel:2:10: py_binary rule //app:hello</code> (absolute path)</td></tr>
+        <tr><td><code>--output=graph</code></td><td>Graphviz dot.</td></tr>
+        <tr><td><code>--output=xml|proto|streamed_jsonproto</code></td><td>Machine-readable forms for tools.</td></tr>
+        <tr><td><code>cquery --output=files</code></td><td>The output files a target produces, such as <code>bazel-out/k8-fastbuild/bin/a/g.txt</code>.</td></tr>
+      </tbody>
+    </table>
+    <p><code>--noimplicit_deps</code> hides most implicit dependencies (toolchains, launchers); <code>--notool_deps</code>
+      hides tools built for the execution platform.</p>
+    <aside class="callout sim">
+      <p>The in-page simulator supports <code>query</code> and <code>cquery</code> with <code>--output=label</code>,
+        <code>label_kind</code>, and <code>package</code>, and the functions above. It does not show implicit or toolchain
+        dependencies, and it has no <code>aquery</code>: use a lab for those.</p>
+    </aside>
+  </section>
+
+  <section class="lesson-section" id="further">
+    <h2>Going further</h2>
+    <ul>
+      <li><a href="https://bazel.build/reference/command-line-reference">Command-line reference</a> on bazel.build</li>
+      <li><a href="https://bazel.build/query/language">The query language</a> and <a href="https://bazel.build/query/cquery">cquery</a></li>
+      <li><a href="https://bazel.build/run/build#specifying-build-targets">Specifying targets to build</a></li>
+      <li><a href="https://bazel.build/run/bazelrc">The .bazelrc file</a></li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>

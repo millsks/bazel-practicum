@@ -224,11 +224,6 @@ ERROR: Build did NOT complete successfully</code></pre>
       <code>could not find 'main.py' as specified by 'main' attribute</code>. The same rule applies to
       <code>py_test</code>: a test named <code>routes_test</code> whose file is <code>tests/test_routes.py</code> needs
       <code>main = "tests/test_routes.py"</code>.</p>
-    <aside class="callout sim">
-      <p>Real rules_python matches the default by the <em>end</em> of the path, so <code>name = "test_routes"</code> with
-        <code>srcs = ["tests/test_routes.py"]</code> works without <code>main</code>. The simulator only accepts an exact
-        file name. Setting <code>main</code> to the full path, as above, works in both.</p>
-    </aside>
     <p>Try it: the build fails. Add <code>main = "main.py"</code>, and build again.</p>
     <div class="runnable" data-title="The default-main error" data-commands="bazel build //app:server|bazel run //app:server">
 <textarea class="file" data-path="MODULE.bazel" data-readonly>
@@ -496,10 +491,6 @@ python.toolchain(python_version = "3.12")</code></pre>
 Hello, Python 3.12.16!</code></pre>
     <p>The same <code>hello.py</code> run as <code>//hello:hello</code> prints <code>Hello, Python 3.13.18!</code>. The
       library <code>:greeting</code> is built for whichever version the binary uses.</p>
-    <aside class="callout sim">
-      <p>The simulator does not resolve toolchains: it accepts any <code>python_version</code>. Only real Bazel reports
-        the "No matching toolchains" error above.</p>
-    </aside>
     <aside class="callout think">
       <p>Pixi pins your <em>development</em> tools here (Bazelisk). Bazel pins the Python that <em>builds and tests</em>
         your code. Why might a team want those to be separate?</p>

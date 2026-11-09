@@ -3,7 +3,8 @@ from typing import Any
 
 import pytest
 
-from practicum import cli
+import practicum.cli as cli
+from practicum.bundle import BundleError
 from practicum.exercises import ExerciseResult
 from practicum.labs import CheckResult, Lab, Source
 from practicum.workspace import ROOT_ENV_VAR
@@ -176,7 +177,7 @@ def test_bundle_writes_file(in_repo: Path, capsys: pytest.CaptureFixture[str], m
 
 def test_bundle_failure_returns_one(capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch) -> None:
     def broken(site_root: Path, out: Path) -> tuple[int, int]:
-        raise cli.BundleError("no manifest")
+        raise BundleError("no manifest")
 
     monkeypatch.setattr(cli, "write_bundle", broken)
     assert cli.main(["bundle"]) == 1

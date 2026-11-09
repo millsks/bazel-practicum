@@ -14,6 +14,7 @@ from practicum.bundle import (
     read_page,
     write_bundle,
 )
+from practicum.site import load_curriculum
 from tests.conftest import page, write_manifest
 
 MODULE_BODY = """
@@ -26,7 +27,7 @@ MODULE_BODY = """
   <section class="lesson-section" id="quiz"><div class="quiz" data-id="m01-quiz"></div></section>
   <section class="lesson-section" id="lab">
     <div class="lab" data-id="m01-lab1"></div>
-    <ul class="checklist" data-id="m01-mini"><li>One <img src="a.png"></li><li>Two <ul><li>nested</li></ul></li><li>Three</li></ul>
+    <ul class="checklist" data-id="m01-mini"><li>One <img src="a.png"><br/></li><li>Two <ul><li>nested</li></ul></li><li>Three</li></ul>
   </section>
 </main>
 """
@@ -97,7 +98,7 @@ def test_read_page_missing_raises(site: Path) -> None:
 
 
 def test_collect_pages_covers_manifest_and_home(site: Path) -> None:
-    pages = collect_pages(site, bundle.load_curriculum(site))
+    pages = collect_pages(site, load_curriculum(site))
     assert {path: (p.id, p.kind) for path, p in pages.items()} == {
         "index.html": ("home", "home"),
         "modules/m01.html": ("m01", "module"),
@@ -107,7 +108,7 @@ def test_collect_pages_covers_manifest_and_home(site: Path) -> None:
 
 
 def test_collect_pages_rejects_duplicate_ids(site: Path) -> None:
-    manifest = {"parts": [{"modules": [{"id": "m01", "href": "modules/m01.html"}], "projects": []}]}
+    manifest: dict[str, object] = {"parts": [{"modules": [{"id": "m01", "href": "modules/m01.html"}], "projects": []}]}
     manifest["reference"] = [{"id": "m01", "href": "reference/glossary.html"}]
     with pytest.raises(BundleError, match="duplicate id"):
         collect_pages(site, manifest)

@@ -220,11 +220,6 @@ ERROR: Error evaluating '//lib': error loading package 'lib': Package 'lib' cont
 INFO: Elapsed time: 0.226s
 INFO: 0 processes.
 ERROR: Build did NOT complete successfully</code></pre>
-    <aside class="callout sim">
-      <p>The simulator reports the same mistake later, during analysis, as <code>no such target '//lib:testdata/words.txt'</code>
-        with the hint <code>(perhaps you meant //lib/testdata:words.txt)</code>. Same cause, same fix; real Bazel's wording
-        is the one above.</p>
-    </aside>
     <p>Move the colon: <code>"//lib/testdata:words.txt"</code>. The colon separates the <em>package</em> from the
       <em>target name</em>, so it must sit exactly at the package boundary. The <code>exports_files()</code> call in
       <code>lib/testdata/BUILD.bazel</code> is what lets another package use that file; without it you get a visibility
