@@ -1,0 +1,14 @@
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "invoice",
+    srcs = ["invoice.py"],
+    deps = ["//common:utils"],
+)
+
+py_test(
+    name = "invoice_test",
+    size = "small",
+    srcs = ["invoice_test.py"],
+    deps = [":invoice"],
+)

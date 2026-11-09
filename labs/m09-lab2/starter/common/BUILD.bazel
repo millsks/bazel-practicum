@@ -1,0 +1,23 @@
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Plain-text helpers: no data, no dependencies. Most of the repository needs only this.
+py_library(
+    name = "text",
+    srcs = ["text.py"],
+)
+
+# HTML rendering. Only this library needs the site templates.
+py_library(
+    name = "render",
+    srcs = ["render.py"],
+    data = ["//web:templates"],
+)
+
+py_test(
+    name = "text_test",
+    size = "small",
+    srcs = ["text_test.py"],
+    deps = [":text"],
+)

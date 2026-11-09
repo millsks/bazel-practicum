@@ -1,0 +1,1897 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M09 · Query &amp; Debugging · Bazel Practicum</title>
+<link rel="stylesheet" href="../assets/css/course.css">
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/viz.js" defer></script>
+<script src="../assets/js/viz-bazel.js" defer></script>
+<script src="../assets/js/course.js" defer></script>
+</head>
+<body data-root="../" data-module="m09">
+<main class="lesson">
+  <header class="lesson-hero">
+    <p class="eyebrow">Stage 2 · Growing the Monorepo · Module 09</p>
+    <h1>Query &amp; Debugging</h1>
+    <p class="lede">Every BUILD file you wrote in this course added edges to one graph. This module teaches you to ask that
+      graph questions: what depends on this, why does that depend on this, which tests does my change affect, and why
+      did Bazel just rebuild everything. It is the toolkit you will use most once a repository is too big to hold in
+      your head.</p>
+    <div class="lesson-meta"><span>⏱ ~2 hours</span><span>Prerequisites: <a href="m08-genrules-macros.html">M08</a></span></div>
+    <ul class="objectives">
+      <li>Choose between <code>query</code>, <code>cquery</code>, and <code>aquery</code> for a question, and say what each one cannot see</li>
+      <li>Write query expressions with target patterns, set operations, <code>deps</code>, <code>rdeps</code>, <code>kind</code>, <code>attr</code>, <code>filter</code>, <code>labels</code>, and <code>tests</code></li>
+      <li>Answer "why does X depend on Y?" with <code>somepath</code> and <code>allpaths</code>, and fix the BUILD file that causes it</li>
+      <li>List the tests a set of changed files affects, the way CI systems do</li>
+      <li>Read actions with <code>aquery</code>: mnemonics, command lines, inputs, and outputs</li>
+      <li>Explain a rebuild with <code>--explain</code>, see commands with <code>-s</code>, and find Bazel's directories with <code>bazel info</code></li>
+    </ul>
+  </header>
+
+  <section class="lesson-section" id="three-tools">
+    <h2>Three questions, three tools</h2>
+    <aside class="callout python">
+      <p>In a Python project you answer "who uses <code>money.py</code>?" with <code>grep -r "from core.money"</code>.
+        It finds direct importers only, misses anything that reads a file at run time, and is fooled by comments and
+        dynamic imports. <code>pipdeptree</code> shows which installed <em>distributions</em> require which, not which of
+        your modules import each other. <code>import-linter</code> checks layering rules by parsing imports. Each is a
+        partial, reconstructed picture.</p>
+    </aside>
+    <p>Bazel does not need to reconstruct anything. The graph is <em>declared</em>: every <code>deps</code>,
+      <code>data</code>, <code>srcs</code>, and generated file is an edge you wrote down, across every language. Bazel
+      offers three commands to read it, one per phase you met in M02:</p>
+    <table>
+      <thead><tr><th>Command</th><th>Reads</th><th>Use it for</th><th>Blind spot</th></tr></thead>
+      <tbody>
+        <tr><td><code>bazel query</code></td><td>The <strong>target graph</strong> after loading</td><td>"What depends on what?" Fast, works on broken builds.</td><td>No configuration: both branches of every <code>select()</code>.</td></tr>
+        <tr><td><code>bazel cquery</code></td><td>The <strong>configured graph</strong> after analysis</td><td>"What does this build, with these flags, really use?" Output file paths.</td><td>Needs the build to analyze; slower.</td></tr>
+        <tr><td><code>bazel aquery</code></td><td>The <strong>action graph</strong> after analysis</td><td>"What command does Bazel run, with which inputs?"</td><td>Verbose; nothing about whether an action will actually run.</td></tr>
+      </tbody>
+    </table>
+    <p>All three take the same expression language. A <strong>query expression</strong> evaluates to a set of
+      targets; the command prints that set. The simplest expression is a target pattern:</p>
+    <p>The workspace below is a small shop: a money library at the bottom, a catalog and a checkout built on it, a
+      server, a report tool, and a genrule that writes a version file. Run the commands and get a feel for the graph.
+      You will use this workspace for most of the module.</p>
+    <div class="runnable" data-title="Ask the graph" data-commands="bazel query //...|bazel query 'deps(//checkout:checkout)' --noimplicit_deps|bazel query 'rdeps(//..., //core:money)'|bazel query 'somepath(//app:server, //core:money)'">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "shop")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="core/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "money",
+    srcs = ["money.py"],
+    visibility = ["//visibility:public"],
+)
+
+py_test(
+    name = "money_test",
+    size = "small",
+    srcs = ["money_test.py"],
+    deps = [":money"],
+)
+</textarea>
+<textarea class="file" data-path="catalog/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "catalog",
+    srcs = ["catalog.py"],
+    visibility = ["//visibility:public"],
+    deps = ["//core:money"],
+)
+
+py_test(
+    name = "catalog_test",
+    size = "small",
+    srcs = ["catalog_test.py"],
+    deps = [":catalog"],
+)
+</textarea>
+<textarea class="file" data-path="checkout/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "checkout",
+    srcs = ["checkout.py"],
+    visibility = ["//app:__pkg__"],
+    deps = [
+        "//catalog",
+        "//core:money",
+    ],
+)
+
+py_test(
+    name = "checkout_test",
+    size = "small",
+    srcs = ["checkout_test.py"],
+    deps = [":checkout"],
+)
+</textarea>
+<textarea class="file" data-path="app/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "server",
+    srcs = ["server.py"],
+    data = ["//gen:version"],
+    deps = ["//checkout"],
+)
+</textarea>
+<textarea class="file" data-path="tools/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "report",
+    srcs = ["report.py"],
+    deps = ["//catalog"],
+)
+</textarea>
+<textarea class="file" data-path="gen/BUILD.bazel">
+genrule(
+    name = "version",
+    srcs = ["VERSION"],
+    outs = ["version.txt"],
+    cmd = "cp $(location VERSION) $@",
+    visibility = ["//app:__pkg__"],
+)
+</textarea>
+<textarea class="file" data-path="core/money.py" data-hidden></textarea>
+<textarea class="file" data-path="core/money_test.py" data-hidden></textarea>
+<textarea class="file" data-path="catalog/catalog.py" data-hidden></textarea>
+<textarea class="file" data-path="catalog/catalog_test.py" data-hidden></textarea>
+<textarea class="file" data-path="checkout/checkout.py" data-hidden></textarea>
+<textarea class="file" data-path="checkout/checkout_test.py" data-hidden></textarea>
+<textarea class="file" data-path="app/server.py" data-hidden></textarea>
+<textarea class="file" data-path="tools/report.py" data-hidden></textarea>
+<textarea class="file" data-path="gen/VERSION" data-hidden>1.4.0</textarea>
+</div>
+    <aside class="callout note">
+      <p><code>bazel query</code> needs no build and no configuration, so it answers in well under a second even in large
+        repositories, and it works when the build is broken at analysis (M02 used it on a dependency cycle). Reach for it
+        first; move to <code>cquery</code> only when flags or <code>select()</code> matter.</p>
+    </aside>
+    <p><strong>Remember:</strong> <code>query</code> reads the declared graph, <code>cquery</code> the graph for one set of
+      flags, <code>aquery</code> the commands. They share one expression language.</p>
+  </section>
+
+  <section class="lesson-section" id="language">
+    <h2>The query language</h2>
+    <p>An expression is built from three things: <strong>target patterns</strong> (the same <code>//...</code>,
+      <code>//pkg:all</code>, <code>//pkg:*</code> you pass to <code>bazel build</code>), <strong>functions</strong> that
+      take sets and return sets, and <strong>set operators</strong> that combine them. Results are printed once each,
+      sorted by package and then name.</p>
+    <h3>Patterns in query are not quite build patterns</h3>
+    <p>One difference matters: <code>bazel build //...</code> skips targets tagged <code>manual</code>, but
+      <code>bazel query //...</code> lists them. Query describes the graph; it does not decide what to build. In our
+      workspace a manual <code>py_test</code> and a manual <code>test_suite</code> both appeared in
+      <code>bazel query //catalog/...</code>. Keep that in mind when you turn query results into a test list.</p>
+    <h3>Functions you will use every day</h3>
+    <table>
+      <thead><tr><th>Function</th><th>Returns</th></tr></thead>
+      <tbody>
+        <tr><td><code>deps(X)</code>, <code>deps(X, N)</code></td><td>X and everything it depends on, transitively, or only N edges deep. <code>deps(X, 1)</code> is X plus its direct dependencies.</td></tr>
+        <tr><td><code>rdeps(U, X)</code>, <code>rdeps(U, X, N)</code></td><td>Targets inside the universe U that depend on X (the next section).</td></tr>
+        <tr><td><code>kind(REGEX, X)</code></td><td>Targets whose kind matches: <code>py_test</code>, <code>genrule</code>, <code>"source file"</code>, <code>"generated file"</code>.</td></tr>
+        <tr><td><code>attr(NAME, REGEX, X)</code></td><td>Rules whose attribute, printed as text, matches: <code>attr(tags, manual, //...)</code>, <code>attr(size, small, //...)</code>.</td></tr>
+        <tr><td><code>filter(REGEX, X)</code></td><td>Targets whose <em>label</em> matches: <code>filter("_test$", //...)</code>.</td></tr>
+        <tr><td><code>labels(ATTR, X)</code></td><td>The labels written in one attribute of X: <code>labels(deps, //checkout)</code>.</td></tr>
+        <tr><td><code>tests(X)</code></td><td>The tests in X, with <code>test_suite</code>s expanded into their members.</td></tr>
+        <tr><td><code>set(A B C)</code></td><td>A literal set, space-separated. Handy for a list of changed files.</td></tr>
+      </tbody>
+    </table>
+    <p>Regexes are partial matches (like Python's <code>re.search</code>): <code>kind(test, //...)</code> matches
+      <code>py_test</code>, <code>go_test</code>, and also <code>test_suite</code>. Anchor them when that matters:
+      <code>kind("py_test", ...)</code> or <code>filter("_test$", ...)</code>.</p>
+    <h3>Set operations</h3>
+    <p><code>A + B</code> (or <code>A union B</code>) is everything in either; <code>A ^ B</code> (<code>intersect</code>)
+      is what is in both; <code>A - B</code> (<code>except</code>) removes B from A. Put spaces around <code>-</code>.
+      Without them the shell word <code>//...-//core/...</code> is read as one malformed pattern:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">$ bazel query '//...-//core/...'
+ERROR: invalid package name '...-//core': package names may not contain '//' path separators</code></pre>
+    <p>Predict each result before you run it. The last one asks: which of the targets <code>//checkout</code> depends on
+      are rules rather than files?</p>
+    <div class="runnable" data-predict data-title="Patterns, functions, and sets" data-commands="bazel query 'kind(py_test, //...)'|bazel query '//... - //core/...'|bazel query 'labels(deps, //checkout)'|bazel query 'attr(visibility, &quot;//app:__pkg__&quot;, //...)'|bazel query 'deps(//checkout) - kind(&quot;source file&quot;, //...:*)' --noimplicit_deps">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "shop")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="core/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "money",
+    srcs = ["money.py"],
+    visibility = ["//visibility:public"],
+)
+
+py_test(
+    name = "money_test",
+    size = "small",
+    srcs = ["money_test.py"],
+    deps = [":money"],
+)
+</textarea>
+<textarea class="file" data-path="catalog/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "catalog",
+    srcs = ["catalog.py"],
+    visibility = ["//visibility:public"],
+    deps = ["//core:money"],
+)
+
+py_test(
+    name = "catalog_test",
+    size = "small",
+    srcs = ["catalog_test.py"],
+    deps = [":catalog"],
+)
+</textarea>
+<textarea class="file" data-path="checkout/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "checkout",
+    srcs = ["checkout.py"],
+    visibility = ["//app:__pkg__"],
+    deps = [
+        "//catalog",
+        "//core:money",
+    ],
+)
+
+py_test(
+    name = "checkout_test",
+    size = "small",
+    srcs = ["checkout_test.py"],
+    deps = [":checkout"],
+)
+</textarea>
+<textarea class="file" data-path="app/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "server",
+    srcs = ["server.py"],
+    data = ["//gen:version"],
+    deps = ["//checkout"],
+)
+</textarea>
+<textarea class="file" data-path="gen/BUILD.bazel" data-readonly>
+genrule(
+    name = "version",
+    srcs = ["VERSION"],
+    outs = ["version.txt"],
+    cmd = "cp $(location VERSION) $@",
+    visibility = ["//app:__pkg__"],
+)
+</textarea>
+<textarea class="file" data-path="core/money.py" data-hidden></textarea>
+<textarea class="file" data-path="core/money_test.py" data-hidden></textarea>
+<textarea class="file" data-path="catalog/catalog.py" data-hidden></textarea>
+<textarea class="file" data-path="catalog/catalog_test.py" data-hidden></textarea>
+<textarea class="file" data-path="checkout/checkout.py" data-hidden></textarea>
+<textarea class="file" data-path="checkout/checkout_test.py" data-hidden></textarea>
+<textarea class="file" data-path="app/server.py" data-hidden></textarea>
+<textarea class="file" data-path="gen/VERSION" data-hidden>1.4.0</textarea>
+</div>
+    <h3>Implicit dependencies</h3>
+    <p>Rules add edges you never wrote: a Python toolchain, a launcher, config settings. <code>deps()</code> follows
+      them. In our workspace, <code>bazel query 'deps(//app:server)'</code> printed 173 lines, most of them C++ helper
+      files under <code>@bazel_tools</code>. <code>--noimplicit_deps</code> hides most of that. For a
+      <code>py_library</code> it leaves only your edges; a <code>py_binary</code> or <code>py_test</code> keeps a few
+      settings that rules_python attaches through its own attributes:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">$ bazel query 'deps(//checkout:checkout_test)' --noimplicit_deps
+//catalog:catalog
+//catalog:catalog.py
+//checkout:checkout
+//checkout:checkout.py
+//checkout:checkout_test
+//checkout:checkout_test.py
+//core:money
+//core:money.py
+@@platforms//os:os
+@@platforms//os:windows
+@rules_python//command_line_option:enable_runfiles
+@rules_python//python:none
+@rules_python//python/private:sentinel</code></pre>
+    <p>To keep only your own repository, intersect with it: <code>deps(//app:server) ^ //...</code> (rules only, since
+      <code>//...</code> has no files), or <code>^ //...:*</code> to keep files too.</p>
+    <aside class="callout sim">
+      <p>The simulator shows only the edges you wrote, as if <code>--noimplicit_deps</code> were always on, and it never
+        lists external targets such as <code>@rules_python//python:none</code>. It also lacks <code>let</code>
+        expressions (below), the <code>minrank</code>/<code>maxrank</code>/<code>graph</code>/<code>build</code> output
+        formats, and file paths like <code>core/money.py</code> as targets: write <code>//core:money.py</code>
+        in sandboxes.</p>
+    </aside>
+    <h3>Naming a sub-result with let</h3>
+    <p>Long expressions repeat themselves. <code>let NAME = EXPR in BODY</code> names a set, and <code>$NAME</code> uses
+      it:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">$ bazel query 'let t = kind(test, //...) in rdeps(//..., //catalog:catalog.py) ^ $t'
+//catalog:catalog_test
+//checkout:checkout_test</code></pre>
+    <p><strong>Remember:</strong> query lists manual targets; regexes match anywhere, so anchor them; spaces around
+      <code>-</code>; <code>--noimplicit_deps</code> or <code>^ //...</code> to cut the toolchain noise.</p>
+  </section>
+
+  <section class="lesson-section" id="rdeps">
+    <h2>rdeps: what breaks if I change this?</h2>
+    <p><code>deps</code> walks edges forward, from a target to what it needs. <strong>Reverse dependencies</strong>
+      walk them backwards: from a target to everything that needs it. That is the question you ask before renaming a
+      function, deleting a library, or changing its behavior.</p>
+    <p><code>rdeps</code> takes a <strong>universe</strong> first: the set of targets to search. Bazel only knows the
+      packages it has loaded, so you tell it where to look. <code>//...</code> means "my whole repository". The optional
+      third argument is a depth: <code>1</code> means direct users only.</p>
+    <p>Predict both results, then run them. Which targets reach <code>//core:money</code> only indirectly?</p>
+    <div class="runnable" data-predict data-title="Who uses the money library?" data-commands="bazel query 'rdeps(//..., //core:money)'|bazel query 'rdeps(//..., //core:money, 1)'|bazel query 'kind(py_binary, rdeps(//..., //core:money))'|bazel query 'allrdeps(//core:money)'|bazel query 'allrdeps(//core:money)' --universe_scope=//...">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "shop")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="core/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "money",
+    srcs = ["money.py"],
+    visibility = ["//visibility:public"],
+)
+
+py_test(
+    name = "money_test",
+    size = "small",
+    srcs = ["money_test.py"],
+    deps = [":money"],
+)
+</textarea>
+<textarea class="file" data-path="catalog/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "catalog",
+    srcs = ["catalog.py"],
+    visibility = ["//visibility:public"],
+    deps = ["//core:money"],
+)
+
+py_test(
+    name = "catalog_test",
+    size = "small",
+    srcs = ["catalog_test.py"],
+    deps = [":catalog"],
+)
+</textarea>
+<textarea class="file" data-path="checkout/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "checkout",
+    srcs = ["checkout.py"],
+    visibility = ["//app:__pkg__"],
+    deps = [
+        "//catalog",
+        "//core:money",
+    ],
+)
+
+py_test(
+    name = "checkout_test",
+    size = "small",
+    srcs = ["checkout_test.py"],
+    deps = [":checkout"],
+)
+</textarea>
+<textarea class="file" data-path="app/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "server",
+    srcs = ["server.py"],
+    deps = ["//checkout"],
+)
+</textarea>
+<textarea class="file" data-path="tools/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "report",
+    srcs = ["report.py"],
+    deps = ["//catalog"],
+)
+</textarea>
+<textarea class="file" data-path="core/money.py" data-hidden></textarea>
+<textarea class="file" data-path="core/money_test.py" data-hidden></textarea>
+<textarea class="file" data-path="catalog/catalog.py" data-hidden></textarea>
+<textarea class="file" data-path="catalog/catalog_test.py" data-hidden></textarea>
+<textarea class="file" data-path="checkout/checkout.py" data-hidden></textarea>
+<textarea class="file" data-path="checkout/checkout_test.py" data-hidden></textarea>
+<textarea class="file" data-path="app/server.py" data-hidden></textarea>
+<textarea class="file" data-path="tools/report.py" data-hidden></textarea>
+</div>
+    <p>The result includes <code>//core:money</code> itself: a target is in its own reverse closure, just as it is in
+      its own <code>deps</code>. Two mistakes produce errors worth recognizing. Forgetting the universe:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">$ bazel query 'rdeps(//core:money)'
+ERROR: Error while parsing 'rdeps(//core:money)': too few arguments to function 'rdeps' at ')'</code></pre>
+    <p>And reaching for <code>allrdeps</code> (reverse deps over "everything loaded") without telling Bazel what
+      "everything" is. It is not even in the list of functions until you pass <code>--universe_scope=//...</code>:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">$ bazel query 'allrdeps(//core:money)'
+ERROR: Error while parsing 'allrdeps(//core:money)': unknown function 'allrdeps' at 'allrdeps ( //core:money'; expected one of ['allpaths', 'attr', 'buildfiles', 'deps', 'executables', 'filter', 'kind', 'labels', 'loadfiles', 'rdeps', 'same_pkg_direct_rdeps', 'siblings', 'some', 'somepath', 'tests', 'visible']</code></pre>
+    <h3>Query does not check visibility</h3>
+    <p>Query reads edges as written. It does not run analysis, so it does not care whether an edge is allowed. We added
+      a <code>//sec:dump</code> binary that lists <code>//checkout</code> in its <code>deps</code>, although
+      <code>//checkout</code> is visible only to <code>//app</code>:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">$ bazel query 'rdeps(//..., //checkout, 1)'
+//app:server
+//checkout:checkout
+//checkout:checkout_test
+//sec:dump
+$ bazel build //sec:dump
+ERROR: sec/BUILD.bazel:3:10: in py_binary rule //sec:dump: Visibility error:
+target '//checkout:checkout' is not visible from
+target '//sec:dump'</code></pre>
+    <p>That is a feature: <code>rdeps</code> finds every target that <em>tries</em> to use a library, including the ones
+      that will fail. Use it to find illegal users before you tighten a visibility list, and remember that a clean
+      <code>rdeps</code> is not proof that everything builds.</p>
+    <aside class="callout pro">
+      <p>Before deleting or renaming a public target, paste the output of
+        <code>bazel query 'rdeps(//..., //lib:old, 1)'</code> into the pull request. Reviewers see the blast radius, and
+        you have a checklist of BUILD files to update.</p>
+    </aside>
+    <p><strong>Remember:</strong> <code>rdeps(universe, target[, depth])</code>; the universe is usually
+      <code>//...</code>; query ignores visibility, so it shows would-be users too.</p>
+  </section>
+
+  <section class="lesson-section" id="paths">
+    <h2>somepath and allpaths: why does X depend on Y?</h2>
+    <aside class="callout python">
+      <p>"Why is <code>numpy</code> in my lambda bundle?" With pip you run <code>pipdeptree -r -p numpy</code> and read the
+        tree upwards. Inside your own code, there is no such tool: you grep for imports, then grep for the importers.</p>
+    </aside>
+    <p><code>somepath(A, B)</code> returns one chain of edges from A to B: the shortest explanation. Real Bazel prints it
+      in path order, from A to B. <code>allpaths(A, B)</code> returns every target on <em>any</em> path from A to B,
+      sorted. When both are empty, A does not depend on B at all, and Bazel prints <code>INFO: Empty results</code>.</p>
+    <div class="runnable" data-predict data-title="Paths through the graph" data-commands="bazel query 'somepath(//app:server, //core:money)'|bazel query 'allpaths(//app:server, //core:money)'|bazel query 'somepath(//tools:report, //checkout)'|bazel query 'allpaths(//app:server, //core:money.py)'">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "shop")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="core/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "money",
+    srcs = ["money.py"],
+    visibility = ["//visibility:public"],
+)
+</textarea>
+<textarea class="file" data-path="catalog/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "catalog",
+    srcs = ["catalog.py"],
+    visibility = ["//visibility:public"],
+    deps = ["//core:money"],
+)
+</textarea>
+<textarea class="file" data-path="checkout/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "checkout",
+    srcs = ["checkout.py"],
+    visibility = ["//app:__pkg__"],
+    deps = [
+        "//catalog",
+        "//core:money",
+    ],
+)
+</textarea>
+<textarea class="file" data-path="app/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "server",
+    srcs = ["server.py"],
+    deps = ["//checkout"],
+)
+</textarea>
+<textarea class="file" data-path="tools/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "report",
+    srcs = ["report.py"],
+    deps = ["//catalog"],
+)
+</textarea>
+<textarea class="file" data-path="core/money.py" data-hidden></textarea>
+<textarea class="file" data-path="catalog/catalog.py" data-hidden></textarea>
+<textarea class="file" data-path="checkout/checkout.py" data-hidden></textarea>
+<textarea class="file" data-path="app/server.py" data-hidden></textarea>
+<textarea class="file" data-path="tools/report.py" data-hidden></textarea>
+</div>
+    <p><code>somepath</code> picked the direct edge <code>//checkout → //core:money</code>; <code>allpaths</code> also found
+      the route through <code>//catalog</code>. That difference matters when you are trying to remove a dependency: cut
+      the edge <code>somepath</code> shows, run it again, and it may show you the next one. <code>allpaths</code> shows
+      them all at once.</p>
+    <aside class="callout sim">
+      <p>The simulator prints <code>somepath</code> results sorted, like every other query. Real Bazel prints the path
+        in order. For <code>somepath(//app:server, //catalog:catalog.py)</code> real Bazel printed
+        <code>//app:server</code>, <code>//checkout:checkout</code>, <code>//catalog:catalog</code>,
+        <code>//catalog:catalog.py</code>: same set, path order.</p>
+    </aside>
+    <h3>Seeing the paths as a picture</h3>
+    <p><code>--output=graph</code> prints the result as <strong>Graphviz</strong> dot, with the edges between the
+      targets in the set. Pipe it into <code>dot -Tsvg</code> (from the <code>graphviz</code> package, which
+      <code>pixi add graphviz</code> installs) or paste it into an online viewer:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">$ bazel query 'allpaths(//app:server, //core:money)' --output=graph
+digraph mygraph {
+  node [shape=box];
+  "//app:server"
+  "//app:server" -&gt; "//checkout:checkout"
+  "//checkout:checkout"
+  "//checkout:checkout" -&gt; "//core:money"
+  "//checkout:checkout" -&gt; "//catalog:catalog"
+  "//catalog:catalog"
+  "//catalog:catalog" -&gt; "//core:money"
+  "//core:money"
+}</code></pre>
+    <aside class="callout warn">
+      <p><code>--output=graph</code> on <code>deps(//...)</code> of a real repository is thousands of nodes and renders
+        as a grey smear. Graph a <code>somepath</code> or <code>allpaths</code>, or a <code>deps</code> with a depth,
+        and add <code>--noimplicit_deps</code>.</p>
+    </aside>
+    <p><strong>Remember:</strong> <code>somepath</code> explains one way A reaches B, in path order; <code>allpaths</code>
+      lists everything on every way; empty means no dependency.</p>
+  </section>
+
+  <section class="lesson-section" id="affected-tests">
+    <h2>Which tests does this change affect?</h2>
+    <p>CI systems for large repositories do not run <code>bazel test //...</code> blindly. They take the files changed
+      in a pull request and ask the graph which tests can see them. You can do the same in one query.</p>
+    <h3>Files are targets</h3>
+    <p>Every source file is a target in its package: <code>core/money.py</code> is <code>//core:money.py</code>. Real
+      <code>bazel query</code> also accepts the workspace-relative path and works out the label, which is exactly what
+      <code>git diff --name-only</code> gives you:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">$ bazel query 'tests(rdeps(//..., set(core/money.py catalog/catalog.py)))'
+//catalog:catalog_test
+//checkout:checkout_test
+//core:money_test</code></pre>
+    <h3>kind(test, ...) or tests(...)?</h3>
+    <p>The workspace below adds a manual live test and a manual suite to <code>//catalog</code>. Predict each result.
+      The differences are the whole lesson.</p>
+    <div class="runnable" data-predict data-title="Affected tests" data-commands="bazel query 'kind(test, rdeps(//..., //catalog:catalog.py))'|bazel query 'tests(rdeps(//..., //catalog:catalog.py))'|bazel query 'tests(rdeps(//..., //catalog:catalog.py)) except attr(tags, manual, //...)'|bazel query 'tests(rdeps(//..., set(//core:money.py //app:server.py)))'">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "shop")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="core/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "money",
+    srcs = ["money.py"],
+    visibility = ["//visibility:public"],
+)
+
+py_test(
+    name = "money_test",
+    size = "small",
+    srcs = ["money_test.py"],
+    deps = [":money"],
+)
+</textarea>
+<textarea class="file" data-path="catalog/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "catalog",
+    srcs = ["catalog.py"],
+    visibility = ["//visibility:public"],
+    deps = ["//core:money"],
+)
+
+py_test(
+    name = "catalog_test",
+    size = "small",
+    srcs = ["catalog_test.py"],
+    deps = [":catalog"],
+)
+
+py_test(
+    name = "catalog_live_test",
+    srcs = ["catalog_live_test.py"],
+    tags = ["manual"],
+    deps = [":catalog"],
+)
+
+test_suite(
+    name = "nightly",
+    tags = ["manual"],
+    tests = [":catalog_live_test"],
+)
+</textarea>
+<textarea class="file" data-path="checkout/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "checkout",
+    srcs = ["checkout.py"],
+    visibility = ["//app:__pkg__"],
+    deps = ["//catalog"],
+)
+
+py_test(
+    name = "checkout_test",
+    size = "small",
+    srcs = ["checkout_test.py"],
+    deps = [":checkout"],
+)
+</textarea>
+<textarea class="file" data-path="app/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "server",
+    srcs = ["server.py"],
+    deps = ["//checkout"],
+)
+</textarea>
+<textarea class="file" data-path="core/money.py" data-hidden></textarea>
+<textarea class="file" data-path="core/money_test.py" data-hidden></textarea>
+<textarea class="file" data-path="catalog/catalog.py" data-hidden></textarea>
+<textarea class="file" data-path="catalog/catalog_test.py" data-hidden></textarea>
+<textarea class="file" data-path="catalog/catalog_live_test.py" data-hidden></textarea>
+<textarea class="file" data-path="checkout/checkout.py" data-hidden></textarea>
+<textarea class="file" data-path="checkout/checkout_test.py" data-hidden></textarea>
+<textarea class="file" data-path="app/server.py" data-hidden></textarea>
+</div>
+    <ul>
+      <li><code>kind(test, ...)</code> matched <code>//catalog:nightly</code> too: <code>test_suite</code> contains
+        "test". Harmless for <code>bazel test</code>, confusing in a report.</li>
+      <li><code>tests(...)</code> expands suites into their members and drops everything else, so it is the right
+        wrapper. It keeps manual tests, because query does.</li>
+      <li><code>except attr(tags, manual, //...)</code> removes the tests <code>bazel test //...</code> would skip anyway.</li>
+      <li>A change to the server's own source affects no test at all: nothing tests the server. That empty answer is
+        itself useful information.</li>
+    </ul>
+    <h3>Files that belong to no package</h3>
+    <p>A real change list contains <code>README.md</code> or <code>docs/</code> files that no BUILD file owns. Query
+      fails on them, and <code>--keep_going</code> skips them instead, exiting with code 3 ("partial success"):</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">$ bazel query 'set(core/money.py README.md)'
+ERROR: couldn't determine target from filename 'README.md'
+$ bazel query --keep_going 'tests(rdeps(//..., set(core/money.py README.md)))'
+ERROR: Skipping 'README.md': couldn't determine target from filename 'README.md'
+WARNING: --keep_going specified, ignoring errors. Results may be inaccurate
+//catalog:catalog_live_test
+//catalog:catalog_test
+//checkout:checkout_test
+//core:money_test
+$ echo $?
+3</code></pre>
+    <p>Exit code 7 was the plain failure. A script that treats any non-zero exit as fatal will fail on every pull
+      request that touches the README. Lab 2 builds exactly this script.</p>
+    <aside class="callout warn">
+      <p>This selection is only as good as the graph. A test that reads a file it never declared does not appear in
+        <code>rdeps</code> of that file, and neither does it rerun when the file changes (M02's hermeticity section). An
+        affected-tests query turns undeclared inputs from a caching bug into a CI bug: changes that break the test land
+        without running it.</p>
+    </aside>
+    <p><strong>Remember:</strong> <code>tests(rdeps(//..., set(FILES))) except attr(tags, manual, //...)</code>, with
+      <code>--keep_going</code> for files outside packages.</p>
+  </section>
+
+  <section class="lesson-section" id="output">
+    <h2>Output formats</h2>
+    <p><code>--output</code> changes how the result set is printed, not what is in it.</p>
+    <table>
+      <thead><tr><th>Format</th><th>Prints</th><th>Good for</th></tr></thead>
+      <tbody>
+        <tr><td><code>label</code> (default)</td><td><code>//core:money</code>, sorted</td><td>Piping into other commands</td></tr>
+        <tr><td><code>label_kind</code></td><td><code>py_library rule //core:money</code></td><td>Seeing at a glance what each result is</td></tr>
+        <tr><td><code>package</code></td><td><code>core</code>, once per package</td><td>"Which teams does this touch?"</td></tr>
+        <tr><td><code>minrank</code>, <code>maxrank</code></td><td><code>2 //core:money</code>: shortest or longest distance from the root</td><td>How deep a dependency sits</td></tr>
+        <tr><td><code>graph</code></td><td>Graphviz dot</td><td>Pictures of small subgraphs</td></tr>
+        <tr><td><code>build</code></td><td>The rule as Bazel sees it after macros run</td><td>"What did this macro really declare?"</td></tr>
+        <tr><td><code>location</code></td><td><code>/path/to/ws/gen/BUILD.bazel:1:8: genrule rule //gen:version</code></td><td>Jumping to the definition</td></tr>
+      </tbody>
+    </table>
+    <div class="runnable" data-predict data-title="Same set, different output" data-commands="bazel query 'rdeps(//..., //core:money)' --output=package|bazel query 'rdeps(//..., //core:money, 1)' --output=label_kind">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "shop")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="core/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "money",
+    srcs = ["money.py"],
+    visibility = ["//visibility:public"],
+)
+
+py_test(
+    name = "money_test",
+    size = "small",
+    srcs = ["money_test.py"],
+    deps = [":money"],
+)
+</textarea>
+<textarea class="file" data-path="catalog/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "catalog",
+    srcs = ["catalog.py"],
+    visibility = ["//visibility:public"],
+    deps = ["//core:money"],
+)
+</textarea>
+<textarea class="file" data-path="tools/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "report",
+    srcs = ["report.py"],
+    deps = ["//catalog"],
+)
+</textarea>
+<textarea class="file" data-path="core/money.py" data-hidden></textarea>
+<textarea class="file" data-path="core/money_test.py" data-hidden></textarea>
+<textarea class="file" data-path="catalog/catalog.py" data-hidden></textarea>
+<textarea class="file" data-path="tools/report.py" data-hidden></textarea>
+</div>
+    <p>The rank formats are not sorted by label. They follow the graph walk, so read the numbers, not the order. From the
+      full shop workspace (excerpt, implicit deps removed):</p>
+    <pre data-label="Real output (Bazel 9.3.2), excerpt"><code class="language-none">$ bazel query 'deps(//app:server)' --noimplicit_deps --output=maxrank
+0 //app:server
+1 //app:server.py
+1 //gen:version
+1 //checkout:checkout
+2 //gen:VERSION
+2 //catalog:catalog
+2 //checkout:checkout.py
+3 //catalog:catalog.py
+3 //core:money
+4 //core:money.py</code></pre>
+    <p><code>//core:money</code> is 2 edges from the server by the short route (<code>minrank</code>) and 3 by the long
+      one through <code>//catalog</code> (<code>maxrank</code>).</p>
+    <h3>--output=build: the rule after macros</h3>
+    <p>In M03 you learned that <code>py_binary</code> is a macro. <code>--output=build</code> shows what it expanded into,
+      with labels made absolute and <code>select()</code> left intact, because query never resolves configuration:</p>
+    <pre data-label="Real output (Bazel 9.3.2), paths shortened, call stack trimmed"><code class="language-none">$ bazel query //app:server --output=build
+# /path/to/ws/app/BUILD.bazel:8:10
+py_binary(
+  name = "server",
+  generator_name = "server",
+  generator_function = "py_binary",
+  generator_location = "app/BUILD.bazel:8:10",
+  data = ["//gen:version"],
+  config_settings = select({"@@platforms//os:windows": {"@rules_python//command_line_option:enable_runfiles": "true"}, "//conditions:default": {}}) + {},
+  deps = ["//checkout:checkout"] + select({"//app:fast": ["//core:speedups"], "//conditions:default": []}),
+  srcs = ["//app:server.py"],
+)
+# Rule server instantiated at (most recent call last):
+#   /path/to/ws/app/BUILD.bazel:8:10 in &lt;toplevel&gt;
+#   .../external/rules_python+/python/py_binary.bzl:44:15 in py_binary
+#   ...</code></pre>
+    <p>That <code>config_settings</code> line is where the <code>@@platforms//os:windows</code> and
+      <code>enable_runfiles</code> entries from the "implicit dependencies" listing come from: the macro added an
+      attribute you never wrote. (This server has a <code>select()</code> on <code>-c opt</code>; the next section uses
+      it.)</p>
+    <p><strong>Remember:</strong> <code>label_kind</code> and <code>package</code> for reading, <code>graph</code> for
+      pictures, <code>build</code> to see through macros, ranks for depth.</p>
+  </section>
+
+  <section class="lesson-section" id="cquery">
+    <h2>cquery: the graph for these flags</h2>
+    <p>M06 introduced <code>cquery</code> for checking a <code>select()</code>. Here is the full picture. The shop's
+      server pulls in a C-accelerated module only in optimized builds:</p>
+    <pre data-label="app/BUILD.bazel"><code class="language-starlark">config_setting(
+    name = "fast",
+    values = {"compilation_mode": "opt"},
+)
+
+py_binary(
+    name = "server",
+    srcs = ["server.py"],
+    data = ["//gen:version"],
+    deps = ["//checkout"] + select({
+        ":fast": ["//core:speedups"],
+        "//conditions:default": [],
+    }),
+)</code></pre>
+    <p>Ask <code>query</code> and <code>cquery</code> the same question:</p>
+    <pre data-label="Real output (Bazel 9.3.2), INFO lines removed"><code class="language-none">$ bazel query 'somepath(//app:server, //core:speedups)'
+//app:server
+//core:speedups
+$ bazel cquery 'somepath(//app:server, //core:speedups)'
+INFO: Empty results
+$ bazel cquery 'somepath(//app:server, //core:speedups)' -c opt
+//app:server (bf3a44e)
+//core:speedups (bf3a44e)</code></pre>
+    <p><code>query</code> says yes: it sees both branches. <code>cquery</code> says no for the default build and yes with
+      <code>-c opt</code>. When the question is "is this in my production binary?", only <code>cquery</code> with your
+      production flags answers it.</p>
+    <h3>Reading cquery output</h3>
+    <p>Each line carries a <strong>configuration id</strong>, the start of a hash of every build option. Targets built
+      with the same flags share it. Source files print <code>(null)</code>: a file is not configured.</p>
+    <pre data-label="Real output (Bazel 9.3.2), INFO lines removed"><code class="language-none">$ bazel cquery 'deps(//app:server, 1)' --noimplicit_deps
+//app:server (a7a71fd)
+//app:server.py (null)
+//app:fast (a7a71fd)
+//gen:version (a7a71fd)
+//checkout:checkout (a7a71fd)</code></pre>
+    <p>The order is not sorted, and <code>config_setting</code>s appear as dependencies. A tool that builds code for the
+      machine running the build (an <em>exec</em> configuration, such as the Python precompiler) shows a different id.
+      <code>--output=label_kind</code> works here too (<code>py_binary rule //app:server (a7a71fd)</code>).</p>
+    <h3>Where is my output? --output=files</h3>
+    <p><code>cquery --output=files</code> prints the files a target produces, relative to the workspace. It is the
+      reliable way for a script to find a genrule's output without guessing the <code>bazel-out</code> directory name:</p>
+    <pre data-label="Real output (Bazel 9.3.2), INFO lines removed"><code class="language-none">$ bazel cquery //gen:version --output=files
+bazel-out/k8-fastbuild/bin/gen/version.txt
+$ bazel cquery //app:server --output=files
+bazel-out/k8-fastbuild/bin/app/server
+app/server.py</code></pre>
+    <div class="runnable" data-title="query sees both branches, cquery picks one" data-commands="bazel query 'somepath(//app:server, //core:speedups)'|bazel cquery 'somepath(//app:server, //core:speedups)'|bazel cquery 'somepath(//app:server, //core:speedups)' -c opt|bazel cquery 'deps(//app:server, 1)' --noimplicit_deps -c opt">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "shop")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="app/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_binary")
+
+config_setting(
+    name = "fast",
+    values = {"compilation_mode": "opt"},
+)
+
+py_binary(
+    name = "server",
+    srcs = ["server.py"],
+    deps = ["//checkout"] + select({
+        ":fast": ["//core:speedups"],
+        "//conditions:default": [],
+    }),
+)
+</textarea>
+<textarea class="file" data-path="core/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "speedups",
+    srcs = ["speedups.py"],
+    visibility = ["//visibility:public"],
+)
+</textarea>
+<textarea class="file" data-path="checkout/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "checkout",
+    srcs = ["checkout.py"],
+    visibility = ["//app:__pkg__"],
+)
+</textarea>
+<textarea class="file" data-path="app/server.py" data-hidden></textarea>
+<textarea class="file" data-path="core/speedups.py" data-hidden></textarea>
+<textarea class="file" data-path="checkout/checkout.py" data-hidden></textarea>
+</div>
+    <aside class="callout sim">
+      <p>The simulator's <code>cquery</code> resolves <code>select()</code> exactly, but prints plain sorted labels with no
+        configuration id, never lists implicit dependencies (real <code>cquery</code> without
+        <code>--noimplicit_deps</code> printed 33 lines for <code>deps(//app:server, 1)</code>), and has no
+        <code>--output=files</code>. Use it to check what is selected; read ids and paths
+        from real Bazel.</p>
+    </aside>
+    <p><strong>Remember:</strong> query answers "could"; cquery answers "does, with these flags". Configuration ids
+      group targets by flags; <code>(null)</code> means a source file; <code>--output=files</code> finds outputs.</p>
+  </section>
+
+  <section class="lesson-section" id="aquery">
+    <h2>aquery: the commands behind a target</h2>
+    <p>M02 showed one <code>aquery</code> output, for a genrule. Its job: list the <strong>actions</strong> analysis
+      created for the targets in an expression, each with its <strong>mnemonic</strong> (a short name for the kind of
+      action), its inputs, outputs, environment, and full command line. Start with a summary, which counts actions by
+      mnemonic:</p>
+    <pre data-label="Real output (Bazel 9.3.2), INFO lines removed"><code class="language-none">$ bazel aquery 'deps(//app:server)' --output=summary
+37 total actions.
+Mnemonics:
+  PythonZipper: 1
+  UnresolvedSymlink: 1
+  ExecutableSymlink: 1
+  Genrule: 1
+  TranslateBuildInfo: 2
+  FileWrite: 3
+  Symlink: 3
+  TemplateExpand: 4
+  SymlinkTree: 4
+  SourceSymlinkManifest: 4
+  PyCompile: 4
+  RunfilesTree: 4
+  RepoMappingManifest: 5
+Configurations:
+  k8-opt-exec: 15
+  k8-fastbuild: 22
+Execution Platforms:
+  @@platforms//host:host: 37</code></pre>
+    <p>The mnemonics you will meet with Python and genrules, all verified with rules_python 2.4.6:</p>
+    <table>
+      <thead><tr><th>Mnemonic</th><th>Action</th></tr></thead>
+      <tbody>
+        <tr><td><code>PyCompile</code></td><td>Precompile one <code>.py</code> into a <code>.pyc</code> ("Python precompiling ... into core/__pycache__/money.cpython-313.pyc")</td></tr>
+        <tr><td><code>Genrule</code></td><td>Run a genrule's <code>cmd</code></td></tr>
+        <tr><td><code>TestRunner</code></td><td>Run a test ("Testing //core:money_test")</td></tr>
+        <tr><td><code>TemplateExpand</code></td><td>Write a <code>py_binary</code>'s launcher and bootstrap scripts</td></tr>
+        <tr><td><code>FileWrite</code>, <code>SymlinkTree</code>, <code>RunfilesTree</code></td><td>Bookkeeping: small generated files and the runfiles tree</td></tr>
+      </tbody>
+    </table>
+    <h3>Filtering actions</h3>
+    <p>aquery adds three functions on top of the query language: <code>mnemonic(REGEX, X)</code>,
+      <code>inputs(REGEX, X)</code>, and <code>outputs(REGEX, X)</code>. The regex must match the whole mnemonic or
+      path. Find every Python compile and genrule action in the repository:</p>
+    <pre data-label="Real output (Bazel 9.3.2), excerpt"><code class="language-none">$ bazel aquery 'mnemonic("PyCompile|Genrule", //...)' --noinclude_commandline
+action 'Python precompiling bin/python3 into app/__pycache__/server.cpython-313.pyc'
+  Mnemonic: PyCompile
+action 'Python precompiling bin/python3 into catalog/__pycache__/catalog.cpython-313.pyc'
+  Mnemonic: PyCompile
+...
+action 'Executing genrule //gen:version'
+  Mnemonic: Genrule</code></pre>
+    <p>And look at one action in full:</p>
+    <pre data-label="Real output (Bazel 9.3.2), Inputs list shortened"><code class="language-none">$ bazel aquery 'mnemonic(PyCompile, //core:money)'
+action 'Python precompiling bin/python3 into core/__pycache__/money.cpython-313.pyc'
+  Mnemonic: PyCompile
+  Target: //core:money
+  Configuration: k8-fastbuild
+  Execution platform: @@platforms//host:host
+  ActionKey: f0b7b2bb8c7f93c39053dbc52d3ebb1f160f922c1b25c3291b6e69f44885e512
+  Inputs: [bazel-out/k8-opt-exec/bin/external/rules_python+/tools/precompiler/precompiler_.py, ..., core/money.py, external/rules_python++python+python_3_13_x86_64-unknown-linux-gnu/bin/python3, ...]
+  Outputs: [bazel-out/k8-fastbuild/bin/core/__pycache__/money.cpython-313.pyc]
+  Environment: [PYTHONHASHSEED=0, PYTHONNOUSERSITE=1, PYTHONSAFEPATH=1]
+  Command Line: (exec external/rules_python++python+python_3_13_x86_64-unknown-linux-gnu/bin/python3 \
+    bazel-out/k8-opt-exec/bin/external/rules_python+/tools/precompiler/precompiler_.py \
+    --invalidation_mode \
+    checked_hash \
+    --src \
+    core/money.py \
+    --src_name \
+    core/money.py \
+    --pyc \
+    bazel-out/k8-fastbuild/bin/core/__pycache__/money.cpython-313.pyc \
+    --optimize \
+    0 \
+    --python_version \
+    3.13)</code></pre>
+    <p>The inputs include the whole hermetic Python 3.13 interpreter: changing the toolchain changes every
+      <code>PyCompile</code> key. The precompiler is built in the <code>k8-opt-exec</code> configuration, the exec
+      configuration from the cquery section.</p>
+    <aside class="callout note" data-title="Declared is not executed">
+      <p>aquery lists actions analysis <em>declared</em>. Whether one runs depends on whether a requested output needs
+        it. In our runs, building and testing the shop never executed a <code>PyCompile</code> action: rules_python 2.4.6
+        declares them, but with its default settings nothing requests the <code>.pyc</code> files. aquery tells you
+        what Bazel <em>could</em> run; <code>--explain</code> and <code>-s</code> (next section) tell you what it
+        <em>did</em>.</p>
+    </aside>
+    <aside class="callout sim">
+      <p>The simulator stops before actions exist, so it has no <code>aquery</code>. Everything in this section is real
+        output.</p>
+    </aside>
+    <p><strong>Remember:</strong> aquery prints actions with mnemonic, inputs, outputs, environment, and command;
+      <code>--output=summary</code> first; filter with <code>mnemonic()</code>, <code>inputs()</code>,
+      <code>outputs()</code>.</p>
+  </section>
+
+  <section class="lesson-section" id="debugging">
+    <h2>Why did that rebuild? Why is it slow?</h2>
+    <aside class="callout python">
+      <p>When pytest is slow you reach for <code>pytest --durations=10</code>, and when something reruns you shrug: it
+        always reruns everything. With Bazel, "why did this run?" has an exact answer, and Bazel will write it down for
+        you.</p>
+    </aside>
+    <h3>--explain: why each action ran</h3>
+    <p><code>--explain=FILE</code> writes one line per executed action with the reason Bazel could not reuse a cached
+      result. <code>--verbose_explanations</code> adds detail where Bazel has it. We appended a comment to
+      <code>catalog/catalog.py</code> and reran the tests:</p>
+    <pre data-label="Real output (Bazel 9.3.2): explain.log, Build options line removed"><code class="language-none">$ bazel test //... --explain=explain.log --verbose_explanations
+$ cat explain.log
+Executing action 'BazelWorkspaceStatusAction stable-status.txt': unconditional execution is requested.
+Executing runfiles for //catalog:catalog_test: action changed since cached execution.
+Executing runfiles for //app:server: action changed since cached execution.
+Executing runfiles for //checkout:checkout_test: action changed since cached execution.
+Executing runfiles for //tools:report: action changed since cached execution.
+Executing action 'Testing //catalog:catalog_test': action changed since cached execution.
+Executing action 'Testing //checkout:checkout_test': action changed since cached execution.</code></pre>
+    <p>Read it like <code>rdeps</code> in action: the runfiles trees of everything that contains
+      <code>catalog.py</code> were refreshed, and the two tests that depend on it ran. <code>//core:money_test</code> is
+      absent: it stayed <code>(cached)</code>. The reasons you will see most:</p>
+    <table>
+      <thead><tr><th>Reason</th><th>Meaning, from our runs</th></tr></thead>
+      <tbody>
+        <tr><td><code>no entry in the cache (action is new)</code></td><td>Never built before: a new target, or a first build.</td></tr>
+        <tr><td><code>action changed since cached execution</code></td><td>The key differs: an input's content, the command, or the environment. Editing <code>gen/VERSION</code> and passing a new <code>--action_env</code> or <code>--test_env</code> value each produced it.</td></tr>
+        <tr><td><code>unconditional execution is requested</code></td><td>Bazel was told to run it: the workspace status action (every build), or a test under <code>--nocache_test_results</code>.</td></tr>
+      </tbody>
+    </table>
+    <p>An action that was a cache hit is not listed. If the log is nearly empty and the build was still slow, the time
+      went somewhere else: loading, analysis, or fetching. That is a job for the profile.</p>
+    <h3>-s: the exact command</h3>
+    <p><code>--subcommands</code> (<code>-s</code>) prints every command as it runs, ready to paste into a shell. It is
+      the fastest way to see what a genrule really executed after <code>$(location)</code> expansion:</p>
+    <pre data-label="Real output (Bazel 9.3.2), output base shortened"><code class="language-none">$ bazel build //gen:version -s
+INFO: Analyzed target //gen:version (0 packages loaded, 0 targets configured).
+SUBCOMMAND: # genrule rule target //gen:version [action 'Executing genrule //gen:version', configuration: a7a71fd16b14112464272f754633480c74c664f2488224c592ebf2dfc7a06b18, execution platform: @@platforms//host:host, mnemonic: Genrule]
+(cd ~/.cache/bazel/_bazel_root/&lt;hash&gt;/execroot/_main &amp;&amp; \
+  exec env - \
+    PATH=/bin:/usr/bin:/usr/local/bin \
+  /bin/bash -c 'source external/bazel_tools/tools/genrule/genrule-setup.sh; cp gen/VERSION bazel-out/k8-fastbuild/bin/gen/version.txt')
+# Configuration: a7a71fd16b14112464272f754633480c74c664f2488224c592ebf2dfc7a06b18
+# Execution platform: @@platforms//host:host
+# Runner: linux-sandbox</code></pre>
+    <p><code>env -</code> clears the environment: the command sees only <code>PATH</code>. <code>Runner:
+      linux-sandbox</code> says it ran sandboxed. Only actions that actually execute are printed, so a fully cached
+      build prints no <code>SUBCOMMAND</code> at all.</p>
+    <h3>bazel info: where everything lives</h3>
+    <pre data-label="Real output (Bazel 9.3.2), selected keys, paths shortened"><code class="language-none">$ bazel info
+bazel-bin: ~/.cache/bazel/_bazel_root/&lt;hash&gt;/execroot/_main/bazel-out/k8-fastbuild/bin
+bazel-testlogs: ~/.cache/bazel/_bazel_root/&lt;hash&gt;/execroot/_main/bazel-out/k8-fastbuild/testlogs
+command_log: ~/.cache/bazel/_bazel_root/&lt;hash&gt;/command.log
+execution_root: ~/.cache/bazel/_bazel_root/&lt;hash&gt;/execroot/_main
+output_base: ~/.cache/bazel/_bazel_root/&lt;hash&gt;
+release: release 9.3.2
+repository_cache: ~/.cache/bazel/_bazel_root/cache/repos/v1
+workspace: /path/to/ws</code></pre>
+    <p>The <strong>output base</strong> is one directory per workspace holding everything Bazel keeps: the action cache,
+      fetched repositories (<code>external/</code>), and the <strong>execution root</strong>, the tree where actions run
+      and where <code>bazel-out</code> really lives. <code>bazel info bazel-bin</code> prints one key, which is handy in
+      scripts. <code>command_log</code> holds the full output of the last command.</p>
+    <h3>--profile: where did the time go?</h3>
+    <p>Bazel writes a profile of every command, in Chrome trace format, to <code>command.profile.gz</code> in the output
+      base. <code>--profile=PATH</code> puts it somewhere you choose. Open it in <code>chrome://tracing</code> or
+      <a href="https://ui.perfetto.dev">ui.perfetto.dev</a> to see a timeline: phases, every action on every thread,
+      and the <strong>critical path</strong> (the chain of actions that decided the wall time). In our profile of
+      <code>bazel test //...</code> after editing <code>money.py</code>, the critical path ended in
+      <code>action 'Testing //checkout:checkout_test'</code>.</p>
+    <aside class="callout bazel">
+      <p>Older guides say to run <code>bazel analyze-profile</code>. Bazel 9.3.2 no longer has it:
+        <code>Command 'analyze-profile' not found. Try 'bazel help'.</code> Use a trace viewer.</p>
+    </aside>
+    <h3>The build event protocol</h3>
+    <p>Everything Bazel reports (targets configured, actions, test results) is also a stream of structured
+      <strong>build events</strong>. CI dashboards read it. <code>--build_event_json_file=bep.json</code> writes one JSON
+      object per line; two of them from our test run:</p>
+    <pre data-label="Real output (Bazel 9.3.2), two events, fields trimmed"><code class="language-json">{"id": {"testResult": {"label": "//catalog:catalog_test", "run": 1, "shard": 1, "attempt": 1, "configuration": {"id": "e722a217..."}}}, "testResult": {"testAttemptDurationMillis": "1467", "status": "PASSED"}}
+{"id": {"testSummary": {"label": "//catalog:catalog_test", "configuration": {"id": "e722a217..."}}}, "testSummary": {"totalRunCount": 1, "overallStatus": "PASSED", "runCount": 1}}</code></pre>
+    <p>If you are tempted to parse Bazel's terminal output in a script, parse this instead: it is stable and
+      documented.</p>
+    <h3>--keep_going: all the errors at once</h3>
+    <p>By default Bazel stops at the first broken package. With two broken packages (an undefined
+      <code>py_library</code> in one, a dependency on a missing target in the other), plain <code>bazel build //...</code>
+      reported only the first. With <code>--keep_going</code> (<code>-k</code>) it reported both and built the eleven
+      targets that did not depend on either:</p>
+    <pre data-label="Real output (Bazel 9.3.2), paths shortened"><code class="language-none">ERROR: broken1/BUILD.bazel:1:1: name 'py_library' is not defined (did you mean 'cc_library'?)
+...
+ERROR: broken2/BUILD.bazel:3:11: no such target '//core:nope': target 'nope' not declared in package 'core' defined by core/BUILD.bazel and referenced by '//broken2:b'
+INFO: Analyzed 12 targets (0 packages loaded, 1 target configured).
+WARNING: errors encountered while analyzing target '//broken2:b', it will not be built.
+Analysis failed
+INFO: Build succeeded for only 11 of 12 top-level targets
+...
+ERROR: Build did NOT complete successfully</code></pre>
+    <p>It works for <code>query</code> too: <code>bazel query //... --keep_going</code> printed every loadable target and
+      warned <code>Results may be inaccurate</code>.</p>
+    <p><strong>Remember:</strong> <code>--explain</code> for "why did this run", <code>-s</code> for "what ran",
+      <code>bazel info</code> for "where", the profile for "how long", BEP for machines, <code>-k</code> for "show me
+      everything".</p>
+  </section>
+
+  <section class="lesson-section" id="diagnoses">
+    <h2>Three diagnoses</h2>
+    <p>Most "Bazel is being weird" reports are one of these. Each has a query that finds it and a BUILD change that fixes
+      it.</p>
+    <h3>1. A dependency you did not expect</h3>
+    <p><em>Symptom:</em> the server image includes test fakes, or a CLI pulls in a heavy library. <em>Find it:</em>
+      <code>somepath(//app:server, //testing:fakes)</code>, then <code>allpaths</code> if cutting one edge is not enough.
+      <em>Fix:</em> move the dependency to the target that really needs it (often a test), split the library that
+      carries it, and add <code>testonly = True</code> or a narrow <code>visibility</code> so it cannot creep back.
+      Exercise 1.</p>
+    <h3>2. A test that runs too often</h3>
+    <p><em>Symptom:</em> a template edit reruns every test in the repository. <em>Find it:</em>
+      <code>kind(test, rdeps(//..., //web:templates/receipt.html))</code> lists tests that have no business seeing a
+      template; <code>somepath</code> from one of them to the template shows the edge. Usually it is a "utils" library
+      that bundles unrelated code and <code>data</code>. <em>Fix:</em> split it so each test depends only on what it
+      imports. Lab 1 is this diagnosis, for real: before the fix, one template edit reran all four tests; after,
+      only one:</p>
+    <pre data-label="Real output (Bazel 9.3.2), after appending to web/templates/receipt.html in the lab's solution"><code class="language-none">//billing:invoice_test                                          (cached) PASSED in 0.5s
+//common:text_test                                              (cached) PASSED in 0.5s
+//inventory:stock_test                                          (cached) PASSED in 0.6s
+//web:render_test                                                        PASSED in 0.5s
+Executed 1 out of 4 tests: 4 tests pass.</code></pre>
+    <p>The reverse symptom, a test that <em>should</em> rerun and does not, is an undeclared input: rdeps cannot see it,
+      so neither can the cache. Declare the file in <code>data</code>.</p>
+    <h3>3. A cache miss you cannot explain</h3>
+    <p><em>Symptom:</em> nothing changed, but actions keep running. <em>Find it:</em> build twice with
+      <code>--explain=explain.log --verbose_explanations</code> and read the second log. "unconditional execution" on a
+      test points at <code>--nocache_test_results</code> or <code>tags = ["external"]</code> (M02). "action changed"
+      on every run with no edits points at something volatile in the key: a genrule that embeds <code>date</code>, an
+      <code>--action_env</code> that differs between your shell and CI, or a flag that toggles between commands (each
+      flag change also prints <code>Build option ... has changed, discarding analysis cache</code>). <em>Fix:</em>
+      remove the volatility, or pin the flag in <code>.bazelrc</code>.</p>
+    <aside class="callout think">
+      <p>A colleague says "CI is slow because Bazel reruns all 900 tests on every pull request." Which two commands would
+        you run first, and what would each tell you? (One answer: an affected-tests query for a typical change, to see
+        whether the graph is too connected; then <code>--explain</code> on a second, unchanged run, to see whether
+        caching works at all.)</p>
+    </aside>
+  </section>
+
+  <section class="lesson-section" id="practice">
+    <h2>Practice</h2>
+    <p>Each exercise is graded by the simulator. Open "Try commands" and use the queries from this module to find the
+      problem before you edit anything: the point is to let the graph tell you where to look.</p>
+
+    <div class="exercise" data-id="m09-e1" data-title="Keep the fakes out of the server">
+      <div class="exercise-prompt">
+        <p>The server must not ship test fakes, but <code>bazel query 'somepath(//app:server, //testing:fakes)'</code>
+          finds a path. Run it, find the edge, and fix the graph so that no path remains, while
+          <code>//checkout:checkout_test</code> still gets the fakes. Then make the mistake impossible to repeat: mark
+          <code>//testing:fakes</code> <code>testonly</code>. Everything must still build.</p>
+      </div>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "shop")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="testing/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "fakes",
+    srcs = ["fakes.py"],
+    visibility = ["//visibility:public"],
+)
+</textarea>
+<textarea class="file" data-path="checkout/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "checkout",
+    srcs = ["checkout.py"],
+    visibility = ["//app:__pkg__"],
+    deps = [
+        "//catalog",
+        "//testing:fakes",
+    ],
+)
+
+py_test(
+    name = "checkout_test",
+    size = "small",
+    srcs = ["checkout_test.py"],
+    deps = [":checkout"],
+)
+</textarea>
+<textarea class="file" data-path="catalog/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "catalog",
+    srcs = ["catalog.py"],
+    visibility = ["//visibility:public"],
+)
+</textarea>
+<textarea class="file" data-path="app/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "server",
+    srcs = ["server.py"],
+    deps = ["//checkout"],
+)
+</textarea>
+<textarea class="file" data-path="testing/fakes.py" data-hidden></textarea>
+<textarea class="file" data-path="checkout/checkout.py" data-hidden></textarea>
+<textarea class="file" data-path="checkout/checkout_test.py" data-hidden></textarea>
+<textarea class="file" data-path="catalog/catalog.py" data-hidden></textarea>
+<textarea class="file" data-path="app/server.py" data-hidden></textarea>
+<script type="text/x-python" class="tests">
+def test_no_path_from_the_server_to_the_fakes(bazel):
+    path = bazel.query("somepath(//app:server, //testing:fakes)")
+    assert path == [], "The server still reaches the fakes through: " + " -> ".join(path)
+
+def test_the_checkout_test_still_gets_the_fakes(bazel):
+    deps = bazel.query("deps(//checkout:checkout_test)")
+    assert "//testing:fakes" in deps, "//checkout:checkout_test uses the fakes: list //testing:fakes in its deps"
+
+def test_the_fakes_are_testonly(bazel):
+    assert bazel.target("//testing:fakes").attrs.get("testonly") is True, "Set testonly = True on //testing:fakes"
+
+def test_everything_builds(bazel):
+    result = bazel.build("//...")
+    assert result.ok, "bazel build //... fails:\n" + result.error
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p>The path is <code>//app:server</code> → <code>//checkout:checkout</code> → <code>//testing:fakes</code>. The
+          library does not need the fakes; its test does. Move the label from the library's <code>deps</code> to the
+          test's. If you mark the fakes <code>testonly</code> first, <code>bazel build //...</code> points at the same
+          edge with "non-test target ... depends on testonly target".</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="testing/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "fakes",
+    testonly = True,
+    srcs = ["fakes.py"],
+    visibility = ["//visibility:public"],
+)</code></pre>
+<pre data-path="checkout/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "checkout",
+    srcs = ["checkout.py"],
+    visibility = ["//app:__pkg__"],
+    deps = ["//catalog"],
+)
+
+py_test(
+    name = "checkout_test",
+    size = "small",
+    srcs = ["checkout_test.py"],
+    deps = [
+        ":checkout",
+        "//testing:fakes",
+    ],
+)</code></pre>
+        <p><code>testonly</code> turns this class of bug from "found by a query, if someone thinks to run it" into an
+          analysis error on the next build.</p>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m09-e2" data-title="Only checkout may charge cards">
+      <div class="exercise-prompt">
+        <p>Security wants <code>//payments:card</code> used only by <code>//checkout</code>. Run
+          <code>bazel query 'rdeps(//..., //payments:card, 1)'</code> to see who uses it today. Restrict its visibility
+          to the <code>checkout</code> package, and move any other user to <code>//payments:summary</code>, the read-only
+          library meant for reporting. When you are done, the direct users of <code>//payments:card</code> must be
+          exactly <code>//checkout:checkout</code> and its own test, and <code>bazel build //...</code> must pass.</p>
+      </div>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "shop")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="payments/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "card",
+    srcs = ["card.py"],
+    visibility = ["//visibility:public"],
+)
+
+py_library(
+    name = "summary",
+    srcs = ["summary.py"],
+    visibility = ["//visibility:public"],
+)
+
+py_test(
+    name = "card_test",
+    size = "small",
+    srcs = ["card_test.py"],
+    deps = [":card"],
+)
+</textarea>
+<textarea class="file" data-path="checkout/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "checkout",
+    srcs = ["checkout.py"],
+    deps = ["//payments:card"],
+)
+</textarea>
+<textarea class="file" data-path="reports/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "monthly",
+    srcs = ["monthly.py"],
+    deps = ["//payments:card"],
+)
+</textarea>
+<textarea class="file" data-path="payments/card.py" data-hidden></textarea>
+<textarea class="file" data-path="payments/summary.py" data-hidden></textarea>
+<textarea class="file" data-path="payments/card_test.py" data-hidden></textarea>
+<textarea class="file" data-path="checkout/checkout.py" data-hidden></textarea>
+<textarea class="file" data-path="reports/monthly.py" data-hidden></textarea>
+<script type="text/x-python" class="tests">
+def test_card_has_only_the_allowed_users(bazel):
+    users = bazel.query("rdeps(//..., //payments:card, 1)")
+    want = ["//checkout:checkout", "//payments:card", "//payments:card_test"]
+    assert users == want, f"rdeps(//..., //payments:card, 1) is {users}; it should be {want}"
+
+def test_card_is_not_public(bazel):
+    vis = bazel.attr("//payments:card", "visibility") or []
+    assert "//visibility:public" not in vis, "Restrict //payments:card to the checkout package"
+
+def test_reports_cannot_use_card(bazel):
+    vis = bazel.attr("//payments:card", "visibility") or []
+    assert vis == ["//checkout:__pkg__"], f"visibility of //payments:card should be exactly ['//checkout:__pkg__'], not {vis}"
+
+def test_everything_builds(bazel):
+    result = bazel.build("//...")
+    assert result.ok, "bazel build //... fails:\n" + result.error
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p>Changing the visibility alone makes <code>//reports:monthly</code> fail with a visibility error, and
+          <code>rdeps</code> still lists it: query reports edges, allowed or not. Edit <code>reports/BUILD.bazel</code>
+          too.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="payments/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "card",
+    srcs = ["card.py"],
+    visibility = ["//checkout:__pkg__"],
+)
+
+py_library(
+    name = "summary",
+    srcs = ["summary.py"],
+    visibility = ["//visibility:public"],
+)
+
+py_test(
+    name = "card_test",
+    size = "small",
+    srcs = ["card_test.py"],
+    deps = [":card"],
+)</code></pre>
+<pre data-path="reports/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "monthly",
+    srcs = ["monthly.py"],
+    deps = ["//payments:summary"],
+)</code></pre>
+        <p><code>card_test</code> is in the same package as <code>card</code>, so it needs no visibility grant.</p>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m09-e3" data-title="Keep the live test out of //...">
+      <div class="exercise-prompt">
+        <p><code>//inventory:warehouse_live_test</code> calls a real warehouse API. Your affected-tests query lists it for
+          every change to <code>stock.py</code>, and <code>bazel test //...</code> runs it on laptops with no network.
+          Make <code>bazel test //...</code> select only <code>//inventory:stock_test</code>, mark the live test as
+          talking to the outside world (so it is never cached), and give it an entry point:
+          <code>bazel test //inventory:live</code> must run it.</p>
+      </div>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "shop")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="inventory/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "stock",
+    srcs = ["stock.py"],
+)
+
+py_test(
+    name = "stock_test",
+    size = "small",
+    srcs = ["stock_test.py"],
+    deps = [":stock"],
+)
+
+py_test(
+    name = "warehouse_live_test",
+    srcs = ["warehouse_live_test.py"],
+    deps = [":stock"],
+)
+</textarea>
+<textarea class="file" data-path="inventory/stock.py" data-hidden></textarea>
+<textarea class="file" data-path="inventory/stock_test.py" data-hidden></textarea>
+<textarea class="file" data-path="inventory/warehouse_live_test.py" data-hidden></textarea>
+<script type="text/x-python" class="tests">
+def test_bazel_test_wildcard_runs_only_the_unit_test(bazel):
+    result = bazel.test("//...")
+    assert result.ok, "bazel test //... fails:\n" + result.error
+    assert result.tests == ["//inventory:stock_test"], f"bazel test //... would run {result.tests}"
+
+def test_the_live_test_is_never_cached(bazel):
+    tags = bazel.target("//inventory:warehouse_live_test").tags
+    assert "external" in tags, "Tag the live test external: its result depends on the outside world"
+
+def test_inventory_live_runs_the_live_test(bazel):
+    result = bazel.test("//inventory:live")
+    assert result.ok, "bazel test //inventory:live fails:\n" + result.error
+    assert result.tests == ["//inventory:warehouse_live_test"], f"bazel test //inventory:live would run {result.tests}"
+
+def test_affected_tests_without_manual(bazel):
+    got = bazel.query("tests(rdeps(//..., //inventory:stock.py)) except attr(tags, manual, //...)")
+    assert got == ["//inventory:stock_test"], f"The affected-tests query (minus manual) gives {got}"
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p>Two tags on the test: <code>manual</code> and <code>external</code>. Then a <code>test_suite</code> named
+          <code>live</code> that lists it. Remember M05: <code>//...</code> matches the suite too, so the suite needs a
+          tag as well.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="inventory/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "stock",
+    srcs = ["stock.py"],
+)
+
+py_test(
+    name = "stock_test",
+    size = "small",
+    srcs = ["stock_test.py"],
+    deps = [":stock"],
+)
+
+py_test(
+    name = "warehouse_live_test",
+    srcs = ["warehouse_live_test.py"],
+    tags = [
+        "external",
+        "manual",
+    ],
+    deps = [":stock"],
+)
+
+test_suite(
+    name = "live",
+    tags = ["manual"],
+    tests = [":warehouse_live_test"],
+)</code></pre>
+        <p><code>tests(rdeps(...))</code> still lists the live test (query keeps manual targets); subtracting
+          <code>attr(tags, manual, //...)</code> is what makes the affected list match <code>bazel test //...</code>.</p>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m09-e4" data-title="Tracing only outside optimized builds">
+      <div class="exercise-prompt">
+        <p><code>//debug:tracer</code> slows the server down by half. It is useful in development but must not be in
+          optimized builds. Use <code>select()</code> on the existing <code>:opt</code> setting so that
+          <code>bazel cquery 'somepath(//app:server, //debug:tracer)' -c opt</code> is empty, while the default build
+          still includes the tracer. Keep <code>//core:money</code> in every build.</p>
+      </div>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "shop")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="app/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_binary")
+
+config_setting(
+    name = "opt",
+    values = {"compilation_mode": "opt"},
+)
+
+py_binary(
+    name = "server",
+    srcs = ["server.py"],
+    deps = [
+        "//core:money",
+        "//debug:tracer",
+    ],
+)
+</textarea>
+<textarea class="file" data-path="core/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "money",
+    srcs = ["money.py"],
+    visibility = ["//visibility:public"],
+)
+</textarea>
+<textarea class="file" data-path="debug/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "tracer",
+    srcs = ["tracer.py"],
+    visibility = ["//visibility:public"],
+)
+</textarea>
+<textarea class="file" data-path="app/server.py" data-hidden></textarea>
+<textarea class="file" data-path="core/money.py" data-hidden></textarea>
+<textarea class="file" data-path="debug/tracer.py" data-hidden></textarea>
+<script type="text/x-python" class="tests">
+def test_no_tracer_with_c_opt(bazel):
+    path = bazel.cquery("somepath(//app:server, //debug:tracer)", "-c", "opt")
+    assert path == [], "With -c opt the server still reaches the tracer"
+
+def test_tracer_in_the_default_build(bazel):
+    path = bazel.cquery("somepath(//app:server, //debug:tracer)")
+    assert path, "The default build should still include //debug:tracer"
+
+def test_money_in_every_build(bazel):
+    for flags in ((), ("-c", "opt"), ("-c", "dbg")):
+        assert "//core:money" in bazel.cquery("deps(//app:server, 1)", *flags), f"//core:money is missing with flags {flags}"
+
+def test_both_modes_build(bazel):
+    for flags in ((), ("-c", "opt")):
+        result = bazel.build("//...", *flags)
+        assert result.ok, f"bazel build //... {' '.join(flags)} fails:\n" + result.error
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p>A list plus a <code>select()</code> concatenate:
+          <code>deps = ["//core:money"] + select({":opt": [], "//conditions:default": ["//debug:tracer"]})</code>. Then
+          compare <code>bazel query</code> and <code>bazel cquery</code> for the same <code>somepath</code>.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="app/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_binary")
+
+config_setting(
+    name = "opt",
+    values = {"compilation_mode": "opt"},
+)
+
+py_binary(
+    name = "server",
+    srcs = ["server.py"],
+    deps = ["//core:money"] + select({
+        ":opt": [],
+        "//conditions:default": ["//debug:tracer"],
+    }),
+)</code></pre>
+        <p><code>bazel query 'somepath(//app:server, //debug:tracer)'</code> still finds the path: query sees both
+          branches. Only cquery with <code>-c opt</code> proves the optimized server is clean.</p>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m09-e5" data-title="Shrink the blast radius of a data file">
+      <div class="exercise-prompt">
+        <p>Every edit to <code>common/countries.csv</code> reruns every test in the repository, but only
+          <code>geo/lookup.py</code> reads it. Run
+          <code>bazel query 'kind(test, rdeps(//..., //common:countries.csv))'</code> and fix the graph so that the
+          answer is only <code>//geo:lookup_test</code>. Keep the CSV file where it is, keep
+          <code>//common:util</code> (everyone still imports it), and keep the CSV in the lookup test's runfiles.</p>
+      </div>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "shop")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="common/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "util",
+    srcs = ["util.py"],
+    data = ["countries.csv"],
+    visibility = ["//visibility:public"],
+)
+
+py_test(
+    name = "util_test",
+    size = "small",
+    srcs = ["util_test.py"],
+    deps = [":util"],
+)
+</textarea>
+<textarea class="file" data-path="geo/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "lookup",
+    srcs = ["lookup.py"],
+    deps = ["//common:util"],
+)
+
+py_test(
+    name = "lookup_test",
+    size = "small",
+    srcs = ["lookup_test.py"],
+    deps = [":lookup"],
+)
+</textarea>
+<textarea class="file" data-path="orders/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "orders",
+    srcs = ["orders.py"],
+    deps = ["//common:util"],
+)
+
+py_test(
+    name = "orders_test",
+    size = "small",
+    srcs = ["orders_test.py"],
+    deps = [":orders"],
+)
+</textarea>
+<textarea class="file" data-path="common/util.py" data-hidden></textarea>
+<textarea class="file" data-path="common/util_test.py" data-hidden></textarea>
+<textarea class="file" data-path="common/countries.csv" data-hidden>code,name</textarea>
+<textarea class="file" data-path="geo/lookup.py" data-hidden></textarea>
+<textarea class="file" data-path="geo/lookup_test.py" data-hidden></textarea>
+<textarea class="file" data-path="orders/orders.py" data-hidden></textarea>
+<textarea class="file" data-path="orders/orders_test.py" data-hidden></textarea>
+<script type="text/x-python" class="tests">
+def test_only_the_lookup_test_sees_the_csv(bazel):
+    got = bazel.query("kind(test, rdeps(//..., //common:countries.csv))")
+    assert got == ["//geo:lookup_test"], f"Tests that see countries.csv: {got}"
+
+def test_the_lookup_test_still_gets_the_csv(bazel):
+    assert "//common:countries.csv" in bazel.query("deps(//geo:lookup_test)"), "//geo:lookup_test must still have countries.csv in its runfiles"
+
+def test_util_is_still_a_library(bazel):
+    assert bazel.target("//common:util").kind == "py_library", "Keep //common:util"
+    assert "//common:util" in bazel.query("deps(//orders:orders, 1)"), "//orders:orders still depends on //common:util"
+
+def test_everything_builds(bazel):
+    result = bazel.build("//...")
+    assert result.ok, "bazel build //... fails:\n" + result.error
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p>Move <code>data</code> from <code>//common:util</code> to <code>//geo:lookup</code>, the library that opens
+          the file. A file in another package needs <code>exports_files</code> (M02); give it a visibility that admits
+          only <code>//geo</code>.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="common/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+exports_files(
+    ["countries.csv"],
+    visibility = ["//geo:__pkg__"],
+)
+
+py_library(
+    name = "util",
+    srcs = ["util.py"],
+    visibility = ["//visibility:public"],
+)
+
+py_test(
+    name = "util_test",
+    size = "small",
+    srcs = ["util_test.py"],
+    deps = [":util"],
+)</code></pre>
+<pre data-path="geo/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "lookup",
+    srcs = ["lookup.py"],
+    data = ["//common:countries.csv"],
+    deps = ["//common:util"],
+)
+
+py_test(
+    name = "lookup_test",
+    size = "small",
+    srcs = ["lookup_test.py"],
+    deps = [":lookup"],
+)</code></pre>
+        <p>A CSV edit now reruns one test instead of three. On a real repository with hundreds of users of a "util"
+          library, this kind of fix is often the biggest CI speedup available.</p>
+      </details>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="lab">
+    <h2>Labs: queries against a real build</h2>
+    <p>The exercises proved the graph changes. These labs show what they buy with real Bazel: tests that stay
+      <code>(cached)</code> after an edit, and a script that asks a real Bazel server which tests to run. The second lab
+      also needs something the simulator cannot do at all: run a program that calls Bazel.</p>
+
+    <div class="lab" data-id="m09-lab1" data-title="Cut the edge that reruns everything">
+      <div class="lab-prompt">
+        <p>The <code>storefront</code> workspace has four tests. Editing one HTML template reruns all four, although only
+          <code>//web:render_test</code> renders HTML. Use query to find out why, then fix the BUILD files so a template
+          edit reaches only the render test. All four tests must keep passing. Do not change any <code>.py</code>
+          file.</p>
+        <ul class="checklist" data-id="m09-lab1-steps">
+          <li>Run <code>pixi run start m09-lab1</code>, then <code>cd work/m09-lab1</code></li>
+          <li>Run <code>pixi run bazel test //...</code>, append a comment to <code>web/templates/receipt.html</code>, and run it again: count the tests that ran</li>
+          <li>Run <code>pixi run bazel query 'kind(test, rdeps(//..., //web:templates/receipt.html))'</code></li>
+          <li>Run <code>pixi run bazel query 'somepath(//billing:invoice_test, //web:templates)'</code> and read the path</li>
+          <li>Split <code>//common:utils</code> so plain-text code no longer carries the templates; repoint each user at what it imports</li>
+          <li>Edit the template again: only <code>//web:render_test</code> should run</li>
+          <li>Back at the repository root, run <code>pixi run grade m09-lab1</code></li>
+        </ul>
+      </div>
+      <details class="hint"><summary>Hint</summary>
+        <p>The path is <code>//billing:invoice_test</code> → <code>//billing:invoice</code> → <code>//common:utils</code>
+          → <code>//web:templates</code>. <code>utils</code> holds two files: <code>text.py</code> (used by billing and
+          inventory) and <code>render.py</code> (used by web, and the only one that reads templates). Make each its own
+          <code>py_library</code>, with <code>data</code> only on the renderer.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-label="common/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Plain-text helpers: no data, no dependencies. Most of the repository needs only this.
+py_library(
+    name = "text",
+    srcs = ["text.py"],
+)
+
+# HTML rendering. Only this library needs the site templates.
+py_library(
+    name = "render",
+    srcs = ["render.py"],
+    data = ["//web:templates"],
+)
+
+py_test(
+    name = "text_test",
+    size = "small",
+    srcs = ["text_test.py"],
+    deps = [":text"],
+)</code></pre>
+        <p>Then <code>//billing:invoice</code> and <code>//inventory:stock</code> depend on <code>//common:text</code>,
+          and <code>//web:server</code> and <code>//web:render_test</code> on <code>//common:render</code>. Before the
+          fix, a template edit printed <code>Executed 4 out of 4 tests</code>; after it,
+          <code>Executed 1 out of 4 tests</code>.</p>
+      </details>
+    </div>
+
+    <div class="lab" data-id="m09-lab2" data-title="Which tests does this change affect?">
+      <div class="lab-prompt">
+        <p>The fixed storefront now has a <code>//tools:affected_tests</code> script (an <code>sh_binary</code> from
+          rules_shell 0.8.0). Given changed files, it should print the tests <code>bazel test //...</code> would need to
+          rerun, one label per line, so CI can run only those. The starter is a first draft that fails in several ways.
+          Finish it. The grader runs it with a library file, a template, a shared file, and a list that includes
+          <code>README.md</code>.</p>
+        <ul class="checklist" data-id="m09-lab2-steps">
+          <li>Run <code>pixi run start m09-lab2</code>, then <code>cd work/m09-lab2</code></li>
+          <li>Run <code>pixi run bazel run //tools:affected_tests -- billing/invoice.py</code> and read the error</li>
+          <li>Make the script <code>cd</code> to <code>$BUILD_WORKSPACE_DIRECTORY</code> before it calls <code>bazel</code></li>
+          <li>Narrow the query to tests, and leave out manual ones (try <code>common/text.py</code>)</li>
+          <li>Try <code>-- README.md inventory/stock.py</code>; make the script skip files outside packages</li>
+          <li>Back at the repository root, run <code>pixi run grade m09-lab2</code></li>
+        </ul>
+      </div>
+      <details class="hint"><summary>Hint</summary>
+        <p><code>bazel run</code> starts the program inside its runfiles tree, and Bazel refuses to start there:
+          <code>ERROR: bazel should not be called from a bazel output directory.</code>
+          <code>BUILD_WORKSPACE_DIRECTORY</code> (M03) is where the user ran <code>bazel run</code>. For
+          <code>README.md</code>, <code>--keep_going</code> makes query skip it, and then Bazel exits with 3, which your
+          script must not treat as failure under <code>set -e</code>.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-label="tools/affected_tests.sh"><code class="language-bash">#!/usr/bin/env bash
+# Print the tests affected by the files given as arguments (paths relative to the
+# workspace root), one label per line.
+set -euo pipefail
+
+if [ "$#" -eq 0 ]; then
+  echo "usage: bazel run //tools:affected_tests -- FILE [FILE...]" &gt;&amp;2
+  exit 2
+fi
+
+# `bazel run` starts us inside the runfiles tree, where Bazel refuses to run.
+# BUILD_WORKSPACE_DIRECTORY is the workspace the user ran `bazel run` from.
+cd "${BUILD_WORKSPACE_DIRECTORY:?run this with bazel run}"
+
+# Every test that depends on a changed file, minus the manual ones that
+# `bazel test //...` would skip anyway.
+query="tests(rdeps(//..., set($*))) except attr(tags, manual, //...)"
+
+# --keep_going skips files that belong to no package (README.md, docs/...);
+# Bazel then exits with 3 ("partial success"), which is fine here.
+status=0
+bazel query --keep_going "$query" || status=$?
+if [ "$status" -ne 0 ] &amp;&amp; [ "$status" -ne 3 ]; then
+  exit "$status"
+fi</code></pre>
+        <p>With the solution, <code>bazel run //tools:affected_tests -- README.md common/text.py</code> printed
+          <code>//billing:invoice_test</code>, <code>//common:text_test</code>, and <code>//inventory:stock_test</code> on
+          stdout, and the <code>Skipping 'README.md'</code> error on stderr. The nested <code>bazel query</code> talks to
+          the same Bazel server that is running <code>bazel run</code>, which works because <code>run</code> releases
+          the server before starting your program.</p>
+      </details>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="quiz">
+    <h2>Quiz</h2>
+    <div class="quiz" data-id="m09-quiz">
+<script type="application/json">
+{"title": "Query and debugging quiz", "passScore": 0.7, "questions": [
+  {"type": "single", "prompt": "You want to know whether <code>//debug:tracer</code> ends up in the server when built with <code>-c opt</code>. The server picks its deps with a <code>select()</code>. Which command answers that?", "options": ["<code>bazel query 'somepath(//app:server, //debug:tracer)'</code>", "<code>bazel cquery 'somepath(//app:server, //debug:tracer)' -c opt</code>", "<code>bazel aquery //app:server</code>", "<code>bazel info</code>"], "answer": 1, "explanation": "<p><code>query</code> runs before configuration and reports both branches of every <code>select()</code>, so it always finds the path. <code>cquery</code> resolves the <code>select()</code> for the flags you pass, so it answers for the optimized build.</p>"},
+  {"type": "output", "prompt": "What does <code>bazel query 'rdeps(//..., //core:money, 1)'</code> print?", "code": "# core/BUILD.bazel\npy_library(name = \"money\", srcs = [\"money.py\"], visibility = [\"//visibility:public\"])\npy_test(name = \"money_test\", srcs = [\"money_test.py\"], deps = [\":money\"])\n\n# catalog/BUILD.bazel\npy_library(name = \"catalog\", srcs = [\"catalog.py\"], deps = [\"//core:money\"])\n\n# app/BUILD.bazel\npy_binary(name = \"server\", srcs = [\"server.py\"], deps = [\"//catalog\"])", "lang": "starlark", "answer": "//catalog:catalog\n//core:money\n//core:money_test", "explanation": "<p>Depth 1 means direct users only, plus the target itself. <code>//app:server</code> reaches money only through catalog, so it is two edges away and left out. Output is sorted by package, then name.</p>"},
+  {"type": "single", "prompt": "What does <code>bazel query 'rdeps(//core:money)'</code> do?", "options": ["Lists everything that depends on //core:money", "Fails: rdeps needs a universe as its first argument", "Lists the direct users only", "Fails: rdeps needs --universe_scope"], "answer": 1, "explanation": "<p>Real Bazel reports <code>too few arguments to function 'rdeps'</code>. Write <code>rdeps(//..., //core:money)</code>. <code>--universe_scope</code> is what <code>allrdeps</code> needs, not <code>rdeps</code>.</p>"},
+  {"type": "multi", "prompt": "<code>//catalog</code> has a <code>py_test</code> tagged <code>manual</code> and a <code>test_suite</code> named <code>nightly</code> that lists it. Which statements are true? Select all that apply.", "options": ["<code>bazel query //catalog/...</code> lists the manual test", "<code>kind(test, //catalog/...)</code> includes <code>//catalog:nightly</code>", "<code>tests(//catalog/...)</code> includes <code>//catalog:nightly</code>", "<code>bazel build //catalog/...</code> skips the manual test"], "answer": [0, 1, 3], "explanation": "<p>Query lists manual targets; only build and test wildcards skip them. <code>kind(test, ...)</code> is a partial regex match, and <code>test_suite</code> contains \"test\". <code>tests()</code> expands suites into their member tests and does not return the suite itself.</p>"},
+  {"type": "single", "prompt": "<code>bazel query 'somepath(//tools:report, //checkout)'</code> prints <code>INFO: Empty results</code>. What does that mean?", "options": ["The query is malformed", "//tools:report does not depend on //checkout, directly or indirectly", "//checkout is not visible to //tools", "The targets are not built yet"], "answer": 1, "explanation": "<p>An empty <code>somepath</code> (and <code>allpaths</code>) means there is no chain of edges from the first set to the second. Query needs no build, and it ignores visibility.</p>"},
+  {"type": "single", "prompt": "<code>bazel query 'rdeps(//..., //checkout, 1)'</code> lists <code>//sec:dump</code>, but <code>//checkout</code> is visible only to <code>//app</code>. What happens when you build <code>//sec:dump</code>?", "options": ["It builds: query proved the edge is valid", "A visibility error at analysis: query does not check visibility", "A loading error in sec/BUILD.bazel", "Query would never list it, so the question is impossible"], "answer": 1, "explanation": "<p>Query reads the edges as written, before analysis, so it reports would-be users too. That makes <code>rdeps</code> a good way to find illegal users before tightening visibility.</p>"},
+  {"type": "single", "prompt": "Which expression lists the tests <code>bazel test //...</code> would rerun after <code>core/money.py</code> changes?", "options": ["<code>deps(//core:money.py)</code>", "<code>tests(rdeps(//..., //core:money.py)) except attr(tags, manual, //...)</code>", "<code>kind(test, deps(//...)) ^ //core:money.py</code>", "<code>somepath(//..., //core:money.py)</code>"], "answer": 1, "explanation": "<p>Reverse dependencies of the file, narrowed to tests with suites expanded, minus the manual tests that wildcards skip. <code>deps</code> walks the wrong direction.</p>"},
+  {"type": "single", "prompt": "Your affected-tests script runs <code>bazel query --keep_going</code> on a change list that includes <code>README.md</code>, which no BUILD file owns. What exit code does Bazel return?", "options": ["0", "1", "3", "7"], "answer": 2, "explanation": "<p>With <code>--keep_going</code> Bazel skips the file (<code>Skipping 'README.md': couldn't determine target from filename</code>), prints the rest, and exits with 3, \"partial success\". Without it, the query fails with exit code 7.</p>"},
+  {"type": "text", "prompt": "Which <code>--output</code> value makes <code>bazel query</code> print Graphviz dot?", "answer": ["graph", "--output=graph"], "explanation": "<p><code>--output=graph</code> prints a <code>digraph</code> with the edges between the result's targets. Graph a <code>somepath</code> or <code>allpaths</code>, not all of <code>deps(//...)</code>.</p>"},
+  {"type": "single", "prompt": "What does <code>bazel cquery //app:server.py</code> print after the label, where a rule would print <code>(a7a71fd)</code>?", "options": ["<code>(source)</code>", "<code>(null)</code>", "<code>(a7a71fd)</code> as well", "Nothing: cquery skips files"], "answer": 1, "explanation": "<p>The id in parentheses names the configuration a target was built in. A source file is not built, so it has no configuration, and cquery prints <code>(null)</code>.</p>"},
+  {"type": "text", "prompt": "In <code>bazel aquery</code> output, what is the mnemonic of the action that runs a genrule's <code>cmd</code>?", "answer": ["Genrule"], "explanation": "<p>Each action has a mnemonic: <code>Genrule</code> for genrules, <code>PyCompile</code> for rules_python's precompiler, <code>TestRunner</code> for tests. <code>aquery 'mnemonic(\"Genrule\", //...)'</code> lists every genrule action.</p>"},
+  {"type": "single", "prompt": "A second <code>bazel build</code> with no edits still runs a genrule. The <code>--explain</code> log says <code>action changed since cached execution</code>. What is the most likely cause?", "options": ["The disk is full", "Something in the action's key changes every time: a volatile input, a differing --action_env, or a flag that toggles", "Bazel never caches genrules", "The genrule is tagged manual"], "answer": 1, "explanation": "<p>\"Action changed\" means the key differs from the cached one. With no edits, look for what varies between runs: a generated input with a timestamp, an environment variable passed through <code>--action_env</code>, or flags that differ between commands.</p>"},
+  {"type": "single", "prompt": "Which flag prints the exact command line of every action Bazel executes?", "options": ["<code>--verbose_failures</code>", "<code>--subcommands</code> (<code>-s</code>)", "<code>--explain</code>", "<code>--announce_rc</code>"], "answer": 1, "explanation": "<p><code>-s</code> prints a <code>SUBCOMMAND</code> block with the working directory, environment, and command for each executed action. <code>--verbose_failures</code> prints the command only for failing actions; <code>--explain</code> prints why actions ran, not what they ran.</p>"},
+  {"type": "single", "prompt": "You want to view a profile of a slow build with Bazel 9.3.2. What works?", "options": ["<code>bazel analyze-profile</code>", "Open <code>command.profile.gz</code> from the output base (or the file from <code>--profile=PATH</code>) in chrome://tracing or Perfetto", "<code>bazel info profile</code>", "<code>bazel query --output=profile</code>"], "answer": 1, "explanation": "<p>Bazel writes a Chrome-trace profile for every command. Bazel 9.3.2 has no <code>analyze-profile</code> command (\"Command 'analyze-profile' not found\"), so use a trace viewer.</p>"},
+  {"type": "multi", "prompt": "Which of these does plain <code>bazel query</code> (no flags) include in <code>deps(//app:server)</code> for a <code>py_binary</code>? Select all that apply.", "options": ["Its <code>srcs</code> files", "Its <code>data</code> targets", "Both branches of a <code>select()</code> in <code>deps</code>", "Implicit dependencies such as Python toolchain helpers"], "answer": [0, 1, 2, 3], "explanation": "<p>Query follows every edge: sources, data, both <code>select()</code> branches, and implicit dependencies rules add. In our workspace that was 173 lines; <code>--noimplicit_deps</code> removes most of the implicit ones.</p>"}
+]}
+</script>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="recap">
+    <h2>Recap</h2>
+    <ul>
+      <li><code>query</code> reads the declared target graph (no configuration, both <code>select()</code> branches,
+        implicit deps, manual targets); <code>cquery</code> the configured graph for your flags; <code>aquery</code> the
+        actions.</li>
+      <li>Expressions combine patterns, functions (<code>deps</code>, <code>rdeps</code>, <code>kind</code>,
+        <code>attr</code>, <code>filter</code>, <code>labels</code>, <code>tests</code>, <code>set</code>,
+        <code>let</code>), and set operators <code>+ ^ -</code> (spaces around <code>-</code>).</li>
+      <li><code>rdeps(//..., X)</code> answers "what breaks"; it ignores visibility, so it also finds would-be users.</li>
+      <li><code>somepath</code> shows one path in order, <code>allpaths</code> every target on any path;
+        <code>--output=graph</code> draws them.</li>
+      <li>Affected tests: <code>tests(rdeps(//..., set(FILES))) except attr(tags, manual, //...)</code>, with
+        <code>--keep_going</code> (exit 3) for files outside packages. It is only as good as your declared inputs.</li>
+      <li><code>cquery</code> prints configuration ids, <code>(null)</code> for files, and finds outputs with
+        <code>--output=files</code>.</li>
+      <li><code>aquery</code> shows mnemonics (<code>PyCompile</code>, <code>Genrule</code>, <code>TestRunner</code>),
+        inputs, outputs, environment, and commands; filter with <code>mnemonic()</code>, <code>inputs()</code>,
+        <code>outputs()</code>.</li>
+      <li><code>--explain</code> says why actions ran, <code>-s</code> what ran, <code>bazel info</code> where things
+        live, the profile how long it took, BEP for machines, <code>--keep_going</code> for every error at once.</li>
+    </ul>
+    <div class="flashcards" data-title="Query and debugging review">
+<script type="application/json">
+[
+  {"front": "query vs cquery vs aquery?", "back": "query: target graph before configuration. cquery: configured graph for the flags you pass. aquery: the actions (commands, inputs, outputs)."},
+  {"front": "What breaks if I change <code>//core:money</code>?", "back": "bazel query 'rdeps(//..., //core:money)'. Add a third argument 1 for direct users only."},
+  {"front": "Why does X depend on Y?", "back": "bazel query 'somepath(X, Y)' for one path (printed in path order); allpaths(X, Y) for every target on any path."},
+  {"front": "Affected tests for changed files?", "back": "tests(rdeps(//..., set(FILES))) except attr(tags, manual, //...), with --keep_going for files no package owns (exit code 3)."},
+  {"front": "<code>kind(test, ...)</code> vs <code>tests(...)</code>?", "back": "kind is a partial regex on the rule kind, so it also matches test_suite. tests() expands suites into their member tests."},
+  {"front": "Does query check visibility?", "back": "No. It reads edges as written, so rdeps also lists targets that would fail with a visibility error."},
+  {"front": "What does <code>(null)</code> mean in cquery output?", "back": "A source file: files are not configured, so they have no configuration id."},
+  {"front": "Find a genrule's output path in a script?", "back": "bazel cquery //pkg:gen --output=files"},
+  {"front": "Three aquery mnemonics for Python and genrules?", "back": "PyCompile (precompile a .py), Genrule (run cmd), TestRunner (run a test). Also TemplateExpand for launchers."},
+  {"front": "Why did this action rerun?", "back": "--explain=FILE --verbose_explanations: 'no entry in the cache', 'action changed since cached execution', or 'unconditional execution is requested'."},
+  {"front": "See the exact commands Bazel runs?", "back": "-s (--subcommands): prints each executed action's cwd, environment, and command."},
+  {"front": "Profile a build in Bazel 9.3.2?", "back": "Open command.profile.gz from the output base (or --profile=PATH) in chrome://tracing or Perfetto. analyze-profile no longer exists."}
+]
+</script>
+    </div>
+    <h3>Going further</h3>
+    <ul>
+      <li><a href="https://bazel.build/query/language">The Bazel query reference</a>: every function, operator, and output format</li>
+      <li><a href="https://bazel.build/query/guide">Query guide</a>: worked examples of common questions</li>
+      <li><a href="https://bazel.build/query/cquery">Configurable query (cquery)</a>: configurations, transitions, and <code>--output=files</code></li>
+      <li><a href="https://bazel.build/query/aquery">Action graph query (aquery)</a>: <code>mnemonic</code>, <code>inputs</code>, <code>outputs</code>, and output formats</li>
+      <li><a href="https://bazel.build/advanced/performance/build-performance-breakdown">Breaking down build performance</a> and <a href="https://bazel.build/advanced/performance/json-trace-profile">the JSON trace profile</a></li>
+      <li><a href="https://bazel.build/remote/bep">Build Event Protocol</a>: the events and how CI systems consume them</li>
+      <li><a href="https://bazel.build/docs/user-manual#explain">--explain in the user manual</a></li>
+      <li><a href="https://rules-python.readthedocs.io/">rules_python documentation</a>: precompiling and the actions it declares</li>
+      <li><a href="https://registry.bazel.build/modules/rules_shell">rules_shell on the Bazel Central Registry</a>: the <code>sh_binary</code> used in Lab 2</li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>

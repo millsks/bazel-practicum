@@ -1,0 +1,14 @@
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "stock",
+    srcs = ["stock.py"],
+    deps = ["//common:utils"],
+)
+
+py_test(
+    name = "stock_test",
+    size = "small",
+    srcs = ["stock_test.py"],
+    deps = [":stock"],
+)

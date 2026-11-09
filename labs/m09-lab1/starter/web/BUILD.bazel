@@ -1,0 +1,23 @@
+load("@rules_python//python:defs.bzl", "py_binary", "py_test")
+
+filegroup(
+    name = "templates",
+    srcs = [
+        "templates/index.html",
+        "templates/receipt.html",
+    ],
+    visibility = ["//common:__pkg__"],
+)
+
+py_binary(
+    name = "server",
+    srcs = ["server.py"],
+    deps = ["//common:utils"],
+)
+
+py_test(
+    name = "render_test",
+    size = "small",
+    srcs = ["render_test.py"],
+    deps = ["//common:utils"],
+)

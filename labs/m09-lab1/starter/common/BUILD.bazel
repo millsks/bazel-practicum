@@ -1,0 +1,20 @@
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Shared helpers: text formatting, and HTML rendering with the site templates.
+py_library(
+    name = "utils",
+    srcs = [
+        "render.py",
+        "text.py",
+    ],
+    data = ["//web:templates"],
+)
+
+py_test(
+    name = "text_test",
+    size = "small",
+    srcs = ["text_test.py"],
+    deps = [":utils"],
+)

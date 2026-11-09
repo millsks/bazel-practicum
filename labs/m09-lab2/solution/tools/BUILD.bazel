@@ -1,0 +1,8 @@
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+
+# Usage: bazel run //tools:affected_tests -- FILE [FILE...]
+# Prints the tests that `bazel test //...` would have to rerun after FILEs change.
+sh_binary(
+    name = "affected_tests",
+    srcs = ["affected_tests.sh"],
+)
