@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "pixi run ci >&2 || exit 2",
+            "timeout": 900
+          }
+        ]
+      }
+    ]
+  }
+}

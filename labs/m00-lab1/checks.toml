@@ -1,0 +1,20 @@
+[[check]]
+name = "the hello package loads"
+command = ["query", "//hello:all"]
+message = "Bazel could not load hello/BUILD.bazel. Read the first ERROR line: which name is not defined, and which file defines it?"
+
+[[check]]
+name = "bazel run //hello:hello prints the greeting"
+command = ["run", "//hello:hello"]
+stdout_equals = "Hello, Bazel!"
+message = "Run `pixi run bazel run //hello:hello` inside work/m00-lab1."
+
+[[check]]
+name = "there is a py_test named //hello:greeting_test"
+command = ["query", "kind(py_test, //hello:all)"]
+stdout_lines = ["//hello:greeting_test"]
+message = "Add a py_test target for greeting_test.py (remember to load py_test too)."
+
+[[check]]
+name = "bazel test //... passes"
+command = ["test", "//...", "--test_output=errors"]

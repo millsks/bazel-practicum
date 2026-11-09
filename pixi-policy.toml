@@ -1,0 +1,64 @@
+# pixi-policy.toml, written by `pixi policy init` from what this workspace uses today.
+# Tighten it from here; `pixi policy explain <RULE>` says what each rule checks.
+
+[sources]
+allowed-channels = ["conda-forge"]
+allow-git = false
+allow-url = false
+allow-path = true  # in use today
+
+[bans]
+deny = []  # e.g. { name = "pycrypto", reason = "unmaintained", use-instead = "pycryptodome" }
+
+[licenses]
+# Every license the packages declare today: pixi.lock's, and the PyPI wheels' METADATA it could read.
+allow = [
+  "0BSD",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "GPL-2.0-only WITH GCC-exception-2.0",
+  "GPL-2.0-or-later",
+  "GPL-3.0-only",
+  "GPL-3.0-only WITH GCC-exception-3.1",
+  "ISC",
+  "LGPL-2.0-or-later",
+  "LGPL-2.0-or-later WITH AdditionRef-exceptions",
+  "LGPL-2.1-only",
+  "LicenseRef-MicrosoftVisualCpp2015-2022Runtime",
+  "LicenseRef-MicrosoftWindowsSDK10",
+  "LicenseRef-Public-Domain",
+  "MIT",
+  "MPL-2.0",
+  "PSF-2.0",
+  "Python-2.0",
+  "TCL",
+  "X11",
+  "Zlib",
+  "blessing",
+  "bzip2-1.0.6",
+]
+unknown = "warn"
+
+# Known vulnerabilities and freshness use the network; turn them on when it is there.
+# [advisories]  # fails on high and critical advisories and known exploited ones
+# [freshness]
+# max-build-age-days = 730
+# max-majors-behind = 1
+
+[hygiene]  # no PyPI package duplicates a conda package today
+
+[python]
+version = "3.14"
+
+[manifest]
+required-platforms = [
+  "osx-arm64",
+  "osx-64",
+  "linux-64",
+  "win-64",
+]
+# min-exclude-newer-days = 7  # with exclude-newer = "7d" in the workspace, a cooldown for new releases
+
+[lock]  # present, complete and in-sync are all on

@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bazel Practicum</title>
+<meta name="description" content="An interactive Bazel course: from Python developer to a polyglot monorepo, with a Bazel simulator in the page and labs graded by real Bazel.">
+<link rel="stylesheet" href="assets/css/course.css">
+<script src="assets/js/curriculum.js"></script>
+<script src="assets/js/viz.js" defer></script>
+<script src="assets/js/viz-bazel.js" defer></script>
+<script src="assets/js/course.js" defer></script>
+</head>
+<body data-root="" data-page="home">
+<main class="lesson">
+  <header class="home-hero">
+    <p class="eyebrow">Bazel 9.3 · Bzlmod · rules_python · rules_go · Pixi</p>
+    <h1>Bazel Practicum</h1>
+    <p class="lede">Learn Bazel the way a Python developer actually meets it: start with a single <code>py_binary</code>, then
+      grow it into a monorepo with tests, PyPI dependencies, configurations, generated files, and a second language (Go).
+      Every lesson has a <strong>Bazel simulator</strong> right in the page, so you can edit BUILD files and run
+      <code>bazel query</code> or <code>bazel build</code> as you read. Every module also has <strong>labs</strong> that
+      run real Bazel 9 on your machine, installed by Pixi and graded by real builds and tests.</p>
+    <div class="btn-row">
+      <a class="btn primary" href="modules/m00-orientation.html">Start with Module 00 →</a>
+      <a class="btn" href="modules/m02-build-graph.html">Jump to the build graph</a>
+      <a class="btn" href="reference/roadmap.html">See the full roadmap</a>
+    </div>
+  </header>
+
+  <section class="lesson-section" id="progress">
+    <h2>Your progress</h2>
+    <div class="card-grid" id="progress-stats"></div>
+    <p class="status">Progress, exercise files, quiz scores, and notes are saved in this browser. Export a backup or move to another computer:</p>
+    <div class="btn-row">
+      <button class="btn small" id="export-progress" type="button">Export progress</button>
+      <label class="btn small">Import progress<input type="file" id="import-progress" accept="application/json" class="visually-hidden"></label>
+      <span class="status" id="progress-message" aria-live="polite"></span>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="how">
+    <h2>How this course works</h2>
+    <div class="card-grid">
+      <div class="card"><h4>1 · Read and try</h4><p>Lessons mix explanation with <strong>sandboxes</strong>: small workspaces you can edit, with a command line for <code>bazel query</code>, <code>build</code>, and <code>test</code>.</p></div>
+      <div class="card"><h4>2 · Meet the errors</h4><p>Bazel's error messages are precise once you can read them. Sandboxes break on purpose so you see each one before it surprises you at work.</p></div>
+      <div class="card"><h4>3 · See the graph</h4><p><strong>Visualizers</strong> show the three phases of a build and exactly what re-runs when you change one file.</p></div>
+      <div class="card"><h4>4 · Practice</h4><p><strong>Graded exercises</strong> check your BUILD files in the simulator. Hints and solutions are there when you need them.</p></div>
+      <div class="card"><h4>5 · Lab it for real</h4><p><strong>Labs</strong> run real Bazel: <code>pixi run start m01-lab1</code>, edit, then <code>pixi run grade m01-lab1</code>.</p></div>
+      <div class="card"><h4>6 · Build a monorepo</h4><p>Level 1 ends with a <strong>capstone</strong>: a Python service and a Go CLI in one repository, graded by real <code>bazel test</code> and <code>bazel query</code>.</p></div>
+    </div>
+    <pre class="mermaid">
+flowchart LR
+  O[0 · Orientation] --> S1[Stage 1 · Foundations] --> S2[Stage 2 · Growing the monorepo] --> C1[Capstone 1 · Polyglot monorepo]
+  C1 -.-> L2[Level 2 · Toolchains and remote builds] -.-> L3[Level 3 · Writing rules]
+    </pre>
+    <aside class="callout note">
+      <p><strong>Level 1 (Building with Bazel) is available now.</strong> Level 2 (toolchains, hermeticity, remote caching
+        and execution, CI) and Level 3 (custom rules, providers, aspects) are on the <a href="reference/roadmap.html">roadmap</a>.</p>
+    </aside>
+    <aside class="callout pixi">
+      <p>All local work uses <a href="https://pixi.sh">Pixi</a>, which installs Bazelisk; Bazelisk then runs the Bazel version
+        each workspace pins. From a clone of <a href="https://github.com/millsks/bazel-practicum">bazel-practicum</a>:
+        <code>pixi install</code> once, <code>pixi run serve</code> to open this site, <code>pixi run labs</code> to list labs,
+        <code>pixi run start m01-lab1</code> to copy a starter workspace into <code>work/</code>, and
+        <code>pixi run grade m01-lab1</code> to check it with real Bazel.</p>
+    </aside>
+    <aside class="callout tip">
+      <p>Level 1 takes about <strong>25–30 hours</strong> including labs and the capstone. You should be comfortable with
+        Python packages, imports, and pytest. No Go experience is needed: Module 07 teaches the little Go it uses.</p>
+    </aside>
+  </section>
+
+  <section class="lesson-section" id="curriculum">
+    <h2>Curriculum</h2>
+    <div id="curriculum-map"></div>
+  </section>
+
+  <section class="lesson-section" id="reference">
+    <h2>Reference</h2>
+    <div class="card-grid">
+      <a class="card" href="reference/roadmap.html"><h4>Roadmap: Levels 2-3</h4><p>The full path and what each level adds.</p></a>
+      <a class="card" href="reference/python-to-bazel.html"><h4>Python to Bazel Cheat Sheet</h4><p>pip, pytest, and pyproject, side by side with Bazel.</p></a>
+      <a class="card" href="reference/commands.html"><h4>Command Reference</h4><p>Commands, flags, and query functions used in the course.</p></a>
+      <a class="card" href="reference/glossary.html"><h4>Glossary</h4><p>Terms with links to where they're taught.</p></a>
+    </div>
+  </section>
+</main>
+</body>
+</html>
