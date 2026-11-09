@@ -1378,7 +1378,9 @@ def _m05_ws(build: str) -> dict[str, str]:
 
 def test_positive_manual_tag_filter_is_ignored() -> None:
     sim = load_simulator(REPO_ROOT / "docs")
-    b = sim.Bazel(_m05_ws('py_test(name = "m", srcs = ["m.py"], tags = ["manual"])\npy_test(name = "s", srcs = ["s.py"])\n'))
+    b = sim.Bazel(
+        _m05_ws('py_test(name = "m", srcs = ["m.py"], tags = ["manual"])\npy_test(name = "s", srcs = ["s.py"])\n')
+    )
     assert b.test("//...", "--test_tag_filters=manual").tests == ["//pkg:s"]
 
 
