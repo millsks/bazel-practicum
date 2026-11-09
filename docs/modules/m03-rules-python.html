@@ -1,0 +1,1183 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M03 · Python with rules_python · Bazel Practicum</title>
+<link rel="stylesheet" href="../assets/css/course.css">
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/viz.js" defer></script>
+<script src="../assets/js/viz-bazel.js" defer></script>
+<script src="../assets/js/course.js" defer></script>
+</head>
+<body data-root="../" data-module="m03">
+<main class="lesson">
+  <header class="lesson-hero">
+    <p class="eyebrow">Stage 1 · Foundations · Module 03</p>
+    <h1>Python with rules_python</h1>
+    <p class="lede">You already know how Python finds modules, where your data files live, and which interpreter runs your
+      code. Bazel changes all three answers. This module shows what <code>rules_python</code> does with your
+      <code>.py</code> files, why your imports and file paths behave differently, and how to write BUILD files that work
+      on every machine.</p>
+    <div class="lesson-meta"><span>⏱ ~2.5 hours</span><span>Prerequisites: <a href="m02-build-graph.html">M02</a></span></div>
+    <ul class="objectives">
+      <li>Write <code>py_library</code>, <code>py_binary</code>, and <code>py_test</code> targets with the right <code>srcs</code>, <code>deps</code>, <code>data</code>, and <code>main</code></li>
+      <li>Predict how an <code>import</code> resolves under Bazel, and use <code>imports</code> for a <code>src/</code>-layout package</li>
+      <li>Explain runfiles, ship a data file with <code>data</code>, and find it at run time with the rules_python runfiles library</li>
+      <li>Describe the hermetic Python toolchain from <code>MODULE.bazel</code> and pin a target to another version with <code>python_version</code></li>
+      <li>Write <code>unittest</code> tests that Bazel runs, and read a failing test's log</li>
+      <li>Choose between <code>bazel run</code> and running <code>bazel-bin/...</code> directly, and know what changes</li>
+    </ul>
+  </header>
+
+  <section class="lesson-section" id="three-rules">
+    <h2>Three rules for Python code</h2>
+    <aside class="callout python">
+      <p>In a normal project, a "library" is a directory with an <code>__init__.py</code>, an "application" is a module you
+        run with <code>python -m</code> or a <code>[project.scripts]</code> entry, and a "test" is any file pytest
+        discovers by name. None of that is declared anywhere; it is convention.</p>
+    </aside>
+    <p>Bazel makes each of those a declared <strong>target</strong>. <code>rules_python</code>, the Python rule set,
+      gives you three rules:</p>
+    <div class="card-grid">
+      <div class="card"><h4>py_library</h4><p>Python code other targets import. It does not run by itself. It hands its files and import paths to whoever depends on it.</p></div>
+      <div class="card"><h4>py_binary</h4><p>A program. Bazel builds an executable launcher you start with <code>bazel run</code>.</p></div>
+      <div class="card"><h4>py_test</h4><p>A <code>py_binary</code> that <code>bazel test</code> runs. Exit code 0 means PASSED; anything else is FAILED.</p></div>
+    </div>
+    <p>All three share the same core attributes. An <strong>attribute</strong> is a named argument of a rule, like a
+      keyword argument of a function:</p>
+    <table>
+      <thead><tr><th>Attribute</th><th>On</th><th>What it means</th></tr></thead>
+      <tbody>
+        <tr><td><code>srcs</code></td><td>all three</td><td>The <code>.py</code> files that belong to this target. Only files in the same package, written as relative paths.</td></tr>
+        <tr><td><code>deps</code></td><td>all three</td><td>Other Python targets this code imports: <code>py_library</code> labels, later PyPI packages (M04).</td></tr>
+        <tr><td><code>data</code></td><td>all three</td><td>Files needed at run time but not imported: JSON, templates, fixtures. See <a href="#runfiles">Runfiles</a>.</td></tr>
+        <tr><td><code>imports</code></td><td>all three</td><td>Extra directories, relative to the package, to put on <code>sys.path</code>. See <a href="#src-layout">src layout</a>.</td></tr>
+        <tr><td><code>main</code></td><td>binary, test</td><td>Which file in <code>srcs</code> is the entry point. Defaults to <code>&lt;name&gt;.py</code>.</td></tr>
+        <tr><td><code>python_version</code></td><td>binary, test</td><td>Run with a specific registered Python, such as <code>"3.12"</code>.</td></tr>
+        <tr><td><code>args</code>, <code>env</code></td><td>binary, test</td><td>Command-line arguments and environment variables added by <code>bazel run</code> and <code>bazel test</code>.</td></tr>
+      </tbody>
+    </table>
+    <p>Here is a small workspace with all three. Run the commands, then try changing <code>kind(py_test, //...)</code>
+      to <code>kind(py_library, //...)</code>.</p>
+    <div class="runnable" data-title="Three Python rules" data-commands="bazel query 'kind(py_test, //...)' --output=label_kind|bazel query //...|bazel build //...|bazel test //...">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "practicum")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(python_version = "3.13", is_default = True)
+</textarea>
+<textarea class="file" data-path="hello/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
+
+py_library(
+    name = "greeting",
+    srcs = ["greeting.py"],
+)
+
+py_binary(
+    name = "hello",
+    srcs = ["hello.py"],
+    deps = [":greeting"],
+)
+
+py_test(
+    name = "greeting_test",
+    srcs = ["greeting_test.py"],
+    deps = [":greeting"],
+)
+</textarea>
+<textarea class="file" data-path="hello/greeting.py" data-hidden></textarea>
+<textarea class="file" data-path="hello/hello.py" data-hidden></textarea>
+<textarea class="file" data-path="hello/greeting_test.py" data-hidden></textarea>
+</div>
+    <aside class="callout warn">
+      <p><code>srcs</code> takes files <em>of this package</em>. A common first attempt is
+        <code>srcs = ["hello.py", "//lib:greeting.py"]</code>, borrowing another package's file. Bazel rejects it with
+        a visibility error, and even when allowed it would copy the file into your target. Depend on the
+        <code>py_library</code> that owns the file instead.</p>
+    </aside>
+    <p><strong>Remember:</strong> <code>srcs</code> is what you own, <code>deps</code> is what you import,
+      <code>data</code> is what you open. Every Python file lives in exactly one target's <code>srcs</code>.</p>
+  </section>
+
+  <section class="lesson-section" id="imports">
+    <h2>How imports work under Bazel</h2>
+    <aside class="callout python">
+      <p>When you run <code>python hello/hello.py</code>, Python puts <code>hello/</code> on <code>sys.path</code>, so
+        <code>from greeting import greeting</code> works. With <code>pip install -e .</code>, your package's parent
+        directory is on the path instead. Either way, the answer depends on how you started Python.</p>
+    </aside>
+    <p>Under Bazel, the answer is fixed: <strong>the workspace root is on <code>sys.path</code></strong>, and every
+      import is written as a path from there. A file at <code>hello/greeting.py</code> is the module
+      <code>hello.greeting</code>:</p>
+    <pre data-label="hello/hello.py"><code class="language-python">from hello.greeting import greeting
+
+print(greeting("Bazel"))</code></pre>
+    <p>The "it worked when I ran it directly" import, <code>from greeting import greeting</code>, fails under
+      <code>bazel run</code>, because <code>hello/</code> itself is not on the path:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">  File "/root/.cache/bazel/_bazel_root/c29f10e04db78a29c46b057dc668bb52/execroot/_main/bazel-out/k8-fastbuild/bin/hello/hello.runfiles/_main/hello/hello.py", line 3, in &lt;module&gt;
+    from greeting import greeting
+ModuleNotFoundError: No module named 'greeting'</code></pre>
+    <p>Why make every import absolute from the root? Because in a monorepo, two packages can each have a
+      <code>utils.py</code>. <code>import utils</code> would be ambiguous; <code>from billing.utils import ...</code>
+      and <code>from search.utils import ...</code> never are.</p>
+    <p>There is a second rule: <strong>an import only works if the file is in your target's transitive
+      <code>deps</code></strong>. Bazel builds each program a private tree containing only the files it declared (the
+      runfiles, below). A module that exists in your repository but is not a dependency is simply not there.</p>
+    <p>Predict what <code>deps(//app:report)</code> returns, then run it. Remember that <code>deps</code> includes the
+      target itself and its source files.</p>
+    <div class="runnable" data-predict data-title="Which files can report.py import?" data-commands="bazel query 'deps(//app:report)'|bazel query 'deps(//app:report, 1)'">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "practicum")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="app/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "report",
+    srcs = ["report.py"],
+    deps = ["//money:fmt"],
+)
+</textarea>
+<textarea class="file" data-path="money/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "fmt",
+    srcs = ["fmt.py"],
+    visibility = ["//app:__pkg__"],
+    deps = [":rounding"],
+)
+
+py_library(
+    name = "rounding",
+    srcs = ["rounding.py"],
+)
+
+py_library(
+    name = "currency",
+    srcs = ["currency.py"],
+)
+</textarea>
+<textarea class="file" data-path="app/report.py" data-hidden></textarea>
+<textarea class="file" data-path="money/fmt.py" data-hidden></textarea>
+<textarea class="file" data-path="money/rounding.py" data-hidden></textarea>
+<textarea class="file" data-path="money/currency.py" data-hidden></textarea>
+</div>
+    <p><code>report.py</code> can import <code>money.fmt</code> and <code>money.rounding</code> (it gets the
+      transitive closure), but <code>import money.currency</code> would fail at run time: nothing in the graph pulls it
+      in. Leaning on a transitive dependency is legal but fragile; if <code>report.py</code> imports
+      <code>money.rounding</code> directly, list <code>//money:rounding</code> in its own <code>deps</code>.</p>
+    <aside class="callout pro">
+      <p>Teams usually enforce "declare what you import" with a tool such as Gazelle's Python extension, which
+        generates <code>deps</code> from your import statements. Until then, the rule of thumb: every
+        <code>import</code> of first-party code maps to one label in <code>deps</code>.</p>
+    </aside>
+    <p><strong>Remember:</strong> imports start at the workspace root (<code>from hello.greeting import ...</code>), and
+      only declared dependencies are importable.</p>
+  </section>
+
+  <section class="lesson-section" id="main">
+    <h2>py_binary's main file</h2>
+    <p>A <code>py_binary</code> needs to know which file to run. Without a <code>main</code> attribute it looks for a
+      file named after the target: <code>name = "server"</code> means <code>server.py</code> must be in
+      <code>srcs</code>. Python developers often call the entry point <code>main.py</code> or
+      <code>__main__.py</code>, which trips this immediately.</p>
+    <pre data-label="app/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "server",
+    srcs = ["main.py"],
+)</code></pre>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: /home/claude/bazel-practicum/build/scratch-m03/demo/app/BUILD.bazel:3:10: in py_binary rule //app:server:
+Traceback (most recent call last):
+	File "/root/.cache/bazel/_bazel_root/c29f10e04db78a29c46b057dc668bb52/external/rules_python+/python/private/py_binary_rule.bzl", line 24, column 30, in _py_binary_impl
+		return py_executable_impl(
+	File "/root/.cache/bazel/_bazel_root/c29f10e04db78a29c46b057dc668bb52/external/rules_python+/python/private/py_executable.bzl", line 276, column 35, in py_executable_impl
+		return py_executable_base_impl(
+	File "/root/.cache/bazel/_bazel_root/c29f10e04db78a29c46b057dc668bb52/external/rules_python+/python/private/py_executable.bzl", line 1195, column 33, in py_executable_base_impl
+		main_py = determine_main(ctx)
+	File "/root/.cache/bazel/_bazel_root/c29f10e04db78a29c46b057dc668bb52/external/rules_python+/python/private/py_executable.bzl", line 1895, column 17, in determine_main
+		fail(("corresponding default '{}' does not appear in srcs. Add " +
+Error in fail: corresponding default 'server.py' does not appear in srcs. Add it or override default file name with a 'main' attribute
+ERROR: /home/claude/bazel-practicum/build/scratch-m03/demo/app/BUILD.bazel:3:10: Analysis of target '//app:server' (config: a7a71fd) failed
+ERROR: Analysis of target '//app:server' failed; build aborted
+INFO: Elapsed time: 9.574s, Critical Path: 0.09s
+INFO: 1 process: 1 internal.
+ERROR: Build did NOT complete successfully</code></pre>
+    <p>Do not be scared by the traceback. It is a <strong>Starlark</strong> stack trace through rules_python's own
+      code; the line that matters is <code>Error in fail:</code>, the message the rule author wrote for you. This is an
+      <strong>analysis</strong> error (M02): the BUILD file loaded fine, but the rule rejected its attributes.</p>
+    <p>Two fixes. Rename the target or file so they match, or say which file is the entry point:</p>
+    <pre data-label="app/BUILD.bazel"><code class="language-starlark">py_binary(
+    name = "server",
+    srcs = ["main.py"],
+    main = "main.py",
+)</code></pre>
+    <p><code>main</code> must name a file that is also in <code>srcs</code>; otherwise the error is
+      <code>could not find 'main.py' as specified by 'main' attribute</code>. The same rule applies to
+      <code>py_test</code>: a test named <code>routes_test</code> whose file is <code>tests/test_routes.py</code> needs
+      <code>main = "tests/test_routes.py"</code>.</p>
+    <aside class="callout sim">
+      <p>Real rules_python matches the default by the <em>end</em> of the path, so <code>name = "test_routes"</code> with
+        <code>srcs = ["tests/test_routes.py"]</code> works without <code>main</code>. The simulator only accepts an exact
+        file name. Setting <code>main</code> to the full path, as above, works in both.</p>
+    </aside>
+    <p>Try it: the build fails. Add <code>main = "main.py"</code>, and build again.</p>
+    <div class="runnable" data-title="The default-main error" data-commands="bazel build //app:server|bazel run //app:server">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "practicum")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="app/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "server",
+    srcs = ["main.py"],
+)
+</textarea>
+<textarea class="file" data-path="app/main.py" data-hidden></textarea>
+</div>
+    <p><strong>Remember:</strong> no <code>main</code> means <code>&lt;name&gt;.py</code>. When the names differ, set
+      <code>main</code> to a file that is in <code>srcs</code>.</p>
+  </section>
+
+  <section class="lesson-section" id="runfiles">
+    <h2>Runfiles: how data files travel with a program</h2>
+    <aside class="callout python">
+      <p>Your code probably opens files with <code>open("data/prices.json")</code> (relative to wherever you started
+        Python) or <code>Path(__file__).parent / "prices.json"</code>. Both assume the source tree is right there at
+        run time. Packaging tools then need <code>package_data</code> or <code>MANIFEST.in</code> to ship those files.</p>
+    </aside>
+    <p>A Bazel program does not run from your source tree. When Bazel builds <code>//app:prices</code>, it also builds
+      its <strong>runfiles</strong>: a directory of everything the program needs at run time, laid out by workspace path.
+      It holds the program's own <code>.py</code> files, every transitive dependency's files, the Python interpreter,
+      and any file listed in <code>data</code>. In this sandbox it is a tree of symlinks next to the launcher.</p>
+    <pre data-label="app/BUILD.bazel"><code class="language-starlark">py_binary(
+    name = "prices",
+    srcs = ["prices.py"],
+    data = ["//data:prices.json"],
+    deps = ["@rules_python//python/runfiles"],
+)</code></pre>
+    <pre data-label="data/BUILD.bazel"><code class="language-starlark">exports_files(["prices.json"])</code></pre>
+    <p>The file lives in another package, so <code>data/BUILD.bazel</code> must let other packages refer to it.
+      <code>exports_files</code> does that (M02). Without it, real Bazel says:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: /home/claude/bazel-practicum/build/scratch-m03/ws2/app/BUILD.bazel:34:10: no such target '//data:prices.json': target 'prices.json' not declared in package 'data' defined by /home/claude/bazel-practicum/build/scratch-m03/ws2/data/BUILD.bazel; however, a source file of this name exists.  (Perhaps add 'exports_files(["prices.json"])' to data/BUILD.bazel?) and referenced by '//app:total'</code></pre>
+    <p>After a build, the runfiles tree for <code>//app:prices</code> looks like this (abridged: the interpreter and
+      the virtual environment rules_python creates are left out):</p>
+    <pre data-label="bazel-bin/app/prices.runfiles/ (abridged)"><code class="language-none">MANIFEST
+_main/                       # your workspace, the "main repository"
+    app/prices                 # the launcher
+    app/prices.py
+    data/prices.json           # because of data = [...]
+_repo_mapping
+rules_python+/               # the runfiles library, because of deps
+rules_python++python+python_3_13_x86_64-unknown-linux-gnu/   # the interpreter</code></pre>
+    <p><code>_main</code> is the canonical name of your own workspace in Bzlmod. Other modules get names like
+      <code>rules_python+</code>.</p>
+    <h3>The current-directory trap</h3>
+    <p>Here is the naive version of the program:</p>
+    <pre data-label="app/prices_naive.py"><code class="language-python">import json
+
+with open("data/prices.json") as f:
+    prices = json.load(f)
+print("total:", sum(prices.values()))</code></pre>
+    <p><code>bazel run //app:prices_naive</code> prints <code>total: 7</code>, because <code>bazel run</code> starts the
+      program inside its runfiles tree, at <code>_main/</code>. Run the same launcher from another directory and it
+      breaks:</p>
+    <pre data-label="Terminal"><code class="language-bash">cd /tmp &amp;&amp; ~/practicum/bazel-bin/app/prices_naive</code></pre>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">  File "/home/claude/bazel-practicum/build/scratch-m03/demo/bazel-bin/app/prices_naive.runfiles/_main/app/prices_naive.py", line 3, in &lt;module&gt;
+    with open("data/prices.json") as f:
+         ~~~~^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: 'data/prices.json'</code></pre>
+    <p>Tools that call your binary (a <code>genrule</code>, another program, a test harness, a deploy script) will not
+      start it in the right directory. The program needs to find its runfiles on its own.</p>
+    <h3>The rules_python runfiles library</h3>
+    <p>rules_python ships a small library for exactly that. Add <code>@rules_python//python/runfiles</code> to
+      <code>deps</code> and ask it where a runfile is:</p>
+    <pre data-label="app/prices.py"><code class="language-python">import json
+
+from python.runfiles import runfiles
+
+r = runfiles.Create()
+path = r.Rlocation("_main/data/prices.json")
+with open(path) as f:
+    prices = json.load(f)
+print("total:", sum(prices.values()))</code></pre>
+    <p><code>runfiles.Create()</code> reads environment variables the launcher sets (such as
+      <code>RUNFILES_MANIFEST_FILE</code>) to locate the tree. <code>Rlocation()</code> turns a <strong>runfiles
+      path</strong>, the repository name plus the path inside it, into a real path on disk. It works from any
+      directory, under <code>bazel run</code>, <code>bazel test</code>, or started directly:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">INFO: Running command line: bazel-bin/app/prices
+total: 7</code></pre>
+    <ul>
+      <li><code>from python.runfiles import runfiles</code> and <code>from python.runfiles import Runfiles</code> (then
+        <code>Runfiles.Create()</code>) both work; the package is named <code>python.runfiles</code> because it lives at
+        <code>python/runfiles/</code> in the rules_python repository.</li>
+      <li>The path starts with the repository: <code>_main/data/prices.json</code>. Your module name works too
+        (<code>practicum/data/prices.json</code>), because the library translates it through
+        <code>_repo_mapping</code>. Without the prefix, <code>"data/prices.json"</code> returns <code>None</code>.</li>
+      <li><code>Rlocation</code> returns <code>None</code> rather than raising when the path is not a runfile, so
+        <code>open(None)</code> fails with <code>TypeError: expected str, bytes or os.PathLike object, not NoneType</code>.
+        That message means "wrong runfiles path, or missing from <code>data</code>".</li>
+      <li>Forgetting the <code>deps</code> entry gives <code>ModuleNotFoundError: No module named 'python'</code>.</li>
+    </ul>
+    <aside class="callout think">
+      <p>Why not <code>Path(__file__).parent</code>? It happens to work for a file in the same directory, because
+        <code>__file__</code> is inside the runfiles tree. It breaks for files from other repositories, for files Bazel
+        generates, and on Windows, where runfiles are often a manifest rather than a directory of symlinks. The
+        library handles all of those.</p>
+    </aside>
+    <p>Predict the output of the first command, then run both.</p>
+    <div class="runnable" data-predict data-title="What is a data dependency?" data-commands="bazel query 'labels(data, //app:prices)'|bazel query 'deps(//app:prices, 1)'|bazel build //app:prices">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "practicum")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="app/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "prices",
+    srcs = ["prices.py"],
+    data = ["//data:prices.json"],
+    deps = ["@rules_python//python/runfiles"],
+)
+</textarea>
+<textarea class="file" data-path="data/BUILD.bazel">
+exports_files(["prices.json"])
+</textarea>
+<textarea class="file" data-path="app/prices.py" data-hidden></textarea>
+<textarea class="file" data-path="data/prices.json" data-hidden></textarea>
+</div>
+    <p>A data file is a real edge in the graph. Change <code>prices.json</code> and Bazel knows
+      <code>//app:prices</code>, and every test that runs it, is affected. Click <code>prices.json</code> below.</p>
+    <div class="viz" data-viz="buildgraph" data-config='{"title": "Data files are inputs too", "nodes": [{"id": "prices.json", "kind": "file", "x": 0, "y": 0}, {"id": "inventory.py", "kind": "file", "x": 0, "y": 1}, {"id": "summary.py", "kind": "file", "x": 0, "y": 2}, {"id": "//report:inventory", "kind": "rule", "x": 1, "y": 1, "deps": ["inventory.py"]}, {"id": "//report:summary", "kind": "rule", "x": 2, "y": 0, "deps": ["prices.json", "summary.py", "//report:inventory"]}, {"id": "//report:inventory_test", "kind": "test", "x": 2, "y": 2, "deps": ["//report:inventory"]}]}'></div>
+    <p><strong>Remember:</strong> list run-time files in <code>data</code>, export them from their package, and open them
+      with <code>runfiles.Create().Rlocation("_main/...")</code>, never with a path relative to the current directory.</p>
+  </section>
+
+  <section class="lesson-section" id="src-layout">
+    <h2>The <code>imports</code> attribute and src layout</h2>
+    <aside class="callout python">
+      <p>Many modern packages use a <strong>src layout</strong>: <code>pyproject.toml</code> at the top,
+        code in <code>src/textstats/</code>, tests in <code>tests/</code>. <code>pip install -e .</code> puts
+        <code>src/</code> on <code>sys.path</code>, so tests write <code>import textstats</code>.</p>
+    </aside>
+    <p>Bring that package into a Bazel workspace at <code>libs/textstats/</code>. By the workspace-root rule, its module
+      name would be <code>libs.textstats.src.textstats</code>. The test's <code>import textstats</code> fails:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">  File "/root/.cache/bazel/_bazel_root/e111c9b5178f1131837654c4f3af2bf6/sandbox/linux-sandbox/1/execroot/_main/bazel-out/k8-fastbuild/bin/libs/textstats/counting_test.runfiles/_main/libs/textstats/tests/counting_test.py", line 3, in &lt;module&gt;
+    from textstats import word_count
+ModuleNotFoundError: No module named 'textstats'</code></pre>
+    <p>The <code>imports</code> attribute adds directories to <code>sys.path</code>, relative to the package, for this
+      target <em>and everything that depends on it</em>:</p>
+    <pre data-label="libs/textstats/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "textstats",
+    srcs = [
+        "src/textstats/__init__.py",
+        "src/textstats/counting.py",
+    ],
+    imports = ["src"],   # puts libs/textstats/src on sys.path
+    visibility = ["//visibility:public"],
+)
+
+py_test(
+    name = "counting_test",
+    srcs = ["tests/counting_test.py"],
+    deps = [":textstats"],
+)</code></pre>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">//libs/textstats:counting_test                                           PASSED in 0.3s
+Executed 1 out of 1 test: 1 test passes.</code></pre>
+    <p>Notice the test's <code>srcs</code> reaches into a subdirectory, <code>tests/</code>. That is fine: a package owns
+      every directory below it that has no BUILD file of its own.</p>
+    <aside class="callout warn">
+      <p>Use <code>imports</code> for code with an established import name (a src-layout package, vendored code). Do
+        not sprinkle <code>imports = ["."]</code> to make <code>from greeting import ...</code> work: it puts every
+        such package on the path, and two <code>utils.py</code> files will shadow each other.</p>
+    </aside>
+    <p>Query which targets change the import path:</p>
+    <div class="runnable" data-title="Find imports attributes" data-commands="bazel query 'attr(imports, src, //...)'|bazel query 'rdeps(//..., //libs/textstats)'">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "practicum")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="libs/textstats/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "textstats",
+    srcs = [
+        "src/textstats/__init__.py",
+        "src/textstats/counting.py",
+    ],
+    imports = ["src"],
+    visibility = ["//visibility:public"],
+)
+
+py_test(
+    name = "counting_test",
+    srcs = ["tests/counting_test.py"],
+    deps = [":textstats"],
+)
+</textarea>
+<textarea class="file" data-path="apps/wc/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "wc",
+    srcs = ["wc.py"],
+    deps = ["//libs/textstats"],
+)
+</textarea>
+<textarea class="file" data-path="libs/textstats/src/textstats/__init__.py" data-hidden></textarea>
+<textarea class="file" data-path="libs/textstats/src/textstats/counting.py" data-hidden></textarea>
+<textarea class="file" data-path="libs/textstats/tests/counting_test.py" data-hidden></textarea>
+<textarea class="file" data-path="apps/wc/wc.py" data-hidden></textarea>
+</div>
+    <p><code>//libs/textstats</code> is short for <code>//libs/textstats:textstats</code>: when the target is named after
+      its package, you can drop the <code>:name</code>.</p>
+    <p><strong>Remember:</strong> <code>imports = ["src"]</code> is Bazel's <code>pip install -e .</code> for a src
+      layout. It is relative to the package and inherited by dependents.</p>
+  </section>
+
+  <section class="lesson-section" id="toolchain">
+    <h2>The hermetic Python toolchain</h2>
+    <aside class="callout python">
+      <p>With Pixi, your environment pins Python, and everyone who runs <code>pixi install</code> gets the same one.
+        Without it, <code>python3</code> means whatever is first on <code>PATH</code>.</p>
+    </aside>
+    <p>Bazel takes the Pixi idea further. These two lines in <code>MODULE.bazel</code> register a
+      <strong>toolchain</strong>, Bazel's word for a tool a rule needs, chosen by Bazel rather than found on
+      <code>PATH</code>:</p>
+    <pre data-label="MODULE.bazel"><code class="language-starlark">python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(python_version = "3.13", is_default = True)</code></pre>
+    <p>rules_python downloads a standalone CPython 3.13 build into Bazel's cache and puts it in every Python target's
+      runfiles. Your system Python is never used to run your code. The build is <strong>hermetic</strong>: its result
+      depends only on declared inputs, so a laptop and CI produce the same thing.</p>
+    <p>You can see it from inside a program. This one prints <code>sys.version</code> and the
+      <code>sys.path</code> entries that hold the standard library (paths shortened to the part after
+      <code>whereami.runfiles/</code>):</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">version: 3.13.18
+path: rules_python++python+python_3_13_x86_64-unknown-linux-gnu/lib/python313.zip
+path: rules_python++python+python_3_13_x86_64-unknown-linux-gnu/lib/python3.13
+path: rules_python++python+python_3_13_x86_64-unknown-linux-gnu/lib/python3.13/lib-dynload</code></pre>
+    <h3>More than one version</h3>
+    <p><code>python_version</code> on a binary or test picks another registered toolchain. It must be registered first;
+      asking for <code>"3.12"</code> when only 3.13 exists fails toolchain resolution:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: /home/claude/bazel-practicum/build/scratch-m03/demo/hello/BUILD.bazel:20:10: While resolving toolchains for target //hello:hello312 (ffe5c97): No matching toolchains found for types:
+  @@bazel_tools//tools/python:toolchain_type
+To debug, rerun with --toolchain_resolution_debug='@@bazel_tools//tools/python:toolchain_type'
+For more information on platforms or toolchains see https://bazel.build/concepts/platforms-intro.
+ERROR: Analysis of target '//hello:hello312' failed; build aborted</code></pre>
+    <p>Register it next to the default, and both versions live in one workspace:</p>
+    <pre data-label="MODULE.bazel"><code class="language-starlark">python.toolchain(python_version = "3.13", is_default = True)
+python.toolchain(python_version = "3.12")</code></pre>
+    <pre data-label="hello/BUILD.bazel"><code class="language-starlark">py_binary(
+    name = "hello312",
+    srcs = ["hello.py"],
+    main = "hello.py",
+    python_version = "3.12",
+    deps = [":greeting"],
+)</code></pre>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">INFO: Running command line: bazel-bin/hello/hello312
+Hello, Python 3.12.16!</code></pre>
+    <p>The same <code>hello.py</code> run as <code>//hello:hello</code> prints <code>Hello, Python 3.13.18!</code>. The
+      library <code>:greeting</code> is built for whichever version the binary uses.</p>
+    <aside class="callout sim">
+      <p>The simulator does not resolve toolchains: it accepts any <code>python_version</code>. Only real Bazel reports
+        the "No matching toolchains" error above.</p>
+    </aside>
+    <aside class="callout think">
+      <p>Pixi pins your <em>development</em> tools here (Bazelisk). Bazel pins the Python that <em>builds and tests</em>
+        your code. Why might a team want those to be separate?</p>
+    </aside>
+    <p><strong>Remember:</strong> <code>python.toolchain(...)</code> in <code>MODULE.bazel</code> decides which Python
+      runs your code; the system Python does not matter. <code>python_version</code> picks among registered versions.</p>
+  </section>
+
+  <section class="lesson-section" id="testing">
+    <h2>Tests with py_test and unittest</h2>
+    <aside class="callout python">
+      <p>pytest discovers <code>test_*.py</code> files, imports them, and runs every <code>test_*</code> function. You
+        never write a <code>__main__</code> block.</p>
+    </aside>
+    <p><code>py_test</code> does no discovery. It runs the main file as a script, exactly like a
+      <code>py_binary</code>, and reads one thing: the exit code. pytest needs a PyPI dependency, which arrives in M04.
+      Until then, use the standard library's <code>unittest</code>, and end every test file with the block that runs
+      it:</p>
+    <pre data-label="calc/calc_test.py"><code class="language-python">import unittest
+
+from calc.calc import add
+
+
+class AddTest(unittest.TestCase):
+    def test_add(self) -&gt; None:
+        self.assertEqual(add(2, 2), 4)
+
+
+if __name__ == "__main__":
+    unittest.main()</code></pre>
+    <aside class="callout danger" data-title="The silent pass">
+      <p>Forget the last two lines and the script defines a class, exits 0, and Bazel reports PASSED, even when the test
+        would fail. This is real output for a <code>calc.add</code> that subtracts, without
+        <code>unittest.main()</code>:</p>
+    </aside>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">//calc:calc_test                                                         PASSED in 0.5s
+Executed 1 out of 1 test: 1 test passes.</code></pre>
+    <p>With <code>unittest.main()</code> added, the bug shows up:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">FAIL: //calc:calc_test (Exit 1) (see /root/.cache/bazel/_bazel_root/c29f10e04db78a29c46b057dc668bb52/execroot/_main/bazel-out/k8-fastbuild/testlogs/calc/calc_test/test.log)
+INFO: Found 1 test target...
+Target //calc:calc_test up-to-date:
+  bazel-bin/calc/calc_test
+INFO: Elapsed time: 0.998s, Critical Path: 0.51s
+INFO: 3 processes: 2 internal, 2 linux-sandbox.
+INFO: Build completed, 1 test FAILED, 3 total actions
+//calc:calc_test                                                         FAILED in 0.4s
+  /root/.cache/bazel/_bazel_root/c29f10e04db78a29c46b057dc668bb52/execroot/_main/bazel-out/k8-fastbuild/testlogs/calc/calc_test/test.log
+Executed 1 out of 1 test: 1 fails locally.</code></pre>
+    <p>Bazel keeps test output out of your terminal. It is in <code>test.log</code>, also reachable through the
+      <code>bazel-testlogs</code> symlink. Read it, or rerun with <code>--test_output=errors</code> to print logs of
+      failing tests:</p>
+    <pre data-label="bazel-testlogs/calc/calc_test/test.log (real)"><code class="language-none">exec ${PAGER:-/usr/bin/less} "$0" || exit 1
+Executing tests from //calc:calc_test
+-----------------------------------------------------------------------------
+F
+======================================================================
+FAIL: test_add (__main__.AddTest.test_add)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/root/.cache/bazel/_bazel_root/c29f10e04db78a29c46b057dc668bb52/sandbox/linux-sandbox/3/execroot/_main/bazel-out/k8-fastbuild/bin/calc/calc_test.runfiles/_main/calc/calc_test.py", line 8, in test_add
+    self.assertEqual(add(2, 2), 4)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^
+AssertionError: 0 != 4
+
+----------------------------------------------------------------------
+Ran 1 test in 0.001s
+
+FAILED (failures=1)</code></pre>
+    <p>Notice <code>linux-sandbox</code> and <code>sandbox/linux-sandbox/3/execroot</code>: the test ran in a
+      <strong>sandbox</strong> holding only its declared inputs. A test that opens an undeclared file fails here even
+      if the file exists in your checkout.</p>
+    <p>A test's <code>args</code>, <code>env</code>, and <code>data</code> work like a binary's. Under
+      <code>bazel test</code>, Bazel also sets <code>TEST_SRCDIR</code> and <code>RUNFILES_DIR</code> to the runfiles
+      directory, which the runfiles library reads for you.</p>
+    <aside class="callout note">
+      <p>The "There were tests whose specified size is too big" line Bazel prints after a run is about the
+        <code>size</code> attribute (default <code>medium</code>), covered with test performance later in the course.
+        It is advice, not an error.</p>
+    </aside>
+    <p><strong>Remember:</strong> a <code>py_test</code> passes when its process exits 0. With unittest, always end with
+      <code>unittest.main()</code>, and read <code>test.log</code> or use <code>--test_output=errors</code>.</p>
+  </section>
+
+  <section class="lesson-section" id="run-vs-bin">
+    <h2><code>bazel run</code> or <code>bazel-bin/...</code>?</h2>
+    <p><code>bazel build //app:whereami</code> leaves an executable launcher at <code>bazel-bin/app/whereami</code>. You
+      can start it directly, or let <code>bazel run</code> build and start it. They are not the same. Given this target:</p>
+    <pre data-label="app/BUILD.bazel"><code class="language-starlark">py_binary(
+    name = "whereami",
+    srcs = ["whereami.py"],
+    args = ["--name", "Ada"],
+    env = {"GREETING": "Howdy"},
+)</code></pre>
+    <div class="tabs">
+      <div class="tab" data-label="bazel run">
+        <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">INFO: Running command line: bazel-bin/app/whereami --name Ada &lt;args omitted&gt;
+argv: ['--name', 'Ada', '--loud']
+GREETING: Howdy
+python: 3.13.18
+cwd is the runfiles tree: True</code></pre>
+        <p>Command: <code>bazel run //app:whereami -- --loud</code>. Everything after <code>--</code> is appended to
+          <code>args</code>.</p>
+      </div>
+      <div class="tab" data-label="bazel-bin/app/whereami">
+        <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">argv: []
+GREETING: None
+python: 3.13.18
+cwd is the runfiles tree: False</code></pre>
+        <p>Command: <code>bazel-bin/app/whereami</code>. Same hermetic Python, but no <code>args</code>, no
+          <code>env</code>, and your shell's current directory.</p>
+      </div>
+    </div>
+    <table>
+      <thead><tr><th></th><th><code>bazel run</code></th><th><code>bazel-bin/...</code></th></tr></thead>
+      <tbody>
+        <tr><td>Rebuilds first</td><td>yes</td><td>no: you may run a stale build</td></tr>
+        <tr><td><code>args</code> and <code>env</code> from BUILD</td><td>applied</td><td>ignored</td></tr>
+        <tr><td>Working directory</td><td>the runfiles tree (<code>…/whereami.runfiles/_main</code>)</td><td>wherever you are</td></tr>
+        <tr><td>Your shell's directory</td><td>in <code>BUILD_WORKING_DIRECTORY</code></td><td>the current directory</td></tr>
+        <tr><td>Holds the Bazel lock</td><td>only while building</td><td>never</td></tr>
+      </tbody>
+    </table>
+    <p>Because <code>bazel run</code> changes directory, a CLI tool that takes file arguments should resolve them against
+      <code>os.environ["BUILD_WORKING_DIRECTORY"]</code>. <code>BUILD_WORKSPACE_DIRECTORY</code> holds the workspace root,
+      handy for formatters and code generators that write into your source tree.</p>
+    <aside class="callout tip">
+      <p>Use <code>bazel run</code> while developing. Run <code>bazel-bin/...</code> directly when you want to start the
+        program many times without Bazel in the loop, or from another tool. Thanks to runfiles, both find their data.</p>
+    </aside>
+    <p><strong>Remember:</strong> <code>bazel run</code> = build + <code>args</code> + <code>env</code> + start in the
+      runfiles tree. The <code>bazel-bin</code> launcher works anywhere but adds nothing from the BUILD file.</p>
+  </section>
+
+  <section class="lesson-section" id="init-py">
+    <h2>The <code>__init__.py</code> warning</h2>
+    <p>Your first build with rules_python 2.4.6 prints a big block like this once per target, labeled
+      <code>DEBUG</code>:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">DEBUG: /root/.cache/bazel/_bazel_root/dfba37e78417d24b06edbffb8257816f/external/rules_python+/python/private/py_executable.bzl:1582:14:
+======================================================================
+WARNING: Target @@//hello:hello is using implicit __init__.py creation.
+  This diabolic behavior is deprecated and will be disabled by default in a
+  future release.
+  See https://github.com/bazel-contrib/rules_python/issues/2945
+
+  Ensure all __init__.py files are explicitly created and
+  added to the srcs or deps of your targets.
+
+  Disable implicit creation for your module in MODULE.bazel:
+
+    rules_python_config = use_extension("@rules_python//python/extensions:config.bzl", "config")
+    rules_python_config.explicit_init_py(default = True)
+
+  Or for a specific target by setting:
+
+    legacy_create_init = 0
+
+  Or globally with the following Bazel flag:
+
+    --incompatible_default_to_explicit_init_py
+======================================================================</code></pre>
+    <p>What it means: by default, rules_python writes an empty <code>__init__.py</code> into every directory of the
+      runfiles tree that lacks one. That is why <code>from hello.greeting import greeting</code> worked even though
+      <code>hello/</code> has no <code>__init__.py</code>: Bazel quietly made <code>hello</code> a regular package.</p>
+    <p>The behavior is deprecated because it surprises people. It turns every directory into a package, which breaks
+      <strong>namespace packages</strong> (PEP 420: packages split across directories, with no
+      <code>__init__.py</code>), and the files exist only under Bazel, so code behaves differently outside it.</p>
+    <p>It is a warning, not an error. Bazel only prints it when it re-analyzes the target, so it disappears on the
+      next build and comes back when you edit the BUILD file. To opt in to the future behavior now, add the
+      <code>config</code> lines it suggests to <code>MODULE.bazel</code>. The warning goes away, and no
+      <code>__init__.py</code> files are generated:</p>
+    <pre data-label="MODULE.bazel"><code class="language-starlark">rules_python_config = use_extension("@rules_python//python/extensions:config.bzl", "config")
+rules_python_config.explicit_init_py(default = True)</code></pre>
+    <p>With that set, the examples in this module still work. Python 3 treats a directory without
+      <code>__init__.py</code> as a namespace package, so <code>hello.greeting</code> still imports. Real
+      <code>__init__.py</code> files you list in <code>srcs</code>, like <code>src/textstats/__init__.py</code>, are
+      always kept.</p>
+    <aside class="callout pro">
+      <p>For new workspaces, set <code>explicit_init_py(default = True)</code> from day one and commit real
+        <code>__init__.py</code> files where your code needs them. Labs in this course leave it unset so you recognize
+        the warning when you meet it in existing repositories.</p>
+    </aside>
+    <p><strong>Remember:</strong> the DEBUG block is a deprecation notice about generated <code>__init__.py</code>
+      files. It is safe to ignore while learning, and one <code>MODULE.bazel</code> setting turns it off.</p>
+  </section>
+
+  <section class="lesson-section" id="practice">
+    <h2>Practice</h2>
+    <p>Exercises run in the simulator, which checks the BUILD graph: targets, labels, visibility, attributes. It cannot
+      run Python, so the labs that follow prove the programs actually work.</p>
+
+    <div class="exercise" data-id="m03-e1" data-title="Split a library into its own package">
+      <div class="exercise-prompt">
+        <p><code>//app:hello</code> tries to use <code>greeting.py</code> from the <code>lib</code> package by listing it
+          in its own <code>srcs</code>. That fails with a visibility error, and it is the wrong shape anyway.</p>
+        <p>Make <code>lib/greeting.py</code> a <code>py_library</code> named <code>//lib:greeting</code>, visible only to
+          the <code>app</code> package (not public), and have <code>//app:hello</code> depend on it. The binary's
+          <code>srcs</code> should list only its own file.</p>
+      </div>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "practicum")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="app/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "hello",
+    srcs = [
+        "hello.py",
+        "//lib:greeting.py",
+    ],
+)
+</textarea>
+<textarea class="file" data-path="lib/BUILD.bazel">
+# Declare the greeting library here.
+</textarea>
+<textarea class="file" data-path="app/hello.py" data-readonly>
+from lib.greeting import greeting
+
+print(greeting("Bazel"))
+</textarea>
+<textarea class="file" data-path="lib/greeting.py" data-hidden></textarea>
+<script type="text/x-python" class="tests">
+def test_greeting_is_a_py_library(bazel):
+    t = bazel.target("//lib:greeting")
+    assert t.kind == "py_library", f"//lib:greeting should be a py_library, but it is a {t.kind}"
+
+def test_hello_depends_on_the_library(bazel):
+    deps = bazel.query("deps(//app:hello, 1)")
+    assert "//lib:greeting" in deps, "//app:hello must list //lib:greeting in deps"
+
+def test_hello_srcs_are_its_own(bazel):
+    srcs = bazel.attr("//app:hello", "srcs") or []
+    assert all(not s.startswith("//") and not s.startswith("@") for s in srcs), f"srcs should only list files in //app, got {srcs}"
+
+def test_library_is_not_public(bazel):
+    vis = bazel.attr("//lib:greeting", "visibility") or []
+    assert vis, "without visibility, //lib:greeting is private to //lib and //app cannot use it"
+    assert "//visibility:public" not in vis, "make it visible to //app only, for example //app:__pkg__"
+
+def test_everything_builds(bazel):
+    result = bazel.build("//...")
+    assert result.ok, "bazel build //... fails:\n" + result.error
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p>In <code>lib/BUILD.bazel</code>: load <code>py_library</code>, set <code>srcs = ["greeting.py"]</code> and
+          <code>visibility = ["//app:__pkg__"]</code>. In <code>app/BUILD.bazel</code>, move the label from
+          <code>srcs</code> to <code>deps</code>, pointing at the target rather than the file.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="lib/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "greeting",
+    srcs = ["greeting.py"],
+    visibility = ["//app:__pkg__"],
+)</code></pre>
+<pre data-path="app/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "hello",
+    srcs = ["hello.py"],
+    deps = ["//lib:greeting"],
+)</code></pre>
+        <p>The import in <code>hello.py</code> stays <code>from lib.greeting import greeting</code>: the module path is
+          the file's path from the workspace root, no matter which target owns it.</p>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m03-e2" data-title="Fix the default-main errors">
+      <div class="exercise-prompt">
+        <p>A team moved a Flask-style app into Bazel. Its entry point is <code>main.py</code> and its tests live in
+          <code>tests/</code>. Both targets fail analysis with "corresponding default ... does not appear in srcs".
+          Run <code>bazel build //...</code> under "Try commands" to see them.</p>
+        <p>Fix both <strong>without renaming any target or file</strong>.</p>
+      </div>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "practicum")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="web/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
+
+py_library(
+    name = "routes",
+    srcs = ["routes.py"],
+)
+
+py_binary(
+    name = "server",
+    srcs = ["main.py"],
+    deps = [":routes"],
+)
+
+py_test(
+    name = "routes_test",
+    srcs = ["tests/test_routes.py"],
+    deps = [":routes"],
+)
+</textarea>
+<textarea class="file" data-path="web/routes.py" data-hidden></textarea>
+<textarea class="file" data-path="web/main.py" data-hidden></textarea>
+<textarea class="file" data-path="web/tests/test_routes.py" data-hidden></textarea>
+<script type="text/x-python" class="tests">
+def test_targets_keep_their_names(bazel):
+    assert bazel.target("//web:server").kind == "py_binary", "keep the py_binary named server"
+    assert bazel.target("//web:routes_test").kind == "py_test", "keep the py_test named routes_test"
+
+def test_server_names_its_main(bazel):
+    main = bazel.attr("//web:server", "main")
+    assert main in ("main.py", ":main.py", "//web:main.py"), f"//web:server should set main to main.py, got {main!r}"
+
+def test_everything_builds(bazel):
+    result = bazel.build("//...")
+    assert result.ok, "bazel build //... fails:\n" + result.error
+
+def test_bazel_test_selects_the_test(bazel):
+    result = bazel.test("//...")
+    assert result.ok, "bazel test //... fails:\n" + result.error
+    assert result.tests == ["//web:routes_test"], f"bazel test //... would run {result.tests}"
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p>Add a <code>main</code> attribute to each. Its value is a file from that target's <code>srcs</code>, written
+          the same way: <code>"main.py"</code> and <code>"tests/test_routes.py"</code>.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="web/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
+
+py_library(
+    name = "routes",
+    srcs = ["routes.py"],
+)
+
+py_binary(
+    name = "server",
+    srcs = ["main.py"],
+    main = "main.py",
+    deps = [":routes"],
+)
+
+py_test(
+    name = "routes_test",
+    srcs = ["tests/test_routes.py"],
+    main = "tests/test_routes.py",
+    deps = [":routes"],
+)</code></pre>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m03-e3" data-title="Ship a data file">
+      <div class="exercise-prompt">
+        <p><code>convert.py</code> (read-only) loads exchange rates with the runfiles library. Make its BUILD graph
+          match:</p>
+        <ul>
+          <li><code>data/rates.json</code> is a <code>data</code> dependency of <code>//app:convert</code>.</li>
+          <li>The <code>data</code> package allows other packages to use that file.</li>
+          <li><code>//app:convert</code> depends on the rules_python runfiles library.</li>
+        </ul>
+      </div>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "practicum")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="app/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "convert",
+    srcs = ["convert.py"],
+)
+</textarea>
+<textarea class="file" data-path="data/BUILD.bazel">
+# The data package has no rules, only files.
+</textarea>
+<textarea class="file" data-path="app/convert.py" data-readonly>
+import json
+import sys
+
+from python.runfiles import runfiles
+
+r = runfiles.Create()
+with open(r.Rlocation("_main/data/rates.json")) as f:
+    rates = json.load(f)
+
+amount, currency = float(sys.argv[1]), sys.argv[2]
+print(round(amount * rates[currency], 2))
+</textarea>
+<textarea class="file" data-path="data/rates.json" data-hidden>{"EUR": 0.92, "GBP": 0.79}</textarea>
+<script type="text/x-python" class="tests">
+def test_rates_is_a_data_dependency(bazel):
+    data = bazel.query("labels(data, //app:convert)")
+    assert data == ["//data:rates.json"], f"labels(data, //app:convert) should be //data:rates.json, got {data}"
+
+def test_convert_depends_on_the_runfiles_library(bazel):
+    deps = bazel.query("deps(//app:convert, 1)")
+    assert "@rules_python//python/runfiles:runfiles" in deps, "add @rules_python//python/runfiles to deps (convert.py imports python.runfiles)"
+
+def test_everything_builds(bazel):
+    result = bazel.build("//...")
+    assert result.ok, "bazel build //... fails:\n" + result.error
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p>Three edits: <code>exports_files(["rates.json"])</code> in <code>data/BUILD.bazel</code>;
+          <code>data = ["//data:rates.json"]</code> and <code>deps = ["@rules_python//python/runfiles"]</code> on the
+          binary.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="data/BUILD.bazel"><code class="language-starlark">exports_files(["rates.json"])</code></pre>
+<pre data-path="app/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "convert",
+    srcs = ["convert.py"],
+    data = ["//data:rates.json"],
+    deps = ["@rules_python//python/runfiles"],
+)</code></pre>
+        <p><code>@rules_python//python/runfiles</code> is short for
+          <code>@rules_python//python/runfiles:runfiles</code>. With real Bazel, <code>bazel run //app:convert -- 10 EUR</code>
+          prints <code>9.2</code>.</p>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m03-e4" data-title="Bring in a src-layout package">
+      <div class="exercise-prompt">
+        <p>The <code>textstats</code> package was copied in from its own repository, src layout and all. Its test does
+          <code>import textstats</code>, and so does <code>//apps/wc:wc</code>. Make it work under Bazel:</p>
+        <ul>
+          <li><code>//libs/textstats</code> puts its <code>src</code> directory on <code>sys.path</code>.</li>
+          <li><code>//apps/wc:wc</code> may depend on it (any visibility that allows it is fine).</li>
+          <li>The test keeps its name, <code>counting_test</code>, and its file, <code>tests/test_counting.py</code>.</li>
+          <li><code>bazel build //...</code> succeeds and <code>bazel test //...</code> selects the test.</li>
+        </ul>
+      </div>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "practicum")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="libs/textstats/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "textstats",
+    srcs = [
+        "src/textstats/__init__.py",
+        "src/textstats/counting.py",
+    ],
+)
+
+py_test(
+    name = "counting_test",
+    srcs = ["tests/test_counting.py"],
+    deps = [":textstats"],
+)
+</textarea>
+<textarea class="file" data-path="apps/wc/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "wc",
+    srcs = ["wc.py"],
+    deps = ["//libs/textstats"],
+)
+</textarea>
+<textarea class="file" data-path="libs/textstats/src/textstats/__init__.py" data-hidden></textarea>
+<textarea class="file" data-path="libs/textstats/src/textstats/counting.py" data-hidden></textarea>
+<textarea class="file" data-path="libs/textstats/tests/test_counting.py" data-hidden></textarea>
+<textarea class="file" data-path="apps/wc/wc.py" data-hidden></textarea>
+<script type="text/x-python" class="tests">
+def test_src_is_on_the_import_path(bazel):
+    imports = bazel.attr("//libs/textstats:textstats", "imports") or []
+    assert imports == ["src"], f"//libs/textstats should set imports = [\"src\"], got {imports}"
+
+def test_the_test_keeps_its_name(bazel):
+    assert bazel.target("//libs/textstats:counting_test").kind == "py_test", "keep the py_test named counting_test"
+    srcs = bazel.attr("//libs/textstats:counting_test", "srcs")
+    assert srcs == ["tests/test_counting.py"], f"keep srcs = [\"tests/test_counting.py\"], got {srcs}"
+
+def test_everything_builds(bazel):
+    result = bazel.build("//...")
+    assert result.ok, "bazel build //... fails:\n" + result.error
+
+def test_bazel_test_selects_it(bazel):
+    result = bazel.test("//...")
+    assert result.ok, "bazel test //... fails:\n" + result.error
+    assert result.tests == ["//libs/textstats:counting_test"], f"bazel test //... would run {result.tests}"
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p>Three problems, three attributes: <code>imports</code> and <code>visibility</code> on the library, and
+          <code>main</code> on the test (its name and file name differ). Build first and read each error.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="libs/textstats/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "textstats",
+    srcs = [
+        "src/textstats/__init__.py",
+        "src/textstats/counting.py",
+    ],
+    imports = ["src"],
+    visibility = ["//apps:__subpackages__"],
+)
+
+py_test(
+    name = "counting_test",
+    srcs = ["tests/test_counting.py"],
+    main = "tests/test_counting.py",
+    deps = [":textstats"],
+)</code></pre>
+        <p><code>//apps:__subpackages__</code> admits every package under <code>apps/</code>. The simulator cannot check
+          that <code>import textstats</code> really resolves; Lab 2 does that with real Bazel.</p>
+      </details>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="lab">
+    <h2>Labs: run it for real</h2>
+    <p>The exercises proved the graphs are well formed. What they cannot show is Python actually running: whether
+      <code>import textstats</code> resolves, whether the JSON file is in the runfiles tree, whether the program finds it
+      from another directory. These two labs check exactly that with real Bazel.</p>
+
+    <div class="lab" data-id="m03-lab1" data-title="Ship a data file with runfiles">
+      <div class="lab-prompt">
+        <p>The <code>inventory</code> workspace has a <code>//report:summary</code> binary that opens
+          <code>catalog/prices.json</code> with a relative path. Make <code>bazel run //report:summary</code> print
+          <code>3 items, total value 45.50</code>, from the runfiles tree <em>and</em> from any other directory.</p>
+        <p>The grader's last check runs the binary with <code>--run_under="cd /tmp &amp;&amp;"</code>, which starts it in
+          <code>/tmp</code>. A relative <code>open()</code> fails there; the runfiles library does not.</p>
+        <ul class="checklist" data-id="m03-lab1-steps">
+          <li>Run <code>pixi run start m03-lab1</code>, then <code>cd work/m03-lab1</code></li>
+          <li>Run <code>pixi run bazel run //report:summary</code> and read the traceback</li>
+          <li>Export <code>prices.json</code> from <code>catalog/BUILD.bazel</code> and add it to the binary's <code>data</code></li>
+          <li>Add <code>@rules_python//python/runfiles</code> to <code>deps</code> and use <code>Rlocation</code> in <code>summary.py</code></li>
+          <li>Try <code>pixi run bazel run --run_under="cd /tmp &amp;&amp;" //report:summary</code></li>
+          <li>Run <code>pixi run bazel test //...</code>, then <code>pixi run grade m03-lab1</code> from the repository root</li>
+        </ul>
+      </div>
+      <details class="hint"><summary>Hint</summary>
+        <p>The runfiles path is the repository name plus the workspace path: <code>_main/catalog/prices.json</code>.
+          If you get <code>TypeError: expected str, bytes or os.PathLike object, not NoneType</code>,
+          <code>Rlocation</code> returned <code>None</code>: check the path and the <code>data</code> attribute.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-label="catalog/BUILD.bazel"><code class="language-starlark">exports_files(["prices.json"])</code></pre>
+<pre data-label="report/BUILD.bazel (the binary)"><code class="language-starlark">py_binary(
+    name = "summary",
+    srcs = ["summary.py"],
+    data = ["//catalog:prices.json"],
+    deps = [
+        ":inventory",
+        "@rules_python//python/runfiles",
+    ],
+)</code></pre>
+<pre data-label="report/summary.py"><code class="language-python">import json
+
+from python.runfiles import runfiles
+
+from report.inventory import summary_line
+
+r = runfiles.Create()
+path = r.Rlocation("_main/catalog/prices.json")
+with open(path, encoding="utf-8") as f:
+    catalog = json.load(f)
+
+print(summary_line(catalog))</code></pre>
+      </details>
+    </div>
+
+    <div class="lab" data-id="m03-lab2" data-title="Package a src-layout library">
+      <div class="lab-prompt">
+        <p>The <code>textkit</code> workspace holds <code>libs/textstats</code>, a src-layout package, and
+          <code>//apps/wordcount</code>, which uses it. Make the package's tests pass, let other packages use it, and make
+          <code>bazel run //apps/wordcount</code> print <code>5 words, 4 unique</code>.</p>
+        <p>The grader adds its own package, <code>//grading</code>, with a test that imports <code>textstats</code> from
+          outside <code>libs/</code>. Make the library visible to it as well (public is fine for a shared library).</p>
+        <ul class="checklist" data-id="m03-lab2-steps">
+          <li>Run <code>pixi run start m03-lab2</code>, then <code>cd work/m03-lab2</code></li>
+          <li>Run <code>pixi run bazel test //libs/textstats:all</code>; fix the analysis error first</li>
+          <li>Read the test's log: which module is missing, and which attribute puts <code>src/</code> on the path?</li>
+          <li>Run <code>pixi run bazel run //apps/wordcount</code> and fix the visibility error</li>
+          <li>Run <code>pixi run grade m03-lab2</code> from the repository root</li>
+        </ul>
+      </div>
+      <details class="hint"><summary>Hint</summary>
+        <p>It is exercise 4 with real Python. Note that <code>args</code> on <code>//apps/wordcount</code> supplies the
+          words; <code>bazel run</code> passes them, running <code>bazel-bin/apps/wordcount/wordcount</code> directly
+          would not.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-label="libs/textstats/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "textstats",
+    srcs = [
+        "src/textstats/__init__.py",
+        "src/textstats/counting.py",
+    ],
+    imports = ["src"],
+    visibility = ["//visibility:public"],
+)
+
+py_test(
+    name = "counting_test",
+    srcs = ["tests/test_counting.py"],
+    main = "tests/test_counting.py",
+    deps = [":textstats"],
+)</code></pre>
+      </details>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="quiz">
+    <h2>Quiz</h2>
+    <div class="quiz" data-id="m03-quiz">
+<script type="application/json">
+{"title": "rules_python quiz", "passScore": 0.7, "questions": [
+  {"type": "single", "prompt": "The file <code>billing/invoice/totals.py</code> is in <code>srcs</code> of <code>//billing/invoice:totals</code>. How does another target import it?", "options": ["<code>import totals</code>", "<code>from invoice import totals</code>", "<code>from billing.invoice import totals</code>", "<code>from //billing/invoice import totals</code>"], "answer": 2, "explanation": "<p>The workspace root is on <code>sys.path</code>, so the module path is the file's path from the root with dots. The importing target also needs <code>//billing/invoice:totals</code> in its <code>deps</code>.</p>"},
+  {"type": "single", "prompt": "Does this analyze?", "code": "py_binary(\n    name = \"cli\",\n    srcs = [\"__main__.py\"],\n)", "lang": "starlark", "options": ["Yes: __main__.py is the conventional entry point", "No: corresponding default 'cli.py' does not appear in srcs", "No: py_binary needs deps", "Yes, but bazel run prints nothing"], "answer": 1, "explanation": "<p>Without <code>main</code>, the entry point defaults to <code>&lt;name&gt;.py</code>. Add <code>main = \"__main__.py\"</code> or rename the target.</p>"},
+  {"type": "output", "prompt": "What does <code>bazel query 'labels(data, //app:report)'</code> print?", "code": "py_binary(\n    name = \"report\",\n    srcs = [\"report.py\"],\n    data = [\"//templates:page.html\", \"//data:prices.json\"],\n    deps = [\"//lib:fmt\"],\n)", "lang": "starlark", "answer": "//data:prices.json\n//templates:page.html", "explanation": "<p><code>labels(attr, x)</code> returns the labels in one attribute. Query output is sorted, so <code>//data</code> comes before <code>//templates</code>. <code>deps</code> is a different attribute and is not included.</p>"},
+  {"type": "multi", "prompt": "Which statements about runfiles are true? Select all that apply.", "options": ["They include files listed in <code>data</code>", "They include the Python interpreter from the toolchain", "They include every file in the workspace", "They include the <code>srcs</code> of transitive <code>deps</code>", "They exist only under <code>bazel run</code>, not <code>bazel test</code>"], "answer": [0, 1, 3], "explanation": "<p>Runfiles hold everything a program needs at run time, and nothing else: its sources, its dependencies' sources, data files, and the interpreter. Tests get runfiles too.</p>"},
+  {"type": "single", "prompt": "<code>r.Rlocation(\"data/prices.json\")</code> returns <code>None</code>. The file is in <code>data</code> and the workspace module is named <code>practicum</code>. What is wrong?", "options": ["The file must be in the same package as the binary", "The runfiles path must start with the repository: <code>_main/data/prices.json</code>", "Rlocation needs an absolute path", "The runfiles library only works under bazel test"], "answer": 1, "explanation": "<p>Runfiles paths begin with a repository name. <code>_main</code> is the canonical name of your workspace; the module name <code>practicum/data/prices.json</code> also works through the repository mapping.</p>"},
+  {"type": "text", "prompt": "What label do you add to <code>deps</code> to use <code>from python.runfiles import runfiles</code>?", "answer": ["@rules_python//python/runfiles", "@rules_python//python/runfiles:runfiles"], "explanation": "<p><code>@rules_python//python/runfiles</code> is the <code>py_library</code> in rules_python. Without it the import fails with <code>No module named 'python'</code>.</p>"},
+  {"type": "single", "prompt": "<code>libs/textstats/src/textstats/__init__.py</code> is in <code>srcs</code> of <code>//libs/textstats</code>. Which attribute value lets dependents write <code>import textstats</code>?", "options": ["<code>imports = [\"textstats\"]</code>", "<code>imports = [\"src\"]</code>", "<code>imports = [\"libs/textstats/src\"]</code>", "<code>imports = [\".\"]</code>"], "answer": 1, "explanation": "<p><code>imports</code> is relative to the package directory, <code>libs/textstats</code>. Adding <code>src</code> puts <code>libs/textstats/src</code> on <code>sys.path</code>, where <code>textstats/</code> lives.</p>"},
+  {"type": "single", "prompt": "Which Python runs a <code>py_binary</code> in a workspace whose MODULE.bazel has <code>python.toolchain(python_version = \"3.13\", is_default = True)</code>, on a laptop whose <code>python3</code> is 3.11?", "options": ["3.11, the first python3 on PATH", "3.13, downloaded by rules_python into Bazel's cache", "Whatever Pixi's environment provides", "It fails: versions must match"], "answer": 1, "explanation": "<p>The toolchain is hermetic: rules_python fetches a standalone CPython and puts it in the runfiles. The system interpreter is not used to run your code.</p>"},
+  {"type": "single", "prompt": "A <code>py_test</code> sets <code>python_version = \"3.12\"</code>, but MODULE.bazel only registers 3.13. What happens?", "options": ["It silently uses 3.13", "Analysis fails: No matching toolchains found for types: @@bazel_tools//tools/python:toolchain_type", "Bazel downloads 3.12 automatically", "Loading fails: unknown attribute python_version"], "answer": 1, "explanation": "<p>A version must be registered with <code>python.toolchain(python_version = \"3.12\")</code> before a target can ask for it. Otherwise toolchain resolution finds nothing.</p>"},
+  {"type": "single", "prompt": "A unittest file has a failing assertion but no <code>if __name__ == \"__main__\": unittest.main()</code>. What does <code>bazel test</code> report?", "options": ["FAILED", "PASSED", "NO STATUS", "An analysis error"], "answer": 1, "explanation": "<p><code>py_test</code> runs the file as a script and only checks the exit code. Without <code>unittest.main()</code> the script defines a class and exits 0, so the test \"passes\". pytest-style discovery comes in M04.</p>"},
+  {"type": "multi", "prompt": "Compared with running <code>bazel-bin/app/tool</code> directly, what does <code>bazel run //app:tool</code> add? Select all that apply.", "options": ["Rebuilds the target first", "Applies <code>args</code> and <code>env</code> from the BUILD file", "Uses a different Python interpreter", "Starts the program in its runfiles tree", "Sets <code>BUILD_WORKING_DIRECTORY</code> to your shell's directory"], "answer": [0, 1, 3, 4], "explanation": "<p>Both use the same hermetic interpreter. <code>bazel run</code> builds, adds the BUILD file's <code>args</code> and <code>env</code>, changes to the runfiles directory, and records where you were in <code>BUILD_WORKING_DIRECTORY</code>.</p>"},
+  {"type": "single", "prompt": "Your build prints <code>WARNING: Target @@//hello:hello is using implicit __init__.py creation.</code> What is going on?", "options": ["The build failed and must be fixed", "rules_python is generating empty <code>__init__.py</code> files in the runfiles tree, a deprecated default", "Your <code>__init__.py</code> files are being ignored", "Python 3.13 no longer supports packages"], "answer": 1, "explanation": "<p>It is a deprecation notice printed during analysis. Set <code>rules_python_config.explicit_init_py(default = True)</code> in MODULE.bazel to opt in to the new behavior and silence it.</p>"},
+  {"type": "single", "prompt": "Does this analyze?", "code": "py_binary(\n    name = \"server\",\n    srcs = [\"app.py\"],\n    main = \"main.py\",\n)", "lang": "starlark", "options": ["Yes", "No: could not find 'main.py' as specified by 'main' attribute", "No: corresponding default 'server.py' does not appear in srcs", "Only if main.py exists on disk"], "answer": 1, "explanation": "<p><code>main</code> must name a file that is also in <code>srcs</code>. Here it does not, so the rule fails with the <code>main</code>-specific message.</p>"}
+]}
+</script>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="recap">
+    <h2>Recap</h2>
+    <ul>
+      <li><code>py_library</code> is importable code, <code>py_binary</code> a program, <code>py_test</code> a program whose exit code is the verdict.</li>
+      <li><code>srcs</code> lists your own files, <code>deps</code> what you import, <code>data</code> what you open at run time.</li>
+      <li>Imports start at the workspace root, and only declared (transitive) dependencies are importable. <code>imports = ["src"]</code> adapts a src-layout package.</li>
+      <li>Without <code>main</code>, a binary or test needs <code>&lt;name&gt;.py</code> in <code>srcs</code>.</li>
+      <li>Runfiles are a program's private run-time tree. Find files in it with <code>runfiles.Create().Rlocation("_main/...")</code> from <code>@rules_python//python/runfiles</code>.</li>
+      <li><code>python.toolchain</code> in MODULE.bazel gives a hermetic interpreter; <code>python_version</code> selects another registered one.</li>
+      <li>unittest files need <code>unittest.main()</code>; failing output is in <code>test.log</code> or shown with <code>--test_output=errors</code>.</li>
+      <li><code>bazel run</code> adds a build, <code>args</code>, <code>env</code>, and the runfiles working directory; <code>bazel-bin/...</code> adds nothing.</li>
+      <li>The implicit <code>__init__.py</code> DEBUG block is a deprecation notice; <code>explicit_init_py(default = True)</code> opts out.</li>
+    </ul>
+    <div class="flashcards" data-title="rules_python review">
+<script type="application/json">
+[
+  {"front": "<code>srcs</code> vs <code>deps</code> vs <code>data</code>?", "back": "srcs: this target's own .py files. deps: Python targets it imports. data: files it opens at run time."},
+  {"front": "How do you import <code>hello/greeting.py</code> under Bazel?", "back": "from hello.greeting import greeting: the workspace root is on sys.path."},
+  {"front": "<code>py_binary(name = \"server\", srcs = [\"main.py\"])</code> fails. Why?", "back": "The default main is server.py, which is not in srcs. Add main = \"main.py\"."},
+  {"front": "What are runfiles?", "back": "The tree of files a program needs at run time: its sources, its deps' sources, data files, and the interpreter."},
+  {"front": "How do you find a data file at run time?", "back": "deps = [\"@rules_python//python/runfiles\"]; from python.runfiles import runfiles; runfiles.Create().Rlocation(\"_main/path/to/file\")."},
+  {"front": "What does <code>Rlocation</code> return for an unknown path?", "back": "None, which makes open() fail with TypeError: expected str, bytes or os.PathLike object, not NoneType."},
+  {"front": "What does <code>imports = [\"src\"]</code> do?", "back": "Adds the package's src/ directory to sys.path for the target and everything that depends on it."},
+  {"front": "Where does the Python that runs your code come from?", "back": "python.toolchain(...) in MODULE.bazel: rules_python downloads a standalone CPython. The system Python is not used."},
+  {"front": "<code>python_version = \"3.12\"</code> fails with No matching toolchains. Fix?", "back": "Register it: python.toolchain(python_version = \"3.12\") in MODULE.bazel."},
+  {"front": "Why can a unittest py_test pass while broken?", "back": "Without unittest.main(), the script exits 0 without running tests. py_test only checks the exit code."},
+  {"front": "<code>bazel run</code> vs <code>bazel-bin/...</code>?", "back": "bazel run builds first, applies args and env, and starts in the runfiles tree. bazel-bin/... is just the launcher."},
+  {"front": "What is the implicit <code>__init__.py</code> warning?", "back": "rules_python generates empty __init__.py files by default; that is deprecated. explicit_init_py(default = True) turns it off."}
+]
+</script>
+    </div>
+    <h3>Going further</h3>
+    <ul>
+      <li><a href="https://rules-python.readthedocs.io/en/latest/">rules_python documentation</a>: the Python rules, attributes, and toolchains</li>
+      <li><a href="https://rules-python.readthedocs.io/en/latest/api/rules_python/python/defs.html">rules_python API: <code>py_binary</code>, <code>py_library</code>, <code>py_test</code></a></li>
+      <li><a href="https://rules-python.readthedocs.io/en/latest/toolchains.html">Configuring Python toolchains</a> in rules_python</li>
+      <li><a href="https://github.com/bazel-contrib/rules_python/tree/main/python/runfiles">The rules_python runfiles library</a> and its README</li>
+      <li><a href="https://bazel.build/extending/rules#runfiles">Runfiles</a> on bazel.build</li>
+      <li><a href="https://bazel.build/docs/user-manual#running-executables">Running executables with <code>bazel run</code></a> on bazel.build</li>
+      <li><a href="https://registry.bazel.build/modules/rules_python">rules_python on the Bazel Central Registry</a></li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>

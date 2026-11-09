@@ -258,7 +258,9 @@ RULES: dict[str, RuleClass] = {
     ),
     "constraint_setting": _rc("constraint_setting", {"default_constraint_value": "label"}),
     "constraint_value": _rc("constraint_value", {"constraint_setting": "label"}, mandatory=("constraint_setting",)),
-    "py_library": _rc("py_library", _PY, provides=("PyInfo",), needs={"deps": _PYDEP}, exts={"srcs": (".py",)}),
+    "py_library": _rc(
+        "py_library", _PY, provides=("PyInfo",), needs={"deps": _PYDEP}, exts={"srcs": (".py",)}, macro="py_library"
+    ),
     "py_binary": _rc(
         "py_binary",
         _PY_EXE,
@@ -973,10 +975,23 @@ class Workspace:
                     except BazelError:
                         continue
                     if label.is_main and label.package == pkg.name and label.name not in pkg.targets:
+                        if self._crosses_subpackage(pkg.name, label.name):
+                            path = f"{pkg.name}/{label.name}" if pkg.name else label.name
+                            sub = self.package_of_path(path) or ""
+                            rest = path[len(sub) + 1 :]
+                            raise _Fail(
+                                f"{target.location}: Label '{label}' is invalid because '{sub}' is a subpackage; "
+                                f"perhaps you meant to put the colon here: '//{sub}:{rest}'?"
+                            )
                         # Bazel creates an input-file target for every same-package label a rule mentions; a
-                        # missing file only fails later, at execution ("missing input file").
-                        if not self._crosses_subpackage(pkg.name, label.name):
-                            pkg.targets[label.name] = Target(label, "source file", location=pkg.build_file)
+                        # missing file only fails later, at execution ("missing input file"). Since Bazel 9 such
+                        # files take the package's default visibility (private unless package() says otherwise).
+                        pkg.targets[label.name] = Target(
+                            label,
+                            "source file",
+                            {"visibility": list(pkg.default_visibility)},
+                            location=pkg.build_file,
+                        )
         # the BUILD file is itself a source-file target
         base = pkg.build_file.rsplit("/", 1)[-1]
         pkg.targets.setdefault(base, Target(Label("", pkg.name, base), "source file", location=pkg.build_file))
@@ -1000,10 +1015,6 @@ class Workspace:
     def _crosses_subpackage(self, package: str, name: str) -> bool:
         path = f"{package}/{name}" if package else name
         return self.package_of_path(path) != package
-
-    def _is_file_in_package(self, package: str, name: str) -> bool:
-        path = f"{package}/{name}" if package else name
-        return path in self.files and self.package_of_path(path) == package
 
     # ------------------------------------------------------------------ environments
 
@@ -1323,20 +1334,13 @@ class Workspace:
         pkg = self.package(label.package)
         if label.name in pkg.targets:
             return pkg.targets[label.name]
-        # a source file that exists but that no rule referenced is still a target
-        if self._is_file_in_package(label.package, label.name):
-            t = Target(label, "source file", location=pkg.build_file)
-            pkg.targets[label.name] = t
-            return t
+        # A file on disk is a target only when a rule in its package mentions it or exports_files() lists it.
         hint = ""
         full = f"{label.package}/{label.name}" if label.package else label.name
         if full in self.files:
-            owner = self.package_of_path(full)
             hint = (
                 f"; however, a source file of this name exists.  (Perhaps add "
                 f"'exports_files([\"{label.name}\"])' to {pkg.build_file}?)"
-                if owner == label.package
-                else f" (perhaps you meant //{owner}:{full[len(owner) + 1 :] if owner else full})"
             )
         raise BazelError(
             f"no such target '{label}': target '{label.name}' not declared in package '{label.package}' "
@@ -1451,6 +1455,17 @@ def _label_values(target: Target) -> list[tuple[str, list[str]]]:
             else:
                 labels.extend(branch)
         out.append((attr, labels))
+    return out
+
+
+def _condition_labels(target: Target) -> list[Label]:
+    """The select() condition keys of every attribute: Bazel makes each one a dependency (query shows them)."""
+    out: list[Label] = []
+    for value in target.attrs.values():
+        if isinstance(value, Select):
+            for kind, part in value.parts:
+                if kind == "select":
+                    out.extend(parse_label(k, value.package) for k in part if k != "//conditions:default")
     return out
 
 
@@ -1749,6 +1764,7 @@ class _Analyzer:
             items = [value] if akind == "label" else list(value.keys()) if akind == "label_dict" else list(value)
             for item in items:
                 out.append((attr, parse_label(item, target.label.package)))
+        out.extend(("$config_conditions", c) for c in _condition_labels(target))
         if target.kind == "test_suite" and not target.attrs.get("tests"):
             for t in self.ws.all_targets(target.label.package):
                 if t.rule_class is not None and t.rule_class.test and "manual" not in t.tags:
@@ -1805,6 +1821,10 @@ class _Analyzer:
                     text += f" and referenced by '{target.label}'"
                 self.errors.append(f"{where}: {text}")
                 continue
+            if attr == "$config_conditions":
+                # select() keys are resolved separately (see _choose); Bazel does not check their visibility.
+                self.check(dep_label)
+                continue
             if attr not in ("$implicit_tests",) and not self.visible(dep, target):
                 self.errors.append(
                     f"{where}: in {target.kind} rule {target.label}: Visibility error:\n"
@@ -1824,14 +1844,24 @@ class _Analyzer:
                         f"testonly target '{dep.label}' and doesn't have testonly attribute set"
                     )
             needs = rc.needs.get(attr)
-            if needs and not self._provides(dep, needs):
-                names = " or ".join(f"'{n}'" for n in needs)
-                suffix = (
-                    f". Since this rule was created by the macro '{rc.macro}', the error might have been caused by "
-                    "the macro implementation"
-                    if rc.macro
-                    else ""
+            suffix = (
+                f". Since this rule was created by the macro '{rc.macro}', the error might have been caused by "
+                "the macro implementation"
+                if rc.macro
+                else ""
+            )
+            if needs and dep.kind == "source file" and not dep.external:
+                # deps-style attributes accept no files: a same-package label that names no rule is reported
+                # as a missing rule, an existing file as misplaced.
+                path = f"{dep.label.package}/{dep.label.name}" if dep.label.package else dep.label.name
+                problem = (
+                    f"source file '{dep.label}' is misplaced here (expected no files)"
+                    if path in self.ws.files
+                    else f"rule '{dep.label}' does not exist"
                 )
+                self.errors.append(f"{where}: in {attr} attribute of {target.kind} rule {target.label}: {problem}{suffix}")
+            elif needs and not self._provides(dep, needs):
+                names = " or ".join(f"'{n}'" for n in needs)
                 self.errors.append(
                     f"{where}: in {attr} attribute of {target.kind} rule {target.label}: '{dep.label}' does not "
                     f"have mandatory providers: {names}{suffix}"
@@ -1907,20 +1937,22 @@ class _Analyzer:
                 except BazelError:
                     continue
                 if group.kind == "package_group":
-                    specs = group.attrs.get("packages") or []
-                    for spec in specs:
-                        if spec == "public":
-                            return True
+                    # A negative spec ("-//pkg/...") excludes wherever it appears in the list; a package is in the
+                    # group when some positive spec matches it and no negative spec does.
+                    positive = negative = False
+                    for spec in group.attrs.get("packages") or []:
                         neg = spec.startswith("-")
-                        spec = spec.lstrip("-")
-                        body = spec[2:] if spec.startswith("//") else spec
-                        hit = (
-                            (body.endswith("/...") and (user_pkg == body[:-4] or user_pkg.startswith(body[:-4] + "/")))
-                            or body == "..."
-                            or body == user_pkg
+                        body = spec.lstrip("-")
+                        body = body[2:] if body.startswith("//") else body
+                        hit = body in ("public", "...", user_pkg) or (
+                            body.endswith("/...") and (user_pkg == body[:-4] or user_pkg.startswith(body[:-4] + "/"))
                         )
-                        if hit:
-                            return not neg
+                        if hit and neg:
+                            negative = True
+                        elif hit:
+                            positive = True
+                    if positive and not negative:
+                        return True
                     for inc in group.attrs.get("includes") or []:
                         if self._allowed([inc], group.label.package, user_pkg, seen):
                             return True
@@ -2006,15 +2038,46 @@ class _Analyzer:
 _TOKEN = re.compile(r"\s*(?:(\()|(\))|(,)|(\+|\^|-(?=\s))|\"([^\"]*)\"|'([^']*)'|([^\s(),\"']+))")
 
 
+# Functions `bazel query` accepts (Bazel 9.3.2's list; allrdeps also needs --universe_scope or
+# --infer_universe_scope), and the subset the simulator evaluates.
+_BAZEL_QUERY_FUNCTIONS = frozenset(
+    {
+        "allpaths",
+        "attr",
+        "buildfiles",
+        "deps",
+        "executables",
+        "filter",
+        "kind",
+        "labels",
+        "loadfiles",
+        "rdeps",
+        "same_pkg_direct_rdeps",
+        "siblings",
+        "some",
+        "somepath",
+        "tests",
+        "visible",
+    }
+)
+_QUERY_FUNCTIONS = _BAZEL_QUERY_FUNCTIONS | {"set"}
+
+
 class _Query:
     """A small `bazel query` evaluator: patterns, set operations, and the common functions."""
 
-    def __init__(self, ws: Workspace, analyzer: _Analyzer | None, configured: bool) -> None:
+    def __init__(
+        self, ws: Workspace, analyzer: _Analyzer | None, configured: bool, universe: list[str] | None = None
+    ) -> None:
         self.ws = ws
         self.an = analyzer or _Analyzer(ws, Config())
         self.configured = configured
+        # --universe_scope patterns; [] means --infer_universe_scope; None means neither (allrdeps unavailable)
+        self.universe = universe
+        self.expr = ""
 
     def run(self, expr: str) -> list[Label]:
+        self.expr = expr
         tokens = self._tokenize(expr)
         self.tokens = tokens
         self.pos = 0
@@ -2081,6 +2144,13 @@ class _Query:
             raise BazelError(f"syntax error at '{value}'")
         nxt = self._peek()
         if nxt is not None and nxt[0] == "(":
+            if value not in _QUERY_FUNCTIONS and not (value == "allrdeps" and self.universe is not None):
+                # Bazel's message quotes the function name, the '(' and the next token.
+                after = self.tokens[self.pos + 1][1] if self.pos + 1 < len(self.tokens) else ""
+                raise BazelError(
+                    f"Error while parsing '{self.expr}': unknown function '{value}' at '{value} ( {after}'; "
+                    f"expected one of [{', '.join(repr(f) for f in sorted(_BAZEL_QUERY_FUNCTIONS))}]"
+                )
             self.pos += 1
             return self._call(value)
         return self.pattern(value)
@@ -2147,9 +2217,13 @@ class _Query:
             universe = self.closure(self._arg_expr(args[0]), None, forward=True)
             depth = int(self._arg_word(args[2])) if n == 3 else None
             return self.rclosure(universe, self._arg_expr(args[1]), depth)
-        if fn == "allrdeps":
+        if fn == "allrdeps" and self.universe is not None:
             need(1, 2)
-            universe = self.closure(self.pattern("//..."), None, forward=True)
+            roots = self._arg_expr(args[0])
+            scope: set[Label] = set()
+            for pattern in self.universe:
+                scope |= self.pattern(pattern)
+            universe = self.closure(scope or roots, None, forward=True)
             depth = int(self._arg_word(args[1])) if n == 2 else None
             return self.rclosure(universe, self._arg_expr(args[0]), depth)
         if fn in ("somepath", "allpaths"):
@@ -2221,7 +2295,7 @@ class _Query:
                     if lbl in {d for _, d in self._edges(t)}:
                         out.add(t.label)
             return out
-        raise BazelError(f"syntax error: unknown function '{fn}'")
+        raise BazelError(f"the simulator does not implement the query function '{fn}'")
 
     # ---------------------------------------------------------------- patterns
 
@@ -2271,6 +2345,7 @@ class _Query:
         for attr, values in _label_values(target):
             for v in values:
                 out.append((attr, parse_label(v, target.label.package)))
+        out.extend(("$config_conditions", c) for c in _condition_labels(target))
         if target.kind == "test_suite" and not target.attrs.get("tests"):
             for t in self.ws.all_targets(target.label.package):
                 if t.rule_class is not None and t.rule_class.test and "manual" not in t.tags:
@@ -2477,10 +2552,19 @@ class Bazel:
     # -- commands -----------------------------------------------------------------------------------
 
     def query(self, expr: str, *flags: str) -> list[str]:
-        """``bazel query EXPR``: labels, sorted like Bazel's default output. Raises BazelError on errors."""
+        """``bazel query EXPR [flags]``: labels, sorted like Bazel's default output. Raises BazelError on errors.
+
+        ``--universe_scope=PATTERNS`` or ``--infer_universe_scope`` enables ``allrdeps``, as in Bazel.
+        """
         self._ensure_module()
         self.ws._current_command = "query"
-        q = _Query(self.ws, None, configured=False)
+        universe: list[str] | None = None
+        for flag in flags:
+            if flag.startswith("--universe_scope="):
+                universe = [p for p in flag.split("=", 1)[1].split(",") if p]
+            elif flag == "--infer_universe_scope":
+                universe = []
+        q = _Query(self.ws, None, configured=False, universe=universe)
         return [str(lbl) for lbl in q.run(expr)]
 
     def cquery(self, expr: str, *flags: str) -> list[str]:
@@ -2597,13 +2681,12 @@ class Bazel:
         cmd, rest = words[0], words[1:]
         try:
             if cmd in ("query", "cquery"):
-                flags = [a for a in rest if a.startswith("-")]
-                exprs = [a for a in rest if not a.startswith("-")]
+                flags, exprs = _split_flags(rest)
                 if len(exprs) != 1:
                     raise BazelError(f"{cmd} expects exactly one query expression (quote it)")
                 fmt = next((f.split("=", 1)[1] for f in flags if f.startswith("--output")), "label")
                 cfg_flags = [f for f in flags if not f.startswith("--output")]
-                labels = self.query(exprs[0]) if cmd == "query" else self.cquery(exprs[0], *cfg_flags)
+                labels = self.query(exprs[0], *cfg_flags) if cmd == "query" else self.cquery(exprs[0], *cfg_flags)
                 if fmt == "label_kind":
                     text = "\n".join(f"{self.ws.target(parse_label(lbl)).kind_string()} {lbl}" for lbl in labels)
                 elif fmt == "package":
@@ -2634,6 +2717,38 @@ class Bazel:
             return Result(False, f"Command '{cmd}' not found. Try 'bazel help'.", [f"unknown command {cmd}"])
         except BazelError as exc:
             return Result(False, f"ERROR: {exc}", [str(exc)])
+
+
+# Options whose value may follow as a separate word: ``-c opt``, ``--platforms //:p``.
+_VALUE_OPTIONS = frozenset(
+    {
+        "-c",
+        "--compilation_mode",
+        "--define",
+        "--platforms",
+        "--output",
+        "--universe_scope",
+        "--config",
+        "--test_tag_filters",
+        "--test_size_filters",
+    }
+)
+
+
+def _split_flags(words: list[str]) -> tuple[list[str], list[str]]:
+    """Split command-line words into options (``-c opt`` joined as ``-c=opt``) and positional arguments."""
+    flags: list[str] = []
+    positional: list[str] = []
+    i = 0
+    while i < len(words):
+        word = words[i]
+        if word in _VALUE_OPTIONS and i + 1 < len(words):
+            flags.append(f"{'--compilation_mode' if word == '-c' else word}={words[i + 1]}")
+            i += 2
+            continue
+        (flags if word.startswith("-") else positional).append(word)
+        i += 1
+    return flags, positional
 
 
 def load_workspace(files: dict[str, str]) -> Bazel:

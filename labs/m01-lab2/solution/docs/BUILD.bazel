@@ -1,0 +1,19 @@
+# The handbook is these pages, concatenated in this order into bazel-bin/docs/handbook.txt.
+filegroup(
+    name = "pages",
+    srcs = [
+        "index.md",
+        "about.md",
+    ],
+)
+
+genrule(
+    name = "handbook",
+    srcs = [
+        ":pages",
+        "//docs/guides:setup.md",
+        "CHANGES.md",
+    ],
+    outs = ["handbook.txt"],
+    cmd = "cat $(SRCS) > $@",
+)

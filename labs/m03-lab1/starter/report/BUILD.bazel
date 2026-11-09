@@ -1,0 +1,18 @@
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
+
+py_library(
+    name = "inventory",
+    srcs = ["inventory.py"],
+)
+
+py_test(
+    name = "inventory_test",
+    srcs = ["inventory_test.py"],
+    deps = [":inventory"],
+)
+
+py_binary(
+    name = "summary",
+    srcs = ["summary.py"],
+    deps = [":inventory"],
+)

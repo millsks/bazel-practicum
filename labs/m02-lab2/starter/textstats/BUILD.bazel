@@ -1,0 +1,20 @@
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "stats",
+    srcs = ["stats.py"],
+)
+
+py_test(
+    name = "stats_test",
+    srcs = ["stats_test.py"],
+    deps = [":stats"],
+)
+
+py_test(
+    name = "report_test",
+    srcs = ["report_test.py"],
+    # Copied from when this test called a web service.
+    tags = ["external"],
+    deps = [":stats"],
+)

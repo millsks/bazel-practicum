@@ -1,0 +1,28 @@
+[[check]]
+name = "//lib is a package with a library and a test"
+command = ["query", "//lib:all"]
+stdout_lines = ["//lib:lib", "//lib:greet_test"]
+message = "Create lib/BUILD.bazel with a py_library named lib (srcs greet.py) and a py_test named greet_test (srcs greet_test.py). Check with `pixi run bazel query //lib:all`."
+
+[[check]]
+name = "//app:cli depends on //lib"
+command = ["query", "deps(//app:cli, 1)"]
+stdout_contains = ["//lib:lib"]
+message = "Add the library to the binary's deps in app/BUILD.bazel. From another package you need an absolute label: //lib (short for //lib:lib)."
+
+[[check]]
+name = "bazel run //app:cli -- --name Ada prints the greeting"
+command = ["run", "//app:cli", "--", "--name", "Ada"]
+stdout_equals = "Hello, Ada! Built by Bazel."
+message = "Run `pixi run bazel run //app:cli -- --name Ada` in work/m01-lab1. If you see 'is not visible from target', give //lib:lib visibility = [\"//visibility:public\"]. Arguments for your program go after `--`."
+
+[[check]]
+name = "bazel test //... passes"
+command = ["test", "//...", "--test_output=errors"]
+message = "Run `pixi run bazel test //... --test_output=errors` and read the failing test's log."
+
+[[check]]
+name = "the binary lands under bazel-bin"
+command = ["build", "//app:cli"]
+file_exists = ["bazel-bin/app/cli"]
+message = "`bazel build //app:cli` should leave the launcher at bazel-bin/app/cli."

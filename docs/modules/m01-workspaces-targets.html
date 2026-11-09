@@ -1,0 +1,1200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M01 · Workspaces, Packages &amp; Targets · Bazel Practicum</title>
+<link rel="stylesheet" href="../assets/css/course.css">
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/viz.js" defer></script>
+<script src="../assets/js/viz-bazel.js" defer></script>
+<script src="../assets/js/course.js" defer></script>
+</head>
+<body data-root="../" data-module="m01">
+<main class="lesson">
+  <header class="lesson-hero">
+    <p class="eyebrow">Stage 1 · Foundations · Module 01</p>
+    <h1>Workspaces, Packages &amp; Targets</h1>
+    <p class="lede">Every Bazel command names things: <code>//app:cli</code>, <code>//...</code>, <code>@rules_python//python:defs.bzl</code>.
+      This module teaches the addressing system behind those names: where a workspace starts, how directories become
+      packages, how a label points at exactly one target, and how patterns select many. Get this right and most
+      "no such target" errors stop being mysterious.</p>
+    <div class="lesson-meta"><span>⏱ ~2 hours</span><span>Prerequisites: <a href="m00-orientation.html">M00</a></span></div>
+    <ul class="objectives">
+      <li>Say what makes a directory a workspace root, and what <code>module(name = ...)</code> is for</li>
+      <li>Explain packages and the subpackage boundary, including why <code>glob()</code> stops at a subpackage</li>
+      <li>Read and write labels in every form: absolute, relative, external, and the <code>//pkg</code> shorthand</li>
+      <li>Tell rule targets, source file targets, and generated file targets apart</li>
+      <li>Select targets with patterns: <code>//...</code>, <code>//pkg/...</code>, <code>:all</code>, <code>:*</code>, and exclusions after <code>--</code></li>
+      <li>Use <code>bazel build</code>, <code>run</code>, <code>test</code>, and <code>query</code>, and find outputs through the convenience symlinks</li>
+    </ul>
+  </header>
+
+  <section class="lesson-section" id="workspace">
+    <h2>The workspace root: MODULE.bazel</h2>
+    <aside class="callout python">
+      <p>A Python project's root is wherever <code>pyproject.toml</code> (or <code>pixi.toml</code>) lives. Tools find it by
+        walking up from your current directory until they see that file. <code>pytest</code> does the same to find its
+        <code>rootdir</code>.</p>
+    </aside>
+    <p>Bazel works the same way. The <strong>workspace</strong> is the directory tree Bazel builds, and its
+      <strong>root</strong> is the nearest directory, at or above where you run <code>bazel</code>, that contains a file
+      named <code>MODULE.bazel</code>. Everything below it is "the main repository".</p>
+    <p>Run Bazel anywhere without one and it refuses before doing anything:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: Bazel 'build' must be invoked from within a workspace (below a directory having a MODULE.bazel file).
+See documentation at https://bazel.build/concepts/build-ref#workspace</code></pre>
+    <p>Because Bazel searches upward, you can run commands from any subdirectory. <code>bazel info workspace</code>
+      prints the root it found:</p>
+    <pre data-label="Terminal (inside docs/guides/)"><code class="language-bash">pixi run bazel info workspace</code></pre>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">/work/handbook</code></pre>
+    <aside class="callout note" data-title="About paths in real output">
+      <p>Real output on this page comes from runs of Bazel 9.3.2. Absolute paths are shortened to
+        <code>/work/&lt;workspace&gt;</code>; on your machine you will see your own directory there.</p>
+    </aside>
+    <h3>What goes in MODULE.bazel</h3>
+    <p>The file can even be empty: an empty <code>MODULE.bazel</code> still marks the root. In practice it starts with one
+      call that names your module:</p>
+    <pre data-label="MODULE.bazel"><code class="language-starlark">module(name = "greeter")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(python_version = "3.13", is_default = True)</code></pre>
+    <p>A <strong>module</strong> is Bazel's unit of versioned code, like a distribution on PyPI. Your workspace is the
+      <em>root module</em>; <code>rules_python</code> is a module you depend on. <code>module(name = "greeter")</code>
+      gives yours a name, which matters when someone else depends on it or when a label names your repository
+      explicitly. Leave it out and Bazel uses an empty name:</p>
+    <pre data-label="Real output of bazel mod graph (Bazel 9.3.2)"><code class="language-none"># MODULE.bazel is empty
+&lt;root&gt; (@_)
+
+# MODULE.bazel says module(name = "handbook")
+&lt;root&gt; (handbook@_)</code></pre>
+    <p><code>bazel_dep</code> and <code>use_extension</code> declare dependencies; Module 04
+      covers them. For this module, remember one thing: the <em>name</em> on the left of a <code>bazel_dep</code> becomes
+      the <code>@rules_python</code> you type in labels.</p>
+    <aside class="callout bazel">
+      <p>Older tutorials mark the root with a <code>WORKSPACE</code> or <code>WORKSPACE.bazel</code> file. Bazel 9 removed
+        that system. If you clone a project with only a <code>WORKSPACE</code> file, Bazel 9 will not treat it as a
+        workspace at all; it needs a <code>MODULE.bazel</code>.</p>
+    </aside>
+    <aside class="callout think">
+      <p>Your repository has <code>MODULE.bazel</code> at the top and you run <code>bazel build //...</code> from
+        <code>services/api/</code>. Which directory does <code>//</code> refer to? (The workspace root, not your current
+        directory. <code>//</code> always means the root.)</p>
+    </aside>
+  </section>
+
+  <section class="lesson-section" id="build-files">
+    <h2>BUILD files and packages</h2>
+    <aside class="callout python">
+      <p>In Python a directory becomes an importable package when it has an <code>__init__.py</code> (or by namespace-package
+        rules). Bazel ignores <code>__init__.py</code> entirely when it decides what a package is.</p>
+    </aside>
+    <p>A <strong>package</strong> is a directory that contains a BUILD file, together with every file below it,
+      <em>except</em> files in deeper directories that have their own BUILD file. The package's name is its path from the
+      workspace root: <code>app/BUILD.bazel</code> defines package <code>app</code>, written <code>//app</code>. A BUILD
+      file at the root defines the root package, written <code>//</code>.</p>
+    <p>The file may be called <code>BUILD.bazel</code> or <code>BUILD</code>. They mean the same thing. If a directory has
+      both, Bazel reads <code>BUILD.bazel</code> and ignores <code>BUILD</code>. Prefer <code>BUILD.bazel</code>: it cannot
+      collide with a directory named <code>build/</code> on case-insensitive file systems (macOS, Windows), and editors
+      recognize it.</p>
+    <pre data-label="Workspace layout"><code class="language-none">greeter/
+├── MODULE.bazel
+├── app/
+│   ├── BUILD.bazel        # package //app
+│   └── cli.py
+└── lib/
+    ├── BUILD.bazel        # package //lib
+    ├── greet.py
+    ├── greet_test.py
+    └── testdata/
+        ├── BUILD.bazel    # package //lib/testdata: a subpackage of nothing, just another package
+        └── words.txt</code></pre>
+    <p>There are three packages here: <code>//app</code>, <code>//lib</code>, and <code>//lib/testdata</code>.
+      <code>words.txt</code> belongs to <code>//lib/testdata</code>, not to <code>//lib</code>, because its nearest
+      ancestor with a BUILD file is <code>lib/testdata/</code>. A directory without a BUILD file (say <code>lib/util/</code>)
+      would simply be part of <code>//lib</code>.</p>
+    <aside class="callout warn" data-title="Packages do not nest">
+      <p>"Subpackage" only describes where a directory sits. <code>//lib/testdata</code> is a package in its own right, with
+        nothing inherited from <code>//lib</code>: not its targets, not its loads, not its visibility. Each BUILD file
+        starts from a blank page.</p>
+    </aside>
+    <p>Try it: this sandbox has both a <code>BUILD</code> and a <code>BUILD.bazel</code> in <code>docs/</code>. Query the
+      package and see which file won.</p>
+    <div class="runnable" data-title="BUILD vs BUILD.bazel" data-commands="bazel query //docs:all|bazel query '//docs:*'">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "handbook")
+</textarea>
+<textarea class="file" data-path="docs/BUILD.bazel">
+filegroup(
+    name = "pages",
+    srcs = ["intro.md"],
+)
+</textarea>
+<textarea class="file" data-path="docs/BUILD">
+filegroup(
+    name = "legacy_pages",
+    srcs = ["intro.md"],
+)
+</textarea>
+<textarea class="file" data-path="docs/intro.md" data-hidden></textarea>
+</div>
+    <p>Only <code>//docs:pages</code> exists. <code>legacy_pages</code> is never loaded, and nothing warns you. When a target
+      you "definitely declared" does not exist, check for a second BUILD file.</p>
+    <p><strong>Remember:</strong> a BUILD file makes a package; the package owns every file below it down to the next BUILD
+      file; <code>BUILD.bazel</code> wins over <code>BUILD</code>.</p>
+  </section>
+
+  <section class="lesson-section" id="boundary">
+    <h2>The subpackage boundary</h2>
+    <p>The boundary has two consequences that surprise Python developers. Both come from one rule: <em>a file belongs to
+      exactly one package</em>, so only that package's BUILD file may refer to it by a relative path.</p>
+    <h3>1. A glob stops at a subpackage</h3>
+    <p><code>glob()</code> is a BUILD-file function that lists files in the current package matching a pattern, like
+      Python's <code>pathlib.Path.glob</code>. <code>**</code> matches any number of directories. But a glob never descends
+      into a directory that has its own BUILD file, because those files are not in this package.</p>
+    <p>Predict what this query prints. <code>labels(srcs, //docs:docs)</code> lists the labels in the <code>srcs</code>
+      attribute after the glob is expanded.</p>
+    <div class="runnable" data-predict data-title="What does the glob match?" data-commands="bazel query 'labels(srcs, //docs:docs)'">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "handbook")
+</textarea>
+<textarea class="file" data-path="docs/BUILD.bazel">
+filegroup(
+    name = "docs",
+    srcs = glob(["**/*.md"]),
+)
+</textarea>
+<textarea class="file" data-path="docs/guides/BUILD.bazel">
+exports_files(["setup.md"])
+</textarea>
+<textarea class="file" data-path="docs/intro.md" data-hidden></textarea>
+<textarea class="file" data-path="docs/faq.md" data-hidden></textarea>
+<textarea class="file" data-path="docs/guides/setup.md" data-hidden></textarea>
+</div>
+    <p><code>guides/setup.md</code> is missing, silently. Now delete the contents of <code>docs/guides/BUILD.bazel</code>
+      and run again: it is still a package, because the <em>file</em> exists, even empty. Real Bazel agrees. With and
+      without <code>docs/guides/BUILD</code>:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none"># no BUILD file in docs/guides
+//docs:guides/setup.md
+//docs:intro.md
+
+# after adding docs/guides/BUILD
+//docs:intro.md</code></pre>
+    <aside class="callout warn">
+      <p>This is how files vanish from a build. Someone adds a BUILD file to a subdirectory for an unrelated reason, and a
+        <code>glob(["**/*.md"])</code> one level up quietly loses those files. No error, just a smaller output. When you add
+        a package, check the globs above it.</p>
+    </aside>
+    <h3>2. A label cannot reach into a subpackage</h3>
+    <p>Inside <code>lib/BUILD.bazel</code>, writing <code>"testdata/words.txt"</code> means "the file
+      <code>testdata/words.txt</code> in package <code>//lib</code>", that is, <code>//lib:testdata/words.txt</code>. If
+      <code>lib/testdata/</code> has its own BUILD file, that label is invalid: the file belongs to
+      <code>//lib/testdata</code>. Run the build in this sandbox:</p>
+    <div class="runnable" data-title="A label that crosses a subpackage" data-commands="bazel build //lib|bazel query '//lib/testdata:*'">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "greeter")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="lib/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "lib",
+    srcs = ["greet.py"],
+    data = ["testdata/words.txt"],
+)
+</textarea>
+<textarea class="file" data-path="lib/testdata/BUILD.bazel">
+exports_files(["words.txt"])
+</textarea>
+<textarea class="file" data-path="lib/greet.py" data-hidden></textarea>
+<textarea class="file" data-path="lib/testdata/words.txt" data-hidden></textarea>
+</div>
+    <p>Real Bazel catches this while <em>loading</em> the BUILD file, and its message tells you the fix:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: /work/greeter/lib/BUILD.bazel:3:11: Label '//lib:testdata/words.txt' is invalid because 'lib/testdata' is a subpackage; perhaps you meant to put the colon here: '//lib/testdata:words.txt'?
+WARNING: Target pattern parsing failed.
+ERROR: Skipping '//lib': Error evaluating '//lib': error loading package 'lib': Package 'lib' contains errors
+ERROR: Error evaluating '//lib': error loading package 'lib': Package 'lib' contains errors
+INFO: Elapsed time: 0.226s
+INFO: 0 processes.
+ERROR: Build did NOT complete successfully</code></pre>
+    <aside class="callout sim">
+      <p>The simulator reports the same mistake later, during analysis, as <code>no such target '//lib:testdata/words.txt'</code>
+        with the hint <code>(perhaps you meant //lib/testdata:words.txt)</code>. Same cause, same fix; real Bazel's wording
+        is the one above.</p>
+    </aside>
+    <p>Move the colon: <code>"//lib/testdata:words.txt"</code>. The colon separates the <em>package</em> from the
+      <em>target name</em>, so it must sit exactly at the package boundary. The <code>exports_files()</code> call in
+      <code>lib/testdata/BUILD.bazel</code> is what lets another package use that file; without it you get a visibility
+      error (Module 02).</p>
+    <p>The fix in the other direction, deleting <code>lib/testdata/BUILD.bazel</code> so the file belongs to
+      <code>//lib</code> again, also works. Choose by intent: does <code>testdata/</code> need its own targets?</p>
+    <p><strong>Remember:</strong> globs stop at subpackages silently; labels that cross a subpackage fail loudly. The colon
+      always sits on the package boundary.</p>
+  </section>
+
+  <section class="lesson-section" id="labels">
+    <h2>Anatomy of a label</h2>
+    <aside class="callout python">
+      <p>A Python import path like <code>lib.greet</code> names a module by its dotted location. A Bazel
+        <strong>label</strong> names a <em>target</em>, not a file or module, and it always has two halves: which package,
+        and which name inside it.</p>
+    </aside>
+    <p>The full form has three parts:</p>
+    <pre data-label="Label anatomy"><code class="language-none">@rules_python//python/private:py_library.bzl
+└─────┬─────┘└──────┬──────┘ └──────┬──────┘
+  repository     package        target name
+ (optional)    (path from     (after the colon)
+               repo root)</code></pre>
+    <dl>
+      <dt><strong>Repository</strong> (<code>@name</code>)</dt>
+      <dd>Which repository the package lives in. Leave it out for your own workspace (the main repository). External
+        repositories come from <code>bazel_dep</code>s: <code>@rules_python</code> exists because MODULE.bazel says
+        <code>bazel_dep(name = "rules_python", ...)</code>.</dd>
+      <dt><strong>Package</strong> (after <code>//</code>)</dt>
+      <dd>The path from that repository's root to the directory with the BUILD file. Never a trailing slash, never
+        <code>..</code>.</dd>
+      <dt><strong>Target name</strong> (after <code>:</code>)</dt>
+      <dd>The <code>name</code> of a rule in that BUILD file, or a file path relative to the package directory
+        (<code>greet.py</code>, <code>data/words.txt</code> if <code>data/</code> has no BUILD file).</dd>
+    </dl>
+    <h3>The shorthands</h3>
+    <div class="card-grid">
+      <div class="card"><h4><code>//lib</code></h4><p>Means <code>//lib:lib</code>: the target named after the last
+        directory of the package. Name a package's main target after its directory and you get this short form.</p></div>
+      <div class="card"><h4><code>:helpers</code></h4><p>Relative: the target <code>helpers</code> in <em>this</em> package.
+        Only valid inside a BUILD file (or on the command line, relative to your current directory).</p></div>
+      <div class="card"><h4><code>helpers</code></h4><p>Also relative, with no colon. Works, but <code>:helpers</code> is the
+        convention for rules; the bare form is used for files: <code>srcs = ["cli.py"]</code>.</p></div>
+      <div class="card"><h4><code>@rules_python//python:defs.bzl</code></h4><p>A file in an external repository. You have
+        been writing one of these in every <code>load()</code>.</p></div>
+    </div>
+    <p>Inside <code>app/BUILD.bazel</code>, these four all name the same target: <code>":cli"</code>, <code>"cli"</code>,
+      <code>"//app:cli"</code>, and <code>"@greeter//app:cli"</code> (the module's own name works as a repository name in
+      the root module). You will also see <code>@@//app:cli</code> in Bazel's own messages: <code>@@</code> is the
+      canonical, unambiguous spelling Bazel uses internally, and <code>@@</code> with nothing after it is the main
+      repository.</p>
+    <aside class="callout tip">
+      <p>Use the shortest form that is unambiguous: <code>":name"</code> inside a package, <code>"//pkg"</code> or
+        <code>"//pkg:name"</code> across packages. Never <code>"//app:cli"</code> from inside <code>//app</code>; reviewers
+        read a full label as "this crosses packages".</p>
+    </aside>
+    <h3>The mistakes Python developers make</h3>
+    <p>Each of these went into <code>deps</code> of <code>//app:cli</code>, which needs the library <code>//lib:lib</code>.
+      All real Bazel 9.3.2 messages, first ERROR line only:</p>
+    <div class="tabs">
+      <div class="tab" data-label="&quot;lib&quot;">
+        <p>A relative label: it looks for <code>lib</code> in <em>this</em> package, <code>//app</code>.</p>
+        <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: /work/greeter/app/BUILD.bazel:3:10: in deps attribute of py_binary rule //app:cli: rule '//app:lib' does not exist. Since this rule was created by the macro 'py_binary', the error might have been caused by the macro implementation</code></pre>
+        <p>Fix: <code>"//lib"</code>. Ignore the remark about the macro; <code>py_binary</code> is a macro around the real
+          rule, and Bazel always adds that sentence.</p>
+      </div>
+      <div class="tab" data-label="&quot;//lib/greet.py&quot;">
+        <p>A file path written like a package. Bazel reads <code>lib/greet.py</code> as a <em>package</em> name.</p>
+        <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: no such package 'lib/greet.py': BUILD file not found in any of the following directories. Add a BUILD file to a directory to mark it as a package.
+ - lib/greet.py</code></pre>
+        <p>Fix: depend on the library target, <code>"//lib"</code>, not on its source file.</p>
+      </div>
+      <div class="tab" data-label="&quot;//lib:greet.py&quot;">
+        <p>A valid label for the source file, but <code>deps</code> wants libraries, and the file is private to
+          <code>//lib</code>.</p>
+        <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: /work/greeter/app/BUILD.bazel:3:10: in deps attribute of py_binary rule //app:cli: source file '//lib:greet.py' is misplaced here (expected no files). Since this rule was created by the macro 'py_binary', the error might have been caused by the macro implementation</code></pre>
+      </div>
+      <div class="tab" data-label="&quot;//lib:greet&quot;">
+        <p>The module is <code>greet.py</code>, but the <em>target</em> is named <code>lib</code>. Target names and file
+          names are independent.</p>
+        <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: /work/greeter/lib/BUILD.bazel: no such target '//lib:greet': target 'greet' not declared in package 'lib' defined by /work/greeter/lib/BUILD.bazel</code></pre>
+      </div>
+      <div class="tab" data-label="&quot;../lib&quot;">
+        <p>Relative paths upward do not exist in labels. This fails while loading <code>//app</code> itself.</p>
+        <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: /work/greeter/app/BUILD.bazel:3:10: //app:cli: invalid label '../lib' in element 0 of attribute 'deps' of 'py_binary': invalid target name '../lib': target names may not contain up-level references '..'</code></pre>
+      </div>
+      <div class="tab" data-label="&quot;//lib/&quot;">
+        <p>A trailing slash, as you would type for a directory in a shell.</p>
+        <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: /work/greeter/app/BUILD.bazel:3:10: //app:cli: invalid label '//lib/' in element 0 of attribute 'deps' of 'py_binary': invalid package name 'lib/': package names may not end with '/' (perhaps you meant ":"?)</code></pre>
+      </div>
+    </div>
+    <p>One more you will hit as soon as you split code into two packages. A target is private to its package by default,
+      so even the correct label fails until the library opts in:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: /work/greeter/app/BUILD.bazel:8:10: in py_binary rule //app:cli: Visibility error:
+target '//lib:lib' is not visible from
+target '//app:cli'
+Recommendation: modify the visibility declaration if you think the dependency is legitimate. For more info see https://bazel.build/concepts/visibility</code></pre>
+    <p>Add <code>visibility = ["//visibility:public"]</code> (or the narrower <code>["//app:__pkg__"]</code>) to the
+      library. Module 02 treats visibility properly; for now, know the error.</p>
+    <p>Fix this sandbox. The build fails with the second mistake from the tabs; make <code>//app:cli</code> depend on the
+      library, then run <code>bazel query 'deps(//app:cli)'</code> to see the result.</p>
+    <div class="runnable" data-title="Fix the label" data-commands="bazel build //app:cli|bazel query 'deps(//app:cli)'|bazel query //lib:all">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "greeter")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="app/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "cli",
+    srcs = ["cli.py"],
+    deps = ["//lib/greet.py"],
+)
+</textarea>
+<textarea class="file" data-path="lib/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "lib",
+    srcs = ["greet.py"],
+    visibility = ["//visibility:public"],
+)
+</textarea>
+<textarea class="file" data-path="app/cli.py" data-hidden></textarea>
+<textarea class="file" data-path="lib/greet.py" data-hidden></textarea>
+</div>
+    <p><strong>Remember:</strong> <code>@repo//package:name</code>; <code>//pkg</code> is <code>//pkg:pkg</code>;
+      <code>:name</code> is relative; the colon sits on the package boundary; you depend on targets, not files.</p>
+  </section>
+
+  <section class="lesson-section" id="targets">
+    <h2>Three kinds of target</h2>
+    <p>A <strong>target</strong> is anything a label can name. There are three kinds:</p>
+    <dl>
+      <dt><strong>Rule targets</strong></dt>
+      <dd>Declared by calling a rule in a BUILD file: <code>py_library(name = "lib", ...)</code> creates
+        <code>//lib:lib</code>. They describe how to produce outputs from inputs.</dd>
+      <dt><strong>Source file targets</strong></dt>
+      <dd>Files checked into the package, like <code>//lib:greet.py</code>. You never declare them; a file in a package is
+        a target automatically. The BUILD file itself is one too.</dd>
+      <dt><strong>Generated file targets</strong></dt>
+      <dd>Files a rule promises to produce, named in an output attribute such as <code>outs</code> of a
+        <code>genrule</code>. <code>//docs:toc.txt</code> is generated by <code>//docs:toc</code>; building either builds the
+        file. Module 08 covers generating files.</dd>
+    </dl>
+    <p><code>--output=label_kind</code> makes <code>bazel query</code> print each target's kind. <code>//docs:*</code>
+      means "every target in <code>//docs</code>", files included (more in the next section). Predict the output, then
+      run it:</p>
+    <div class="runnable" data-predict data-title="What kinds of target are here?" data-commands="bazel query '//docs:*' --output=label_kind">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "handbook")
+</textarea>
+<textarea class="file" data-path="docs/BUILD.bazel">
+filegroup(
+    name = "pages",
+    srcs = ["intro.md"],
+)
+
+genrule(
+    name = "toc",
+    srcs = [":pages"],
+    outs = ["toc.txt"],
+    cmd = "ls $(SRCS) > $@",
+)
+</textarea>
+<textarea class="file" data-path="docs/intro.md" data-hidden></textarea>
+</div>
+    <p>Real Bazel on a slightly bigger <code>//docs</code> package (one more filegroup, <code>missing</code>, whose
+      <code>srcs</code> name a file <code>nope.md</code> that does not exist):</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">source file //docs:BUILD.bazel
+filegroup rule //docs:docs
+source file //docs:intro.md
+filegroup rule //docs:missing
+source file //docs:nope.md
+genrule rule //docs:toc
+generated file //docs:toc.txt</code></pre>
+    <h3>A missing file is not a loading error</h3>
+    <p>Look again: <code>//docs:nope.md</code> is listed as a <em>source file</em>, though no such file exists. When a rule
+      mentions a same-package file label, Bazel creates the target on trust. Query, loading, and analysis all succeed. The
+      build only fails at <strong>execution</strong>, when an action needs the file's bytes:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">INFO: Analyzed target //docs:missing (0 packages loaded, 2 targets configured).
+ERROR: /work/handbook/docs/BUILD.bazel:6:10: //docs:missing: missing input file '//docs:nope.md'
+ERROR: /work/handbook/docs/BUILD.bazel:6:10: 1 input file(s) do not exist
+Target //docs:missing failed to build
+Use --verbose_failures to see the command lines of failed build steps.
+INFO: Elapsed time: 0.210s, Critical Path: 0.00s
+INFO: 1 process: 1 internal.
+ERROR: Build did NOT complete successfully</code></pre>
+    <p>This matters for Python developers because the usual cause is a typo or a case mismatch
+      (<code>Readme.md</code> vs <code>README.md</code>), and <code>bazel query</code> will not catch it. If a build says
+      <code>missing input file</code>, compare the label with <code>ls</code>.</p>
+    <aside class="callout think">
+      <p>Why can't Bazel just check the disk while loading? Because loading must be fast and cacheable across thousands
+        of packages, and a source file can legitimately appear later (a generated file with the same name in another
+        configuration, a file a script writes before the build). Checking at execution keeps loading purely about BUILD
+        files.</p>
+    </aside>
+    <p><strong>Remember:</strong> rules are declared, source files exist (or are assumed to), generated files are promised
+      by a rule. A missing same-package file fails at execution with <code>missing input file</code>.</p>
+  </section>
+
+  <section class="lesson-section" id="patterns">
+    <h2>Target patterns: naming many targets at once</h2>
+    <aside class="callout python">
+      <p><code>pytest tests/</code> collects every test below a directory. Bazel's equivalent is a <strong>target
+        pattern</strong>: a label-like expression that expands to a set of targets. You pass patterns to
+        <code>build</code>, <code>test</code>, and <code>query</code>.</p>
+    </aside>
+    <table>
+      <thead><tr><th>Pattern</th><th>Selects</th></tr></thead>
+      <tbody>
+        <tr><td><code>//...</code></td><td>Every <em>rule</em> target in every package of the main repository</td></tr>
+        <tr><td><code>//tools/...</code></td><td>Every rule target in <code>//tools</code> and all packages below it</td></tr>
+        <tr><td><code>//app:all</code></td><td>Every rule target in <code>//app</code> only (not subpackages)</td></tr>
+        <tr><td><code>//app:*</code> or <code>//app:all-targets</code></td><td>Every target in <code>//app</code>: rules <em>and</em> files</td></tr>
+        <tr><td><code>//app:cli</code></td><td>Exactly one target</td></tr>
+        <tr><td><code>-//tools/exp/...</code></td><td>Removes those targets from what earlier patterns selected</td></tr>
+      </tbody>
+    </table>
+    <p>Three details trip people up:</p>
+    <ul>
+      <li><code>//...</code> does <strong>not</strong> include files. A package with only <code>exports_files()</code> and
+        no rules contributes nothing to <code>//...</code>.</li>
+      <li>Wildcards skip targets tagged <code>manual</code>. That is how a team keeps a slow or broken target out of
+        <code>bazel test //...</code> while still building it by name (Module 05).</li>
+      <li><code>:all</code> is a pattern, not a target. In <code>deps</code> you cannot write <code>"//lib:all"</code>; patterns
+        only work on the command line and in query.</li>
+    </ul>
+    <h3>Exclusions need <code>--</code></h3>
+    <p>A pattern starting with <code>-</code> subtracts. But to Bazel's option parser, a leading <code>-</code> looks like a
+      flag:</p>
+    <pre data-label="Terminal"><code class="language-bash">pixi run bazel build //... -//tools/exp/...</code></pre>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: Invalid options syntax: -//tools/exp/...
+Note: Negative target patterns can only appear after the end of options marker ('--'). Flags corresponding to Starlark-defined build settings always start with '--', not '-'.</code></pre>
+    <p>Put <code>--</code> (the "end of options" marker, as in many Unix tools) before the patterns. Patterns are applied
+      left to right, so the negative one goes <em>after</em> what it subtracts from:</p>
+    <pre data-label="Terminal"><code class="language-bash">pixi run bazel build -- //... -//tools/exp/...</code></pre>
+    <aside class="callout warn">
+      <p>Order matters. <code>bazel build -- -//tools/... //...</code> subtracts from nothing, then adds everything back:
+        in a real run it analyzed all 5 targets, while <code>-- //... -//tools/...</code> analyzed 3. Put exclusions
+        last.</p>
+    </aside>
+    <p>Inside <code>bazel query</code>, which has its own expression language, subtraction is an operator and needs no
+      <code>--</code>: <code>bazel query '//... - //tools/...'</code> (or <code>except</code> instead of <code>-</code>). Quote
+      the whole expression so your shell passes it as one argument.</p>
+    <p>Predict what this query prints, then run the other buttons and compare.</p>
+    <div class="runnable" data-predict data-title="Which targets does the pattern select?" data-commands="bazel query '//... - //tools/...'|bazel query //app:all|bazel query '//app:*'|bazel query //tools/...|bazel build -- //... -//tools/... -//app:cli_legacy">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "shop")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="app/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_binary", "py_test")
+
+py_binary(
+    name = "cli",
+    srcs = ["cli.py"],
+)
+
+py_binary(
+    name = "cli_legacy",
+    srcs = ["cli_legacy.py"],
+)
+
+py_test(
+    name = "cli_test",
+    srcs = ["cli_test.py"],
+)
+</textarea>
+<textarea class="file" data-path="tools/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "gen",
+    srcs = ["gen.py"],
+)
+</textarea>
+<textarea class="file" data-path="app/cli.py" data-hidden></textarea>
+<textarea class="file" data-path="app/cli_legacy.py" data-hidden></textarea>
+<textarea class="file" data-path="app/cli_test.py" data-hidden></textarea>
+<textarea class="file" data-path="tools/gen.py" data-hidden></textarea>
+</div>
+    <h3>Relative patterns</h3>
+    <p>Patterns without <code>//</code> are relative to your current directory, like file paths. From the workspace root,
+      <code>bazel build app:cli</code> is <code>//app:cli</code>. From inside <code>app/</code>, <code>bazel build :cli</code>
+      works too. Scripts and CI should always use absolute patterns so they do not depend on where they run.</p>
+    <aside class="callout pro">
+      <p>Long pattern lists belong in a file. <code>bazel build --target_pattern_file=ci/targets.txt</code> reads one
+        pattern per line (negative patterns allowed, <code>#</code> comments allowed) and is easier to review than a
+        shell one-liner. It works with <code>build</code> and <code>test</code>; <code>bazel query</code> rejects it (use
+        <code>--query_file</code> there).</p>
+    </aside>
+    <p><strong>Remember:</strong> <code>//...</code> and <code>:all</code> select rules; <code>:*</code> adds files;
+      exclusions go last, after <code>--</code>.</p>
+  </section>
+
+  <section class="lesson-section" id="commands">
+    <h2>The four everyday commands</h2>
+    <p>Every command has the shape <code>bazel &lt;command&gt; [flags] &lt;targets&gt;</code>. Here is each one on the
+      two-package <code>greeter</code> workspace from this module (<code>//app:cli</code> depends on <code>//lib</code>).</p>
+    <h3><code>bazel build</code></h3>
+    <p>Builds targets and everything they depend on. Nothing runs; outputs land under <code>bazel-bin/</code>.</p>
+    <pre data-label="Real output: the build half of the first bazel run //app:cli in a fresh workspace (Bazel 9.3.2)"><code class="language-none">INFO: Analyzed target //app:cli (95 packages loaded, 2868 targets configured).
+INFO: Found 1 target...
+Target //app:cli up-to-date:
+  bazel-bin/app/cli
+INFO: Elapsed time: 10.020s, Critical Path: 0.20s
+INFO: 12 processes: 12 internal.
+INFO: Build completed successfully, 12 total actions</code></pre>
+    <p>"95 packages loaded" is the first build in a fresh workspace: most of those packages are inside
+      <code>rules_python</code> and the Python toolchain. The next build loads almost nothing and takes well under a
+      second.</p>
+    <aside class="callout note">
+      <p>The first time you build a <code>py_binary</code> or <code>py_test</code>, rules_python 2.4.6 prints a long
+        <code>WARNING: Target @@//app:cli is using implicit __init__.py creation</code>. It is harmless here;
+        Module 03 explains it and how to silence it.</p>
+    </aside>
+    <h3><code>bazel run</code></h3>
+    <p>Builds one executable target, then runs it. Arguments for <em>your program</em> go after <code>--</code>; everything
+      before it is for Bazel:</p>
+    <pre data-label="Terminal"><code class="language-bash">pixi run bazel run //app:cli -- --name Ada</code></pre>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">INFO: Analyzed target //app:cli (0 packages loaded, 0 targets configured).
+INFO: Found 1 target...
+Target //app:cli up-to-date:
+  bazel-bin/app/cli
+INFO: Elapsed time: 0.869s, Critical Path: 0.00s
+INFO: 1 process: 1 internal.
+INFO: Build completed successfully, 1 total action
+INFO: Running command line: bazel-bin/app/cli &lt;args omitted&gt;
+Hello, Ada! Built by Bazel.</code></pre>
+    <p>Forget the <code>--</code> and Bazel tries to parse <code>--name</code> as one of its own flags:</p>
+    <pre data-label="Real output of bazel run //app:cli --name Ada (Bazel 9.3.2)"><code class="language-none">ERROR: --name :: Unrecognized option: --name</code></pre>
+    <p>And <code>run</code> needs something executable: a <code>py_binary</code> or <code>py_test</code>, not a library.</p>
+    <pre data-label="Real output of bazel run //lib (Bazel 9.3.2)"><code class="language-none">ERROR: Cannot run target //lib:lib: Not executable
+INFO: Elapsed time: 0.133s
+INFO: 0 processes.
+ERROR: Build did NOT complete successfully
+ERROR: Build failed. Not running target</code></pre>
+    <aside class="callout python">
+      <p><code>bazel run //app:cli -- --name Ada</code> is the Bazel spelling of <code>python -m app.cli --name Ada</code>.
+        The program runs from a prepared directory of its files and dependencies (its <em>runfiles</em>), with Bazel's
+        Python 3.13, not your Pixi environment's Python. Module 03 covers runfiles.</p>
+    </aside>
+    <h3><code>bazel test</code></h3>
+    <p>Builds the targets, then runs every test target among them. <code>bazel test //...</code> is the "run the whole
+      suite" command:</p>
+    <pre data-label="Real output of bazel test //... (Bazel 9.3.2)"><code class="language-none">INFO: Analyzed 3 targets (2 packages loaded, 32 targets configured).
+INFO: Found 2 targets and 1 test target...
+INFO: Elapsed time: 2.718s, Critical Path: 1.76s
+INFO: 13 processes: 12 internal, 2 linux-sandbox.
+INFO: Build completed successfully, 13 total actions
+//lib:greet_test                                                         PASSED in 1.0s
+Executed 1 out of 1 test: 1 test passes.
+There were tests whose specified size is too big. Use the --test_verbose_timeout_warnings command line option to see which ones these are.</code></pre>
+    <p>(rules_python's <code>__init__.py</code> warning is trimmed from this and the other outputs; see the note above.
+      The last line is a hint that the test finished far inside its time budget; Module 05
+      covers test sizes.)</p>
+    <p>If the patterns match no tests at all, <code>bazel test</code> builds what it found and then fails with
+      <code>ERROR: No test targets were found, yet testing was requested</code>. That usually means a typo in the pattern,
+      or tests tagged <code>manual</code>.</p>
+    <h3><code>bazel query</code></h3>
+    <p>Answers questions about the graph without building anything. Module 09 goes deep; for now, three uses:</p>
+    <pre data-label="Terminal"><code class="language-bash">pixi run bazel query //...                       # list every rule target
+pixi run bazel query //... --output=label_kind   # ...with each target's kind
+pixi run bazel query //... --output=package      # list the packages that have rules</code></pre>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">py_binary rule //app:cli
+py_test rule //lib:greet_test
+py_library rule //lib:lib</code></pre>
+    <p>Output is sorted, one label per line, which makes it ideal for scripts and for graders like the ones in this
+      course's labs.</p>
+    <p>Try all four here. The simulator never executes anything, so <code>run</code> stops at "simulated: not executed"
+      and <code>test</code> tells you which tests <em>would</em> run.</p>
+    <div class="runnable" data-title="build, run, test, query" data-commands="bazel build //app:cli|bazel run //app:cli -- --name Ada|bazel test //...|bazel query //... --output=label_kind|bazel run //lib">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "greeter")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="app/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "cli",
+    srcs = ["cli.py"],
+    deps = ["//lib"],
+)
+</textarea>
+<textarea class="file" data-path="lib/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "lib",
+    srcs = ["greet.py"],
+    visibility = ["//visibility:public"],
+)
+
+py_test(
+    name = "greet_test",
+    srcs = ["greet_test.py"],
+    deps = [":lib"],
+)
+</textarea>
+<textarea class="file" data-path="app/cli.py" data-hidden></textarea>
+<textarea class="file" data-path="lib/greet.py" data-hidden></textarea>
+<textarea class="file" data-path="lib/greet_test.py" data-hidden></textarea>
+</div>
+    <h3>Where the outputs go: convenience symlinks</h3>
+    <p>After the first build, your workspace root has four new symlinks. Bazel's real output tree lives in a cache
+      directory outside your workspace; these are shortcuts into it:</p>
+    <pre data-label="Real output of ls -l (Bazel 9.3.2, paths shortened)"><code class="language-none">bazel-bin -&gt; ~/.cache/bazel/_bazel_root/3812.../execroot/_main/bazel-out/k8-fastbuild/bin
+bazel-greeter -&gt; ~/.cache/bazel/_bazel_root/3812.../execroot/_main
+bazel-out -&gt; ~/.cache/bazel/_bazel_root/3812.../execroot/_main/bazel-out
+bazel-testlogs -&gt; ~/.cache/bazel/_bazel_root/3812.../execroot/_main/bazel-out/k8-fastbuild/testlogs</code></pre>
+    <dl>
+      <dt><code>bazel-bin</code></dt><dd>Built outputs for the current configuration. <code>bazel-bin/app/cli</code> is the
+        launcher; you can run it directly: <code>./bazel-bin/app/cli --name Grace</code> printed
+        <code>Hello, Grace! Built by Bazel.</code></dd>
+      <dt><code>bazel-testlogs</code></dt><dd>Each test's <code>test.log</code> and XML results.</dd>
+      <dt><code>bazel-out</code></dt><dd>The parent of every configuration's outputs (<code>k8-fastbuild</code> is "Linux
+        x86-64, default compilation mode").</dd>
+      <dt><code>bazel-&lt;dir&gt;</code></dt><dd>The <em>execution root</em>, the directory actions run in. Named after
+        your workspace <em>directory</em> (here <code>greeter/</code>), not the module name.</dd>
+    </dl>
+    <aside class="callout pro">
+      <p>Add <code>bazel-*</code> to <code>.gitignore</code> on day one, and tell your editor and linters to skip those
+        directories. Otherwise ruff, mypy, and IDE indexers will crawl Bazel's entire output tree.</p>
+    </aside>
+    <p><strong>Remember:</strong> <code>build</code> builds, <code>run</code> builds one executable and runs it (program
+      arguments after <code>--</code>), <code>test</code> builds and runs tests, <code>query</code> inspects without
+      building. Outputs live under <code>bazel-bin</code>.</p>
+  </section>
+
+  <section class="lesson-section" id="practice">
+    <h2>Practice</h2>
+    <p>Edit the files, press <strong>Check</strong>, and read each check's message. Open "Try commands" to run
+      <code>bazel</code> against your edits.</p>
+
+    <div class="exercise" data-id="m01-e1" data-title="Two packages from a blank page">
+      <div class="exercise-prompt">
+        <p>The workspace has <code>app/cli.py</code> (which does <code>from lib.greet import greet</code>) and
+          <code>lib/greet.py</code>, but both BUILD files are empty. Write them:</p>
+        <ul>
+          <li><code>//lib:lib</code>: a <code>py_library</code> made of <code>greet.py</code>, usable from <code>//app</code>.</li>
+          <li><code>//app:cli</code>: a <code>py_binary</code> made of <code>cli.py</code> that depends on the library.</li>
+        </ul>
+        <p><code>bazel build //...</code> must succeed.</p>
+      </div>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "greeter")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="lib/BUILD.bazel">
+</textarea>
+<textarea class="file" data-path="app/BUILD.bazel">
+</textarea>
+<textarea class="file" data-path="app/cli.py" data-hidden></textarea>
+<textarea class="file" data-path="lib/greet.py" data-hidden></textarea>
+<script type="text/x-python" class="tests">
+def test_lib_is_a_py_library(bazel):
+    t = bazel.target("//lib:lib")
+    assert t.kind == "py_library", f"//lib:lib should be a py_library, but it is a {t.kind}"
+
+def test_cli_is_a_py_binary(bazel):
+    t = bazel.target("//app:cli")
+    assert t.kind == "py_binary", f"//app:cli should be a py_binary, but it is a {t.kind}"
+
+def test_cli_depends_on_the_library(bazel):
+    deps = bazel.query("deps(//app:cli, 1)")
+    assert "//lib:lib" in deps, "//app:cli must list the library in deps: from another package that is \"//lib\""
+
+def test_everything_builds(bazel):
+    result = bazel.build("//...")
+    assert result.ok, "bazel build //... fails:\n" + result.error
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p>Each BUILD file needs its own <code>load()</code>. The library must be visible to <code>//app</code>: add
+          <code>visibility = ["//visibility:public"]</code>. From <code>app/BUILD.bazel</code> the library is
+          <code>"//lib"</code>, short for <code>"//lib:lib"</code>.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="lib/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "lib",
+    srcs = ["greet.py"],
+    visibility = ["//visibility:public"],
+)</code></pre>
+<pre data-path="app/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "cli",
+    srcs = ["cli.py"],
+    deps = ["//lib"],
+)</code></pre>
+        <p>Naming the library after its directory is what makes the short label <code>//lib</code> possible.
+          <code>visibility = ["//app:__pkg__"]</code> would also pass and is stricter: only <code>//app</code> may use it.</p>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m01-e2" data-title="Fix a label that crosses a subpackage">
+      <div class="exercise-prompt">
+        <p><code>//lib:lib</code> ships <code>lib/testdata/words.txt</code> as a data file, but <code>lib/testdata/</code>
+          is its own package, so the label in <code>data</code> is invalid. Fix the label. Keep
+          <code>lib/testdata/BUILD.bazel</code>: the package boundary should stay where it is.</p>
+      </div>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "greeter")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="lib/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "lib",
+    srcs = ["greet.py"],
+    data = ["testdata/words.txt"],
+    visibility = ["//visibility:public"],
+)
+</textarea>
+<textarea class="file" data-path="lib/testdata/BUILD.bazel">
+exports_files(["words.txt"])
+</textarea>
+<textarea class="file" data-path="lib/greet.py" data-hidden></textarea>
+<textarea class="file" data-path="lib/testdata/words.txt" data-hidden>hello</textarea>
+<script type="text/x-python" class="tests">
+def test_testdata_is_still_a_package(bazel):
+    assert "//lib/testdata" in bazel.packages(), "keep lib/testdata/BUILD.bazel: fix the label, not the boundary"
+
+def test_the_library_ships_words_txt(bazel):
+    data = bazel.query("labels(data, //lib:lib)")
+    assert data == ["//lib/testdata:words.txt"], f"labels(data, //lib:lib) is {data}; it should be the file in //lib/testdata"
+
+def test_the_library_builds(bazel):
+    result = bazel.build("//lib:lib")
+    assert result.ok, "bazel build //lib:lib fails:\n" + result.error
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p>The colon separates package from target name. The package is <code>lib/testdata</code>, so the colon goes right
+          after it.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="lib/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "lib",
+    srcs = ["greet.py"],
+    data = ["//lib/testdata:words.txt"],
+    visibility = ["//visibility:public"],
+)</code></pre>
+        <p>This works only because <code>lib/testdata/BUILD.bazel</code> calls <code>exports_files(["words.txt"])</code>.
+          Without it, the file is private to its package and you would get a visibility error instead.</p>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m01-e3" data-title="Relative or absolute?">
+      <div class="exercise-prompt">
+        <p><code>//app:cli</code> needs two libraries: <code>helpers</code>, declared in the same BUILD file, and the
+          library in <code>//lib</code>. Both labels in its <code>deps</code> are wrong. Fix them, using the
+          conventional form for each: a <code>:</code>-relative label for the same-package dependency, and the short
+          absolute form for the other package's main target.</p>
+      </div>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "greeter")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="app/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_binary", "py_library")
+
+py_library(
+    name = "helpers",
+    srcs = ["helpers.py"],
+)
+
+py_binary(
+    name = "cli",
+    srcs = ["cli.py"],
+    deps = [
+        "//app/helpers",
+        "lib",
+    ],
+)
+</textarea>
+<textarea class="file" data-path="lib/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "lib",
+    srcs = ["greet.py"],
+    visibility = ["//visibility:public"],
+)
+</textarea>
+<textarea class="file" data-path="app/cli.py" data-hidden></textarea>
+<textarea class="file" data-path="app/helpers.py" data-hidden></textarea>
+<textarea class="file" data-path="lib/greet.py" data-hidden></textarea>
+<script type="text/x-python" class="tests">
+def test_cli_builds(bazel):
+    result = bazel.build("//app:cli")
+    assert result.ok, "bazel build //app:cli fails:\n" + result.error
+
+def test_cli_depends_on_both_libraries(bazel):
+    deps = bazel.query("deps(//app:cli, 1)")
+    for want in ("//app:helpers", "//lib:lib"):
+        assert want in deps, f"//app:cli should depend on {want}"
+
+def test_same_package_label_is_relative(bazel):
+    deps = bazel.attr("//app:cli", "deps")
+    assert ":helpers" in deps, f"deps is {deps}; write the same-package library as \":helpers\""
+
+def test_other_package_label_is_short(bazel):
+    deps = bazel.attr("//app:cli", "deps")
+    assert "//lib" in deps, f"deps is {deps}; write the other package's main target as \"//lib\""
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p><code>"//app/helpers"</code> names a package <code>app/helpers</code>, which does not exist. <code>"lib"</code>
+          is relative, so it means <code>//app:lib</code>. Run <code>bazel build //app:cli</code> under "Try commands" to
+          see each error.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="app/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_binary", "py_library")
+
+py_library(
+    name = "helpers",
+    srcs = ["helpers.py"],
+)
+
+py_binary(
+    name = "cli",
+    srcs = ["cli.py"],
+    deps = [
+        ":helpers",
+        "//lib",
+    ],
+)</code></pre>
+        <p>The starter's first label fails in real Bazel with <code>no such package 'app/helpers': BUILD file not found</code>.
+          Buildifier sorts <code>deps</code> with relative labels first, which is why <code>":helpers"</code> comes before
+          <code>"//lib"</code>.</p>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m01-e4" data-title="A target pattern file for CI">
+      <div class="exercise-prompt">
+        <p>CI runs <code>bazel build --target_pattern_file=ci/targets.txt</code>, which reads one pattern per line, in
+          order (blank lines and <code>#</code> comments are ignored). Edit <code>ci/targets.txt</code> so CI builds every
+          rule target in the workspace <em>except</em> everything under <code>//tools/experimental</code> and the single
+          target <code>//app:cli_legacy</code>. Do not list targets one by one: new targets in <code>//app</code> or
+          <code>//tools</code> should be picked up automatically.</p>
+      </div>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "shop")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="ci/targets.txt">
+# One target pattern per line, applied in order.
+//app:cli
+</textarea>
+<textarea class="file" data-path="app/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_binary", "py_test")
+
+py_binary(name = "cli", srcs = ["cli.py"])
+
+py_binary(name = "cli_legacy", srcs = ["cli_legacy.py"])
+
+py_test(name = "cli_test", srcs = ["cli_test.py"])
+</textarea>
+<textarea class="file" data-path="tools/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(name = "gen", srcs = ["gen.py"])
+</textarea>
+<textarea class="file" data-path="tools/experimental/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(name = "fast_gen", srcs = ["fast_gen.py"])
+
+py_binary(name = "parallel_gen", srcs = ["parallel_gen.py"])
+</textarea>
+<textarea class="file" data-path="app/cli.py" data-hidden></textarea>
+<textarea class="file" data-path="app/cli_legacy.py" data-hidden></textarea>
+<textarea class="file" data-path="app/cli_test.py" data-hidden></textarea>
+<textarea class="file" data-path="tools/gen.py" data-hidden></textarea>
+<textarea class="file" data-path="tools/experimental/fast_gen.py" data-hidden></textarea>
+<textarea class="file" data-path="tools/experimental/parallel_gen.py" data-hidden></textarea>
+<script type="text/x-python" class="tests">
+def _patterns(bazel):
+    text = bazel.ws.files.get("ci/targets.txt", "")
+    return [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+
+def _selected(bazel):
+    # Apply the patterns left to right, as Bazel does.
+    chosen = set()
+    for p in _patterns(bazel):
+        if p.startswith("-"):
+            chosen -= set(bazel.query(p[1:]))
+        else:
+            chosen |= set(bazel.query(p))
+    return chosen
+
+def test_the_file_uses_wildcards(bazel):
+    pats = _patterns(bazel)
+    assert any("..." in p and not p.startswith("-") for p in pats), "start from a recursive pattern such as //... so new targets are picked up"
+
+def test_ci_builds_the_right_targets(bazel):
+    want = {"//app:cli", "//app:cli_test", "//tools:gen"}
+    got = _selected(bazel)
+    missing = sorted(want - got)
+    extra = sorted(got - want)
+    assert not missing and not extra, f"the patterns select {sorted(got)}; missing {missing}, should not include {extra}"
+
+def test_the_patterns_build(bazel):
+    result = bazel.build("--", *_patterns(bazel))
+    assert result.ok, "bazel build fails with these patterns:\n" + result.error
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p>Start with a pattern that selects everything, then add one negative pattern per exclusion on the following
+          lines. Negative patterns start with <code>-</code>, and order matters: exclusions come after what they subtract
+          from.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="ci/targets.txt"><code class="language-none"># One target pattern per line, applied in order.
+//...
+-//tools/experimental/...
+-//app:cli_legacy</code></pre>
+        <p>In a file, negative patterns need no <code>--</code>: there is no option parser to confuse. On the command line
+          the same thing is <code>bazel build -- //... -//tools/experimental/... -//app:cli_legacy</code>. Excluding
+          <code>//tools/...</code> instead would also drop <code>//tools:gen</code>.</p>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m01-e5" data-title="Get the files a glob lost back">
+      <div class="exercise-prompt">
+        <p><code>//docs:all_pages</code> is supposed to hold every Markdown page, but someone made <code>docs/guides/</code>
+          its own package and <code>guides/setup.md</code> and <code>guides/deploy.md</code> silently dropped out of the
+          glob. Keep <code>docs/guides</code> a package. Give it a <code>filegroup</code> named <code>pages</code> holding
+          its Markdown files, and make <code>//docs:all_pages</code> include that filegroup alongside its own glob, so
+          <code>deps(//docs:all_pages)</code> reaches all four pages.</p>
+      </div>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "handbook")
+</textarea>
+<textarea class="file" data-path="docs/BUILD.bazel">
+filegroup(
+    name = "all_pages",
+    srcs = glob(["**/*.md"]),
+)
+</textarea>
+<textarea class="file" data-path="docs/guides/BUILD.bazel">
+# This directory became a package for an unrelated reason.
+</textarea>
+<textarea class="file" data-path="docs/intro.md" data-hidden></textarea>
+<textarea class="file" data-path="docs/faq.md" data-hidden></textarea>
+<textarea class="file" data-path="docs/guides/setup.md" data-hidden></textarea>
+<textarea class="file" data-path="docs/guides/deploy.md" data-hidden></textarea>
+<script type="text/x-python" class="tests">
+def test_guides_is_still_a_package(bazel):
+    assert "//docs/guides" in bazel.packages(), "keep docs/guides/BUILD.bazel"
+
+def test_guides_has_a_pages_filegroup(bazel):
+    t = bazel.target("//docs/guides:pages")
+    assert t.kind == "filegroup", f"//docs/guides:pages should be a filegroup, but it is a {t.kind}"
+
+def test_all_pages_reaches_every_page(bazel):
+    deps = bazel.query("deps(//docs:all_pages)")
+    for want in ("//docs:intro.md", "//docs:faq.md", "//docs/guides:setup.md", "//docs/guides:deploy.md"):
+        assert want in deps, f"deps(//docs:all_pages) is missing {want}"
+
+def test_everything_builds(bazel):
+    result = bazel.build("//...")
+    assert result.ok, "bazel build //... fails:\n" + result.error
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p>In <code>docs/guides/BUILD.bazel</code>, <code>filegroup(name = "pages", srcs = glob(["*.md"]), ...)</code>. It
+          is private by default, so <code>//docs</code> cannot use it until you add <code>visibility</code>. In
+          <code>docs/BUILD.bazel</code>, a list plus a list is a list: <code>glob([...]) + ["//docs/guides:pages"]</code>.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="docs/guides/BUILD.bazel"><code class="language-starlark">filegroup(
+    name = "pages",
+    srcs = glob(["*.md"]),
+    visibility = ["//docs:__pkg__"],
+)</code></pre>
+<pre data-path="docs/BUILD.bazel"><code class="language-starlark">filegroup(
+    name = "all_pages",
+    srcs = glob(["**/*.md"]) + ["//docs/guides:pages"],
+)</code></pre>
+        <p>Each package owns its files and exposes them through a target. That is the general pattern: when a subdirectory
+          becomes a package, the parent stops globbing its files and depends on a target there instead.</p>
+      </details>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="lab">
+    <h2>Labs: packages for real</h2>
+    <p>The exercises proved your labels are valid. The simulator cannot show the binary printing, pass arguments through
+      <code>--</code>, run a test, write <code>bazel-bin/</code>, or hit a <code>missing input file</code> at execution
+      time. These two labs do all of that with real Bazel.</p>
+
+    <div class="lab" data-id="m01-lab1" data-title="Two packages and a label between them">
+      <div class="lab-prompt">
+        <p>The <code>greeter</code> workspace has <code>app/cli.py</code> and a <code>lib/</code> directory with
+          <code>greet.py</code> and <code>greet_test.py</code>, but <code>lib/</code> is not a package yet and
+          <code>//app:cli</code> does not depend on it. Make <code>//lib</code> a package with a library and a test, and
+          make <code>bazel run //app:cli -- --name Ada</code> print exactly:</p>
+        <pre data-label="Expected stdout"><code class="language-none">Hello, Ada! Built by Bazel.</code></pre>
+        <ul class="checklist" data-id="m01-lab1-steps">
+          <li>Run <code>pixi run start m01-lab1</code>, then <code>cd work/m01-lab1</code></li>
+          <li>Run <code>pixi run bazel run //app:cli -- --name Ada</code> and read the Python traceback: which import fails?</li>
+          <li>Create <code>lib/BUILD.bazel</code> with a <code>py_library</code> named <code>lib</code> and a
+            <code>py_test</code> named <code>greet_test</code>; check with <code>pixi run bazel query //lib:all</code></li>
+          <li>Add the library to <code>//app:cli</code>'s <code>deps</code>; fix the visibility error if you get one</li>
+          <li>Run the binary again, then <code>pixi run bazel test //...</code>, then look at <code>bazel-bin/app/</code></li>
+          <li>Back at the repository root, run <code>pixi run grade m01-lab1</code></li>
+        </ul>
+      </div>
+      <details class="hint"><summary>Hint</summary>
+        <p>It is exercise 1 plus a <code>py_test</code>. The starter builds, but fails at run time with
+          <code>ModuleNotFoundError: No module named 'lib.greet'</code>: Bazel only puts declared dependencies on the Python
+          path. The grader checks <code>query //lib:all</code>, <code>deps(//app:cli, 1)</code>, the program's exact
+          stdout, <code>bazel test //...</code>, and that <code>bazel-bin/app/cli</code> exists.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-label="lib/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "lib",
+    srcs = ["greet.py"],
+    visibility = ["//visibility:public"],
+)
+
+py_test(
+    name = "greet_test",
+    srcs = ["greet_test.py"],
+    deps = [":lib"],
+)</code></pre>
+<pre data-label="app/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "cli",
+    srcs = ["cli.py"],
+    deps = ["//lib"],
+)</code></pre>
+        <p>Note the two labels for the same library: <code>":lib"</code> from inside <code>//lib</code>,
+          <code>"//lib"</code> from <code>//app</code>.</p>
+      </details>
+    </div>
+
+    <div class="lab" data-id="m01-lab2" data-title="Package boundaries and missing files">
+      <div class="lab-prompt">
+        <p>The <code>handbook</code> workspace concatenates Markdown pages into <code>bazel-bin/docs/handbook.txt</code>
+          with a <code>genrule</code>. Its BUILD file has two bugs, and they fail in different phases. Fix both so the
+          handbook contains every page, including <code>docs/guides/setup.md</code> and <code>docs/CHANGES.md</code>, without
+          deleting the <code>docs/guides</code> package.</p>
+        <ul class="checklist" data-id="m01-lab2-steps">
+          <li>Run <code>pixi run start m01-lab2</code>, then <code>cd work/m01-lab2</code></li>
+          <li>Run <code>pixi run bazel build //docs:handbook</code>. The first error comes from loading: follow its suggestion</li>
+          <li>Build again. The second error comes from execution: compare the label with <code>ls docs/</code></li>
+          <li>Read <code>bazel-bin/docs/handbook.txt</code>, then run <code>pixi run grade m01-lab2</code> from the repository root</li>
+        </ul>
+      </div>
+      <details class="hint"><summary>Hint</summary>
+        <p>Bug one is this module's subpackage-crossing error, almost word for word. Bug two is a
+          <code>missing input file</code>: the label names a file that does not exist. Notice that
+          <code>bazel query //docs:all</code> succeeds with bug two still present.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-label="docs/BUILD.bazel"><code class="language-starlark">filegroup(
+    name = "pages",
+    srcs = [
+        "index.md",
+        "about.md",
+    ],
+)
+
+genrule(
+    name = "handbook",
+    srcs = [
+        ":pages",
+        "//docs/guides:setup.md",
+        "CHANGES.md",
+    ],
+    outs = ["handbook.txt"],
+    cmd = "cat $(SRCS) &gt; $@",
+)</code></pre>
+        <p>The real errors, in order. First, while loading:</p>
+        <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: /work/m01-lab2/docs/BUILD.bazel:10:8: Label '//docs:guides/setup.md' is invalid because 'docs/guides' is a subpackage; perhaps you meant to put the colon here: '//docs/guides:setup.md'?</code></pre>
+        <p>Then, after analysis succeeded, while executing:</p>
+        <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">INFO: Analyzed target //docs:handbook (7 packages loaded, 13 targets configured).
+ERROR: /work/m01-lab2/docs/BUILD.bazel:10:8: Executing genrule //docs:handbook failed: missing input file '//docs:CHANGELOG.md'</code></pre>
+      </details>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="quiz">
+    <h2>Quiz</h2>
+    <div class="quiz" data-id="m01-quiz">
+<script type="application/json">
+{"title": "Workspaces, packages, and targets quiz", "passScore": 0.7, "questions": [
+  {"type": "single", "prompt": "Which file marks the root of a Bazel 9 workspace?", "options": ["WORKSPACE", "BUILD.bazel", "MODULE.bazel", ".bazelversion"], "answer": 2, "explanation": "<p>Bazel walks up from the current directory to the nearest <code>MODULE.bazel</code>. Even an empty one works. <code>WORKSPACE</code> was removed in Bazel 9; <code>.bazelversion</code> only tells Bazelisk which Bazel to run.</p>"},
+  {"type": "single", "prompt": "A directory contains both <code>BUILD</code> and <code>BUILD.bazel</code>. What does Bazel do?", "options": ["Reads both and merges their targets", "Reads BUILD.bazel and ignores BUILD", "Reads BUILD and ignores BUILD.bazel", "Fails with an ambiguity error"], "answer": 1, "explanation": "<p><code>BUILD.bazel</code> takes precedence, silently. Targets declared only in <code>BUILD</code> do not exist.</p>"},
+  {"type": "text", "prompt": "Inside <code>app/BUILD.bazel</code>, write the full absolute label that <code>\":cli\"</code> stands for.", "answer": ["//app:cli"], "explanation": "<p>A label starting with <code>:</code> is relative to the current package, here <code>//app</code>.</p>"},
+  {"type": "single", "prompt": "What does the label <code>//services/billing</code> mean?", "options": ["Every target in the billing package", "The target <code>billing</code> in package <code>services/billing</code>", "The directory services/billing", "The target <code>services/billing</code> in the root package"], "answer": 1, "explanation": "<p>Without a colon, the target name defaults to the last component of the package path: <code>//services/billing:billing</code>.</p>"},
+  {"type": "single", "prompt": "<code>lib/data/</code> has its own BUILD file. Does <code>lib/BUILD.bazel</code> load?", "code": "filegroup(\n    name = \"fixtures\",\n    srcs = [\"data/users.json\"],\n)", "lang": "starlark", "options": ["Yes: the file exists on disk", "No: Label '//lib:data/users.json' is invalid because 'lib/data' is a subpackage", "Yes, but the build fails later with missing input file", "Yes, with a warning suggesting exports_files"], "answer": 1, "explanation": "<p>A label cannot reach into a subpackage. Bazel reports it while loading <code>//lib</code> and suggests <code>//lib/data:users.json</code>. That file also has to be exported by <code>lib/data/BUILD.bazel</code>.</p>"},
+  {"type": "output", "prompt": "<code>docs/guides/</code> has a BUILD file. What does <code>bazel query 'labels(srcs, //docs:all_md)'</code> print?", "code": "# docs/ contains: BUILD.bazel  intro.md  guides/BUILD.bazel  guides/setup.md\nfilegroup(\n    name = \"all_md\",\n    srcs = glob([\"**/*.md\"]),\n)", "lang": "starlark", "answer": "//docs:intro.md", "explanation": "<p>A glob never descends into a subpackage, so <code>guides/setup.md</code> is not matched. No error, no warning: the file is just gone from the list.</p>"},
+  {"type": "single", "prompt": "<code>srcs = [\"main.py\"]</code>, but the file is called <code>Main.py</code> on a case-sensitive file system. When does Bazel report it?", "options": ["While loading the BUILD file", "During analysis, as no such target", "During execution, as missing input file '//pkg:main.py'", "Never: Bazel finds the file case-insensitively"], "answer": 2, "explanation": "<p>Same-package file labels become source file targets without checking the disk. Query and analysis succeed; the action that needs the file fails at execution with <code>missing input file</code>.</p>"},
+  {"type": "multi", "prompt": "Which of these are <strong>rule</strong> targets? Select all that apply.", "code": "genrule(\n    name = \"toc\",\n    srcs = [\"intro.md\"],\n    outs = [\"toc.txt\"],\n    cmd = \"ls $(SRCS) > $@\",\n)", "lang": "starlark", "options": ["//docs:toc", "//docs:toc.txt", "//docs:intro.md", "//docs:BUILD.bazel"], "answer": [0], "explanation": "<p>Only <code>toc</code> is declared by calling a rule. <code>toc.txt</code> is a generated file, and <code>intro.md</code> and the BUILD file are source files.</p>"},
+  {"type": "output", "prompt": "<code>//app</code> has a <code>py_binary</code> named <code>cli</code> whose <code>srcs</code> are <code>[\"cli.py\"]</code>, and <code>//app/admin</code> has a <code>py_binary</code> named <code>admin</code>. What does <code>bazel query //app:all</code> print?", "answer": "//app:cli", "explanation": "<p><code>:all</code> means rule targets in this one package. It does not include files (that is <code>:*</code>) and does not descend into <code>//app/admin</code> (that is <code>//app/...</code>).</p>"},
+  {"type": "single", "prompt": "What does <code>bazel query '//app:*'</code> add compared with <code>//app:all</code>?", "options": ["Subpackages of //app", "Targets tagged manual", "File targets, such as //app:cli.py and //app:BUILD.bazel", "External dependencies"], "answer": 2, "explanation": "<p><code>:*</code> (also spelled <code>:all-targets</code>) selects every target in the package, rules and files.</p>"},
+  {"type": "single", "prompt": "What happens with <code>bazel build //... -//tools/...</code>?", "options": ["Builds everything except //tools/...", "Builds everything, ignoring the second pattern", "Fails: Invalid options syntax; negative patterns must come after --", "Builds only //tools/..."], "answer": 2, "explanation": "<p>The leading <code>-</code> makes Bazel's option parser treat it as a flag. Write <code>bazel build -- //... -//tools/...</code>.</p>"},
+  {"type": "text", "prompt": "Complete the command so the program receives <code>--name Ada</code>: <code>bazel run //app:cli ___ --name Ada</code>", "answer": ["--"], "explanation": "<p>Everything after <code>--</code> goes to your program. Without it, Bazel reports <code>Unrecognized option: --name</code>.</p>"},
+  {"type": "single", "prompt": "In <code>app/BUILD.bazel</code>, <code>deps = [\"lib\"]</code> was meant to point at <code>//lib:lib</code>. What does Bazel report?", "options": ["Nothing: Bazel finds //lib automatically", "rule '//app:lib' does not exist", "no such package 'lib'", "invalid label 'lib'"], "answer": 1, "explanation": "<p>A label without <code>//</code> is relative to the current package, so <code>\"lib\"</code> means <code>//app:lib</code>. Use <code>\"//lib\"</code>.</p>"},
+  {"type": "single", "prompt": "Where does <code>bazel build //app:cli</code> put the launcher for the binary?", "options": ["app/cli", "bazel-bin/app/cli", "bazel-out/app/cli", "dist/cli"], "answer": 1, "explanation": "<p><code>bazel-bin</code> is a symlink into the output tree for the current configuration, mirroring the package path. Never commit any <code>bazel-*</code> symlink.</p>"}
+]}
+</script>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="recap">
+    <h2>Recap</h2>
+    <ul>
+      <li>The workspace root is the nearest directory with <code>MODULE.bazel</code>; <code>//</code> always means that root.
+        <code>module(name = ...)</code> names your module.</li>
+      <li>A package is a directory with <code>BUILD.bazel</code> (or <code>BUILD</code>; <code>BUILD.bazel</code> wins), owning
+        every file down to the next BUILD file. Packages do not inherit anything from parent directories.</li>
+      <li>Globs stop at subpackages silently. Labels that reach into a subpackage fail while loading, with a suggestion
+        to move the colon.</li>
+      <li>A label is <code>@repo//package:name</code>. <code>//pkg</code> means <code>//pkg:pkg</code>; <code>:name</code> and
+        <code>name</code> are relative to the current package; <code>@rules_python//...</code> comes from a <code>bazel_dep</code>.</li>
+      <li>Targets are rules (declared), source files (exist, or are assumed to), or generated files (promised by a rule). A
+        missing same-package file fails at execution: <code>missing input file</code>.</li>
+      <li><code>//...</code> and <code>:all</code> select rule targets; <code>:*</code> adds files; exclusions come last, after
+        <code>--</code>.</li>
+      <li><code>build</code>, <code>run</code> (program arguments after <code>--</code>), <code>test</code>, and
+        <code>query</code> cover daily work. Outputs live under <code>bazel-bin</code>, test logs under
+        <code>bazel-testlogs</code>.</li>
+    </ul>
+    <div class="flashcards" data-title="Workspaces, packages, and targets">
+<script type="application/json">
+[
+  {"front": "What makes a directory the workspace root?", "back": "It contains MODULE.bazel (even an empty one). Bazel searches upward from the current directory for it."},
+  {"front": "What is a package?", "back": "A directory with a BUILD.bazel or BUILD file, plus everything below it that is not inside another package."},
+  {"front": "BUILD and BUILD.bazel in one directory?", "back": "BUILD.bazel is read; BUILD is silently ignored."},
+  {"front": "What does <code>//lib</code> mean as a label?", "back": "//lib:lib, the target named after the package's last directory."},
+  {"front": "<code>:helpers</code> vs <code>//app:helpers</code>?", "back": "The same target when written in app/BUILD.bazel. Use the relative form inside the package."},
+  {"front": "Why does <code>//lib:testdata/words.txt</code> fail when lib/testdata has a BUILD file?", "back": "The file belongs to //lib/testdata. Move the colon: //lib/testdata:words.txt (and export the file)."},
+  {"front": "Does <code>glob([\"**/*.py\"])</code> see files in a subpackage?", "back": "No. Globs stop at any directory with its own BUILD file, silently."},
+  {"front": "When does a typo in a same-package <code>srcs</code> file name fail?", "back": "At execution: missing input file '//pkg:name'. Loading, analysis, and query all succeed."},
+  {"front": "<code>//pkg:all</code> vs <code>//pkg:*</code>?", "back": ":all is the rule targets in the package; :* (or :all-targets) adds every file target too."},
+  {"front": "How do you exclude targets from a build?", "back": "bazel build -- //... -//tools/... : negative patterns after --, and after what they subtract from."},
+  {"front": "How do you pass arguments to the program in <code>bazel run</code>?", "back": "After --: bazel run //app:cli -- --name Ada"},
+  {"front": "What are the four convenience symlinks?", "back": "bazel-bin (outputs), bazel-testlogs (test logs), bazel-out (all configurations), bazel-&lt;dir&gt; (execution root)."}
+]
+</script>
+    </div>
+    <h3>Going further</h3>
+    <ul>
+      <li><a href="https://bazel.build/concepts/build-ref">Workspaces, packages, and targets</a> on bazel.build</li>
+      <li><a href="https://bazel.build/concepts/labels">Labels</a>: the full syntax, including canonical <code>@@</code> names</li>
+      <li><a href="https://bazel.build/run/build#specifying-build-targets">Specifying targets to build</a>: every target pattern form</li>
+      <li><a href="https://bazel.build/concepts/build-files">BUILD files</a> and <a href="https://bazel.build/reference/be/functions#glob">glob()</a></li>
+      <li><a href="https://bazel.build/docs/user-manual">Commands and options</a>: <code>build</code>, <code>run</code>, <code>test</code></li>
+      <li><a href="https://bazel.build/remote/output-directories">Output directory layout</a>: what the <code>bazel-*</code> symlinks point at</li>
+      <li><a href="https://rules-python.readthedocs.io/">rules_python documentation</a> and the <a href="https://registry.bazel.build/">Bazel Central Registry</a></li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>

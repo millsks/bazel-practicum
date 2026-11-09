@@ -1,0 +1,2 @@
+# The catalog is plain data: no rules, just a file other packages may use.
+exports_files(["prices.json"])

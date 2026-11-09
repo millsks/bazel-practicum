@@ -1,0 +1,27 @@
+[[check]]
+name = "the workspace builds"
+command = ["build", "//..."]
+message = "Run `pixi run bazel build //...` in work/m03-lab1 and read the first ERROR line."
+
+[[check]]
+name = "the unit tests pass"
+command = ["test", "//...", "--test_output=errors"]
+message = "The inventory tests should pass untouched; did an edit break report/inventory.py?"
+
+[[check]]
+name = "prices.json is a data dependency of //report:summary"
+command = ["query", "labels(data, //report:summary)"]
+stdout_lines = ["//catalog:prices.json"]
+message = "Add the JSON file to the binary's `data` attribute (and export it from //catalog so //report may use it)."
+
+[[check]]
+name = "bazel run //report:summary prints the summary"
+command = ["run", "//report:summary"]
+stdout_equals = "3 items, total value 45.50"
+message = "Run `pixi run bazel run //report:summary` in work/m03-lab1 and read the traceback."
+
+[[check]]
+name = "the binary finds its data from any working directory"
+command = ["run", "--run_under=cd /tmp &&", "//report:summary"]
+stdout_equals = "3 items, total value 45.50"
+message = "A path like open(\"catalog/prices.json\") depends on the current directory. Look the file up with the rules_python runfiles library: r.Rlocation(\"_main/catalog/prices.json\")."

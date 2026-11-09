@@ -1,0 +1,19 @@
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "textstats",
+    srcs = [
+        "src/textstats/__init__.py",
+        "src/textstats/counting.py",
+    ],
+    # Put libs/textstats/src on sys.path, so `import textstats` works (like `pip install -e .` would).
+    imports = ["src"],
+    visibility = ["//visibility:public"],
+)
+
+py_test(
+    name = "counting_test",
+    srcs = ["tests/test_counting.py"],
+    main = "tests/test_counting.py",
+    deps = [":textstats"],
+)
