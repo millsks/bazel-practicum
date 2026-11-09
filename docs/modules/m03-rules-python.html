@@ -95,8 +95,9 @@ py_test(
 </div>
     <aside class="callout warn">
       <p><code>srcs</code> takes files <em>of this package</em>. A common first attempt is
-        <code>srcs = ["hello.py", "//lib:greeting.py"]</code>, borrowing another package's file. Bazel rejects it with
-        a visibility error, and even when allowed it would copy the file into your target. Depend on the
+        <code>srcs = ["hello.py", "//lib:greeting.py"]</code>, borrowing another package's file. Real Bazel rejects
+        it: <code>no such target '//lib:greeting.py'</code> if <code>lib/BUILD.bazel</code> never mentions the file, or a
+        visibility error if a rule there uses it. Even when allowed, the file would belong to two targets. Depend on the
         <code>py_library</code> that owns the file instead.</p>
     </aside>
     <p><strong>Remember:</strong> <code>srcs</code> is what you own, <code>deps</code> is what you import,
@@ -269,7 +270,8 @@ py_binary(
     <pre data-label="data/BUILD.bazel"><code class="language-starlark">exports_files(["prices.json"])</code></pre>
     <p>The file lives in another package, so <code>data/BUILD.bazel</code> must let other packages refer to it.
       <code>exports_files</code> does that (M02). Without it, real Bazel says:</p>
-    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: /home/claude/bazel-practicum/build/scratch-m03/ws2/app/BUILD.bazel:34:10: no such target '//data:prices.json': target 'prices.json' not declared in package 'data' defined by /home/claude/bazel-practicum/build/scratch-m03/ws2/data/BUILD.bazel; however, a source file of this name exists.  (Perhaps add 'exports_files(["prices.json"])' to data/BUILD.bazel?) and referenced by '//app:total'</code></pre>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: /home/claude/bazel-practicum/build/scratch-m03/demo/app/BUILD.bazel:15:10: no such target '//data:prices.json': target 'prices.json' not declared in package 'data' defined by /home/claude/bazel-practicum/build/scratch-m03/demo/data/BUILD.bazel; however, a source file of this name exists.  (Perhaps add 'exports_files(["prices.json"])' to data/BUILD.bazel?) and referenced by '//app:prices'
+ERROR: Analysis of target '//app:prices' failed; build aborted: Analysis failed</code></pre>
     <p>After a build, the runfiles tree for <code>//app:prices</code> looks like this (abridged: the interpreter and
       the virtual environment rules_python creates are left out):</p>
     <pre data-label="bazel-bin/app/prices.runfiles/ (abridged)"><code class="language-none">MANIFEST
@@ -691,7 +693,8 @@ rules_python_config.explicit_init_py(default = True)</code></pre>
     <div class="exercise" data-id="m03-e1" data-title="Split a library into its own package">
       <div class="exercise-prompt">
         <p><code>//app:hello</code> tries to use <code>greeting.py</code> from the <code>lib</code> package by listing it
-          in its own <code>srcs</code>. That fails with a visibility error, and it is the wrong shape anyway.</p>
+          in its own <code>srcs</code>. That fails analysis (run <code>bazel build //...</code> under "Try commands"), and it
+          is the wrong shape anyway.</p>
         <p>Make <code>lib/greeting.py</code> a <code>py_library</code> named <code>//lib:greeting</code>, visible only to
           the <code>app</code> package (not public), and have <code>//app:hello</code> depend on it. The binary's
           <code>srcs</code> should list only its own file.</p>

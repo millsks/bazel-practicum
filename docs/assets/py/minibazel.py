@@ -894,8 +894,9 @@ class Workspace:
         mod.pip_hubs = {k: v for k, v in mod.pip_hubs.items() if k in mod.repos}
 
     def visible_repos(self) -> set[str]:
-        """Repositories the main repository can see by apparent name."""
-        return {*self.module.deps, *self.module.repos, "bazel_tools", ""}
+        """Repositories the main repository can see by apparent name (its own module name included)."""
+        own = {self.module.name} if self.module.name else set()
+        return {*self.module.deps, *self.module.repos, *own, "bazel_tools", ""}
 
     # ------------------------------------------------------------------ packages
 
@@ -1329,6 +1330,8 @@ class Workspace:
         """Return the target for ``label`` or raise BazelError like Bazel does."""
         if isinstance(label, str):
             label = parse_label(label)
+        if label.repo and label.repo == self.module.name and label.repo not in self.module.deps:
+            label = Label("", label.package, label.name)  # @<own module name>//pkg:x is the main repository
         if label.repo:
             return self._external_target(label)
         pkg = self.package(label.package)
@@ -1512,6 +1515,10 @@ class Config:
             args = _expand_bazelrc(ws, args)
         while i < len(args):
             a = args[i]
+            if a == "--":
+                # everything after "--" is a target pattern (negative patterns such as -//x/... are allowed only here)
+                rest.extend(["--", *args[i + 1 :]])
+                break
 
             def take(a: str = a) -> str:
                 nonlocal i
@@ -1552,14 +1559,84 @@ class Config:
                 cfg.flags[str(parse_label(key))] = value
             elif a.startswith("--no//") or a.startswith("--no@"):
                 cfg.flags[str(parse_label(a[4:]))] = "false"
-            elif a.startswith("--"):
-                name, eq, val = a[2:].partition("=")
-                cfg.values[name] = val if eq else "true"
+            elif a.startswith("-") and a[1:2] in ("/", "@", ":"):
+                raise BazelError(f"Invalid options syntax: {a}")
+            elif a.startswith("-"):
+                name, eq, val = a.lstrip("-").partition("=")
+                bare = name[2:] if name.startswith("no") and name[2:] in _BOOLEAN_OPTIONS else name
+                if not a.startswith("--") or (name not in _KNOWN_OPTIONS and bare not in _BOOLEAN_OPTIONS):
+                    raise BazelError(f"{a.split('=', 1)[0]} :: Unrecognized option: {a.split('=', 1)[0]}")
+                if name in _VALUE_OPTION_NAMES and not eq:
+                    val = take()
+                    eq = "="
+                cfg.values[bare] = val if eq else ("false" if bare != name else "true")
             else:
                 rest.append(a)
             i += 1
         cfg.values.setdefault("compilation_mode", cfg.compilation_mode)
         return cfg, rest
+
+
+# Options the simulator accepts and ignores beyond recording them for config_setting(values = ...). Anything else
+# is rejected the way Bazel rejects it: "ERROR: --name :: Unrecognized option: --name".
+_VALUE_OPTION_NAMES = frozenset(
+    {
+        "output",
+        "test_output",
+        "test_arg",
+        "test_env",
+        "action_env",
+        "disk_cache",
+        "remote_cache",
+        "run_under",
+        "jobs",
+        "universe_scope",
+        "copt",
+        "cpu",
+        "host_platform",
+        "extra_toolchains",
+        "test_timeout",
+        "runs_per_test",
+        "flaky_test_attempts",
+        "color",
+        "curses",
+        "repo_env",
+        "stamp",
+        "target_pattern_file",
+        "query_file",
+        "test_filter",
+        "test_sharding_strategy",
+        "python_version",
+    }
+)
+_BOOLEAN_OPTIONS = frozenset(
+    {
+        "keep_going",
+        "build_tests_only",
+        "nobuild",
+        "build",
+        "implicit_deps",
+        "tool_deps",
+        "infer_universe_scope",
+        "verbose_failures",
+        "subcommands",
+        "sandbox_debug",
+        "announce_rc",
+        "check_up_to_date",
+        "cache_test_results",
+        "test_verbose_timeout_warnings",
+        "toolchain_resolution_debug",
+        "show_progress",
+        "experimental_ui_debug_all_events",
+        "incompatible_default_to_explicit_init_py",
+        "stamp",
+        "enable_bzlmod",
+        "incompatible_strict_action_env",
+        "remote_upload_local_results",
+        "order_output",
+    }
+)
+_KNOWN_OPTIONS = _VALUE_OPTION_NAMES | _BOOLEAN_OPTIONS
 
 
 def _expand_bazelrc(ws: Workspace, args: list[str]) -> list[str]:
@@ -1650,20 +1727,24 @@ class _Analyzer:
         if not matching:
             if "//conditions:default" in conditions:
                 return conditions["//conditions:default"]
-            keys = "\n".join(f" {k}" for k in conditions)
-            msg = no_match or (
-                f'Configurable attribute "{attr}" doesn\'t match this configuration (would a default condition '
-                f"help?).\nConditions checked:\n{keys}"
+            keys = "\n".join(f" {parse_label(k, package)}" for k in conditions)
+            head = f'configurable attribute "{attr}" in {target.label} doesn\'t match this configuration'
+            msg = (
+                f"{head}: {no_match}"
+                if no_match
+                else f"{head}. Would a default condition help?\n\nConditions checked:\n{keys}\n\n"
+                "To see a condition's definition, run: bazel query --output=build <condition label>."
             )
-            raise BazelError(f"{target.location}: {target.label}: {msg}")
+            raise BazelError(f"{target.location}: {msg}")
         if len(matching) > 1:
             specialized = [m for m in matching if all(self._refines(m[1], o[1]) for o in matching if o is not m)]
             if len(specialized) != 1:
-                names = ", ".join(str(m[0]) for m in matching)
+                names = "\n".join(sorted(str(m[0]) for m in matching))
                 raise BazelError(
-                    f"{target.location}: {target.label}: Illegal ambiguous match on configurable attribute "
+                    f"{target.location}: Illegal ambiguous match on configurable attribute "
                     f'"{attr}" in {target.label}:\n{names}\nMultiple matches are not allowed unless one is '
-                    "unambiguously more specialized or they resolve to the same value."
+                    "unambiguously more specialized or they resolve to the same value. "
+                    "See https://bazel.build/reference/be/functions#select."
                 )
             matching = specialized
         original = next(
@@ -2035,7 +2116,7 @@ class _Analyzer:
 # ------------------------------------------------------------------------------------------- query
 
 
-_TOKEN = re.compile(r"\s*(?:(\()|(\))|(,)|(\+|\^|-(?=\s))|\"([^\"]*)\"|'([^']*)'|([^\s(),\"']+))")
+_TOKEN = re.compile(r"\s*(?:(\()|(\))|(,)|(\+|\^|-(?=[\s/@:]))|\"([^\"]*)\"|'([^']*)'|([^\s(),\"']+))")
 
 
 # Functions `bazel query` accepts (Bazel 9.3.2's list; allrdeps also needs --universe_scope or
@@ -2084,7 +2165,8 @@ class _Query:
         result = self._expr()
         if self.pos != len(self.tokens):
             raise BazelError(f"syntax error at '{self.tokens[self.pos][1]}'")
-        return sorted(result, key=lambda lbl: (lbl.repo != "", str(lbl)))
+        # Bazel sorts by repository, then package, then name: //tools:gen before //tools/exp:x.
+        return sorted(result, key=lambda lbl: (lbl.repo != "", lbl.repo, lbl.package, lbl.name))
 
     def _tokenize(self, expr: str) -> list[tuple[str, str]]:
         out: list[tuple[str, str]] = []
@@ -2577,16 +2659,19 @@ class Bazel:
         return [str(lbl) for lbl in q.run(expr)]
 
     def _expand(self, patterns: list[str], *, skip_manual: bool) -> tuple[set[Label], set[Label]]:
+        # Patterns apply left to right: "-- //... -//x/..." excludes, "-- -//x/... //..." adds them back.
         include: set[Label] = set()
         exclude: set[Label] = set()
         q = _Query(self.ws, None, configured=False)
         q.skip_manual = skip_manual
         for p in patterns:
             if p.startswith("-"):
-                exclude |= q.pattern(p[1:])
+                removed = q.pattern(p[1:])
+                include -= removed
+                exclude |= removed
             else:
                 include |= q.pattern(p)
-        return include - exclude, exclude
+        return include, exclude
 
     def build(self, *args: str) -> Result:
         """``bazel build PATTERNS [flags]`` up to the end of analysis (nothing is compiled)."""
@@ -2701,10 +2786,12 @@ class Bazel:
             if cmd in ("build", "test"):
                 return self._build(cmd, rest)
             if cmd == "run":
-                res = self._build("build", [rest[0]] if rest else [])
+                if "--" in rest:
+                    rest = rest[: rest.index("--")]  # what follows "--" is the program's own arguments
+                res = self._build("build", rest)
                 if not res.ok:
                     return res
-                t = self.target(rest[0])
+                t = self.target(next(a for a in rest if not a.startswith("-")))
                 if t.rule_class is None or not t.rule_class.executable:
                     msg = f"Cannot run target {t.label}: Not executable"
                     return Result(False, f"ERROR: {msg}", [msg])
