@@ -1,0 +1,32 @@
+load("@bazel_skylib//rules:diff_test.bzl", "diff_test")
+load("@bazel_skylib//rules:run_binary.bzl", "run_binary")
+load("@rules_python//python:defs.bzl", "py_library")
+
+# catalog.py is generated from catalog.csv at build time. It is never checked in:
+# it lives in bazel-bin/data/, and Bazel puts it on the import path.
+run_binary(
+    name = "catalog_gen",
+    srcs = ["catalog.csv"],
+    outs = ["catalog.py"],
+    args = [
+        "$(location catalog.csv)",
+        "$(location catalog.py)",
+    ],
+    tool = "//tools/catalog_gen",
+)
+
+# Import it as `from data.catalog import PRODUCTS`. Only the pricing library may.
+py_library(
+    name = "catalog",
+    srcs = [":catalog.py"],
+    visibility = ["//libs/pricing:__pkg__"],
+)
+
+# The reviewed copy. When the generator or the CSV changes on purpose, copy
+# bazel-bin/data/catalog.py over catalog.golden.py and review the diff.
+diff_test(
+    name = "catalog_golden_test",
+    size = "small",
+    file1 = ":catalog.py",
+    file2 = "catalog.golden.py",
+)

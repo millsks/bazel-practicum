@@ -1,0 +1,17 @@
+load("@bazel_skylib//rules:common_settings.bzl", "string_flag")
+
+# Which sales region a build is for: bazel build --//config:region=eu ...
+string_flag(
+    name = "region",
+    build_setting_default = "us",
+    values = [
+        "us",
+        "eu",
+    ],
+)
+
+config_setting(
+    name = "eu",
+    flag_values = {":region": "eu"},
+    visibility = ["//visibility:public"],
+)

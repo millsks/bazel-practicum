@@ -1,0 +1,33 @@
+[[check]]
+name = "the dependency graph resolves with no version surprises"
+command = ["mod", "graph", "--depth=1", "--check_direct_dependencies=error"]
+message = "Read the first ERROR line. A bazel_dep that asks for an older version than Minimal Version Selection picks is an error under --check_direct_dependencies=error: ask for the version `bazel mod graph` shows."
+
+[[check]]
+name = "textkit comes from vendor/textkit through local_path_override"
+command = ["mod", "show_repo", "textkit"]
+output_contains = ["local_repository(", "path = \"vendor/textkit\""]
+message = "textkit is not in the registry. Add bazel_dep(name = \"textkit\", version = \"0.3.0\") and local_path_override(module_name = \"textkit\", path = \"vendor/textkit\")."
+
+[[check]]
+name = "the docs package loads skylib as @skylib"
+command = ["query", "//docs:all"]
+stdout_lines = ["//docs:page", "//docs:title"]
+message = "docs/BUILD.bazel loads from @skylib. Give the bazel_skylib dependency that apparent name with repo_name, rather than editing the BUILD file."
+
+[[check]]
+name = "rules_shell is a dev dependency"
+command = ["mod", "graph", "--depth=1", "--ignore_dev_dependency", "--override_module=textkit=%workspace%/vendor/textkit"]
+stdout_contains = ["bazel_skylib@"]
+stdout_lacks = ["rules_shell"]
+message = "Only tests use rules_shell, so a module depending on handbook should not inherit it: add dev_dependency = True to its bazel_dep."
+
+[[check]]
+name = "bazel test //... passes"
+command = ["test", "//...", "--check_direct_dependencies=error", "--test_output=errors"]
+message = "Run `pixi run bazel test //... --test_output=errors` in work/m04-lab2."
+
+[[check]]
+name = "the page was built"
+file_exists = ["bazel-bin/docs/page.txt"]
+message = "bazel test //... builds //docs:page as a data dependency of the test."

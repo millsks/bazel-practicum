@@ -1,0 +1,10 @@
+load("@rules_python//python:defs.bzl", "py_test")
+
+# Added by the grader: a second service package. The spec says every package
+# under //services may use //libs/pricing, so this test must build and pass.
+py_test(
+    name = "pricing_contract_test",
+    size = "small",
+    srcs = ["pricing_contract_test.py"],
+    deps = ["//libs/pricing"],
+)

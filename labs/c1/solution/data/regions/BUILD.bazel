@@ -1,0 +1,13 @@
+load("@bazel_skylib//rules:copy_file.bzl", "copy_file")
+
+# One region file per build, chosen by --//config:region. Consumers depend on
+# :region and always read region.json; they never see the select().
+copy_file(
+    name = "region",
+    src = select({
+        "//config:eu": "eu.json",
+        "//conditions:default": "us.json",
+    }),
+    out = "region.json",
+    visibility = ["//services:__subpackages__"],
+)

@@ -1,0 +1,5 @@
+id = "c1"
+title = "Capstone 1: Polyglot Monorepo"
+module = "c1"
+# The first grading run downloads Python, Go, and the PyPI wheels and compiles the Go standard library.
+timeout = 1800

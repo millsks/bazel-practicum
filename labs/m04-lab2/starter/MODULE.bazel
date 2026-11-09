@@ -1,0 +1,9 @@
+module(name = "handbook", version = "1.0.0")
+
+bazel_dep(name = "bazel_skylib", version = "1.7.1")
+
+# Only tests use rules_shell.
+bazel_dep(name = "rules_shell", version = "0.8.0")
+
+# TODO: depend on the textkit module (version 0.3.0), which lives in vendor/textkit
+# and is not in the Bazel Central Registry.

@@ -1,0 +1,298 @@
+# Capstone 1 checks, grouped by milestone. The grader adds two packages to your copy:
+#   //grading/outsider  targets outside //services that try to use private targets (they must fail)
+#   //services/grading  a second service package that uses //libs/pricing (it must pass)
+
+# ---------------------------------------------------------------- Milestone 1: modules and packages
+
+[[check]]
+name = "M1: MODULE.bazel declares every rule set the BUILD files load"
+command = ["mod", "graph", "--depth=1"]
+stdout_contains = ["rules_python@2.4.6", "rules_go@0.65.0", "bazel_skylib@1.9.2"]
+message = "Add bazel_dep lines for rules_go 0.65.0 and bazel_skylib 1.9.2 next to rules_python 2.4.6, and go_sdk.download(version = \"1.25.3\")."
+
+[[check]]
+name = "M1: the whole monorepo builds"
+command = ["build", "//..."]
+message = "Run `pixi run bazel build //...` in work/c1 and fix the first ERROR line, then the next."
+
+[[check]]
+name = "M1: the monorepo has the required targets"
+command = ["query", "//data:catalog + //data:catalog_gen + //libs/pricing + //services/quote + //services/quote:quote_lib + //tools/fmtcli + //tools/fmtcli/money + //tools/catalog_gen", "--output=label_kind"]
+stdout_lines = [
+    "py_library rule //data:catalog",
+    "run_binary rule //data:catalog_gen",
+    "py_library rule //libs/pricing:pricing",
+    "py_binary rule //services/quote:quote",
+    "py_library rule //services/quote:quote_lib",
+    "go_binary rule //tools/fmtcli:fmtcli",
+    "go_library rule //tools/fmtcli/money:money",
+    "py_binary rule //tools/catalog_gen:catalog_gen",
+]
+message = "Compare with the target table in the spec (section 'The packages'). The generator in //data must be a run_binary (from @bazel_skylib//rules:run_binary.bzl), not a genrule."
+
+[[check]]
+name = "M1: //libs/pricing is not visible outside //services"
+command = ["build", "//grading/outsider:uses_pricing"]
+expect = "failure"
+output_contains = ["target '//libs/pricing:pricing' is not visible from"]
+message = "The pricing library is for services only: visibility = [\"//services:__subpackages__\"], not public."
+
+[[check]]
+name = "M1: every package under //services may use //libs/pricing"
+command = ["test", "//services/grading:pricing_contract_test", "--test_output=errors"]
+message = "The grader adds //services/grading, which depends on //libs/pricing. Use //services:__subpackages__ (every package under services/), not //services/quote:__pkg__."
+
+[[check]]
+name = "M1: the generated catalog library is private to //libs/pricing"
+command = ["build", "//grading/outsider:uses_catalog"]
+expect = "failure"
+output_contains = ["target '//data:catalog' is not visible from"]
+message = "Only the pricing library reads the catalog: give //data:catalog visibility = [\"//libs/pricing:__pkg__\"]."
+
+[[check]]
+name = "M1: the Go money package is private to the fmtcli tool"
+command = ["build", "//grading/outsider:uses_money"]
+expect = "failure"
+output_contains = ["target '//tools/fmtcli/money:money' is not visible from"]
+message = "Give //tools/fmtcli/money visibility = [\"//tools/fmtcli:__pkg__\"]; the binary is the public face of the tool."
+
+# ---------------------------------------------------------------- Milestone 2: Python, PyPI, runfiles
+
+[[check]]
+name = "M2: requirements_lock.txt was generated with hashes"
+file_contains = { "requirements_lock.txt" = "--hash=sha256:" }
+message = "Generate the lock with real tooling: `pixi run bazel run //:requirements.update` in work/c1. Do not write it by hand."
+
+[[check]]
+name = "M2: the lock pins tabulate"
+file_contains = { "requirements_lock.txt" = "tabulate==" }
+message = "requirements.in lists tabulate and pytest; re-run `pixi run bazel run //:requirements.update`."
+
+[[check]]
+name = "M2: the pip hub is named after the module and aliased to @pypi"
+command = ["mod", "show_extension", "@rules_python//python/extensions:pip.bzl%pip"]
+output_lacks = ['hub_name="pypi"']
+output_contains = ['hub_name="harbor_pypi"']
+message = "pip.parse(hub_name = \"harbor_pypi\", python_version = \"3.13\", requirements_lock = \"//:requirements_lock.txt\") and use_repo(pip, pypi = \"harbor_pypi\")."
+
+[[check]]
+name = "M2: //libs/pricing depends on the generated catalog and on tabulate"
+command = ["query", "labels(deps, //libs/pricing)"]
+stdout_lines = ["//data:catalog", "@pypi//tabulate:tabulate"]
+message = "pricing.py imports data.catalog and tabulate. Each import is a deps entry: //data:catalog and @pypi//tabulate."
+
+[[check]]
+name = "M2: pricing_test runs pytest and collects all five tests"
+command = ["test", "//libs/pricing:pricing_test", "--test_output=all", "--nocache_test_results"]
+output_contains = ["5 passed"]
+message = "Without a pytest entry point the file runs as a plain script, defines five functions, and exits 0. Use main = \"pytest_main.py\", args = [\"$(rootpath pricing_test.py)\"], and @pypi//pytest."
+
+[[check]]
+name = "M2: bazel run //services/quote prints a US quote"
+command = ["run", "//services/quote", "--", "WIDGET=2", "GADGET"]
+stdout_equals = """
+Quote for region us (USD)
+
+item      qty    unit    total
+------  -----  ------  -------
+Gadget      1  $12.50   $12.50
+Widget      2   $4.99    $9.98
+
+subtotal  $22.48
+tax 8%    $1.80
+total     $24.28
+"""
+message = "Run `pixi run bazel run //services/quote -- WIDGET=2 GADGET` in work/c1. The binary needs main = \"main.py\", the region file in its runfiles (//data/regions:region), and FMTCLI set with $(rlocationpath //tools/fmtcli)."
+
+# ---------------------------------------------------------------- Milestone 3: tests at scale
+
+[[check]]
+name = "M3: bazel test //... passes"
+command = ["test", "//...", "--test_output=errors"]
+message = "Read each failing test's log (the path is printed under its FAILED line)."
+
+[[check]]
+name = "M3: every test is sized, and a second run comes from the cache"
+command = ["test", "//..."]
+stdout_contains = ["(cached) PASSED"]
+output_lacks = ["There were tests whose specified size is too big"]
+message = "Set size = \"small\" on every test (these all finish in about a second). Run `pixi run bazel test //...` twice: the second run should be all (cached) PASSED."
+
+[[check]]
+name = "M3: //... skips the exhaustive test"
+command = ["test", "//..."]
+stdout_lacks = ["exhaustive_test"]
+message = "Tag //services/quote:exhaustive_test with \"manual\", and tag the //:slow suite manual too (a suite runs every test it names)."
+
+[[check]]
+name = "M3: the exhaustive test is the only manual test"
+command = ["query", "attr(tags, '\\bmanual\\b', kind('.*_test rule', //libs/... + //services/quote/... + //tools/... + //data/...))"]
+stdout_lines = ["//services/quote:exhaustive_test"]
+message = "Only exhaustive_test is slow; tag it manual and leave the others alone."
+
+[[check]]
+name = "M3: //:fast holds the four fast tests"
+command = ["query", "tests(//:fast)"]
+stdout_lines = ["//data:catalog_golden_test", "//libs/pricing:pricing_test", "//services/quote:quote_test", "//tools/fmtcli/money:money_test"]
+message = "In the root BUILD.bazel: test_suite(name = \"fast\", tests = [...]) listing the four tests. A suite with no tests attribute only collects tests from its own package."
+
+[[check]]
+name = "M3: //:slow runs the exhaustive test"
+command = ["test", "//:slow", "--test_output=errors"]
+stdout_contains = ["//services/quote:exhaustive_test"]
+message = "test_suite(name = \"slow\", tags = [\"manual\"], tests = [\"//services/quote:exhaustive_test\"])."
+
+# ---------------------------------------------------------------- Milestone 4: configuration
+
+[[check]]
+name = "M4: --//config:region=eu prints an EU quote"
+command = ["run", "//services/quote", "--//config:region=eu", "--", "WIDGET=2", "GADGET"]
+stdout_equals = """
+Quote for region eu (EUR)
+
+item      qty       unit      total
+------  -----  ---------  ---------
+Gadget      1  EUR 12,50  EUR 12,50
+Widget      2   EUR 4,99   EUR 9,98
+
+subtotal  EUR 22,48
+tax 20%   EUR 4,50
+total     EUR 26,98
+"""
+message = "Declare string_flag(name = \"region\") in config/BUILD.bazel with a config_setting for eu, and select() eu.json or us.json into //data/regions:region (a copy_file whose out is region.json)."
+
+[[check]]
+name = "M4: --config=eu from .bazelrc does the same"
+command = ["run", "//services/quote", "--config=eu", "--", "WIDGET=2", "GADGET"]
+stdout_contains = ["Quote for region eu (EUR)", "total     EUR 26,98"]
+message = "Add `common:eu --//config:region=eu` to .bazelrc."
+
+[[check]]
+name = "M4: the region flag rejects unknown regions"
+command = ["build", "//services/quote", "--//config:region=apac"]
+expect = "failure"
+output_contains = ["invalid value 'apac'"]
+message = "List the allowed values on the flag: values = [\"us\", \"eu\"]."
+
+[[check]]
+name = "M4: cquery shows only eu.json under --config=eu"
+command = ["cquery", "labels(src, //data/regions:region)", "--config=eu"]
+stdout_contains = ["//data/regions:eu.json"]
+stdout_lacks = ["us.json"]
+message = "//data/regions:region should be a copy_file (from @bazel_skylib//rules:copy_file.bzl) whose src is a select() on //config:eu."
+
+[[check]]
+name = "M4: --config=ci builds optimized"
+command = ["cquery", "//services/quote", "--config=ci", "--output=files"]
+stdout_contains = ["bazel-out/k8-opt/bin/services/quote/quote"]
+message = "Add -c opt to the ci config in .bazelrc."
+
+[[check]]
+name = "M4: --config=ci also works with bazel query"
+command = ["query", "//services/...", "--config=ci"]
+message = "query reads no `build` lines, so `build:ci ...` leaves ci undefined for it. Write the ci config as `common:ci -c opt` (and keep `test:ci --test_output=errors`)."
+
+[[check]]
+name = "M4: bazel test //... --config=ci passes"
+command = ["test", "//...", "--config=ci"]
+message = "Run `pixi run bazel test //... --config=ci` in work/c1 and read the failing test's log."
+
+# ---------------------------------------------------------------- Milestone 5: Go
+
+[[check]]
+name = "M5: the Go code is a library, a binary, and a test"
+command = ["query", "kind(go_.*, //tools/...)"]
+stdout_lines = ["//tools/fmtcli:fmtcli", "//tools/fmtcli/money:money", "//tools/fmtcli/money:money_test"]
+message = "tools/fmtcli/money/BUILD.bazel: go_library money and go_test money_test; tools/fmtcli/BUILD.bazel: go_binary fmtcli."
+
+[[check]]
+name = "M5: the internal Go test embeds the library"
+command = ["query", "labels(embed, //tools/fmtcli/money:money_test)"]
+stdout_lines = ["//tools/fmtcli/money:money"]
+message = "money_test.go is in package money, so it is compiled together with the library: embed = [\":money\"], not deps."
+
+[[check]]
+name = "M5: bazel run //tools/fmtcli formats euros"
+command = ["run", "//tools/fmtcli", "--", "EUR", "123456", "-75"]
+stdout_equals = "EUR 1.234,56\n-EUR 0,75"
+message = "Run `pixi run bazel run //tools/fmtcli -- EUR 123456 -75` in work/c1. A 'missing strict dependencies' error means the go_binary needs deps = [\"//tools/fmtcli/money\"]."
+
+[[check]]
+name = "M5: the Python test ships the Go tool as data"
+command = ["query", "labels(data, //services/quote:quote_test)"]
+stdout_lines = ["//tools/fmtcli:fmtcli"]
+message = "$(rlocationpath //tools/fmtcli) only expands a label in the rule's own data: add data = [\"//tools/fmtcli\"] to each executable that sets FMTCLI."
+
+# ---------------------------------------------------------------- Milestone 6: generated data
+
+[[check]]
+name = "M6: the catalog module is generated, not checked in"
+command = ["query", "//data:catalog.py", "--output=label_kind"]
+stdout_equals = "generated file //data:catalog.py"
+message = "data/catalog.py must be an output of //data:catalog_gen, not a source file: delete any checked-in data/catalog.py."
+
+[[check]]
+name = "M6: run_binary runs the catalog generator"
+command = ["query", "labels(tool, //data:catalog_gen)"]
+stdout_lines = ["//tools/catalog_gen:catalog_gen"]
+message = "run_binary(name = \"catalog_gen\", tool = \"//tools/catalog_gen\", srcs = [\"catalog.csv\"], outs = [\"catalog.py\"], args = [...])."
+
+[[check]]
+name = "M6: the generated catalog lists every product"
+command = ["build", "//data:catalog_gen"]
+file_contains = { "bazel-bin/data/catalog.py" = "\"GIZMO\": (\"Gizmo\", 99999)," }
+message = "Build //data:catalog_gen and read bazel-bin/data/catalog.py: every row of catalog.csv should be there."
+
+[[check]]
+name = "M6: a diff_test guards the generated catalog"
+command = ["query", "kind(diff_test, //data:all)"]
+stdout_lines = ["//data:catalog_golden_test"]
+message = "diff_test(name = \"catalog_golden_test\", file1 = \":catalog.py\", file2 = \"catalog.golden.py\") from @bazel_skylib//rules:diff_test.bzl."
+
+[[check]]
+name = "M6: the golden file matches the generator"
+command = ["test", "//data:catalog_golden_test", "--test_output=errors"]
+message = "Create data/catalog.golden.py from the generated file (cp bazel-bin/data/catalog.py data/catalog.golden.py; chmod u+w it) and review it."
+
+# ---------------------------------------------------------------- Milestone 7: the graph has the right shape
+
+[[check]]
+name = "M7: only services, the pricing tests, and the suites depend on //libs/pricing"
+command = ["query", "rdeps(//..., //libs/pricing) except //grading/..."]
+stdout_lines = [
+    "//:fast",
+    "//:slow",
+    "//libs/pricing:pricing",
+    "//libs/pricing:pricing_test",
+    "//services/grading:pricing_contract_test",
+    "//services/quote:exhaustive_test",
+    "//services/quote:quote",
+    "//services/quote:quote_lib",
+    "//services/quote:quote_test",
+]
+message = "Run `pixi run bazel query 'rdeps(//..., //libs/pricing)'` and compare with the spec. Nothing in //tools or //data may depend on the pricing library."
+
+[[check]]
+name = "M7: the pricing library is region-agnostic"
+command = ["query", "somepath(//libs/pricing, //config:region)"]
+stdout_lines = []
+message = "The region is chosen in the service (through //data/regions:region), never inside //libs/pricing. Remove any select() or region data from the library."
+
+[[check]]
+name = "M7: the quote binary reaches the CSV through the generator"
+command = ["query", "somepath(//services/quote, //data:catalog.csv)"]
+stdout_contains = ["//libs/pricing:pricing", "//data:catalog", "//data:catalog_gen", "//data:catalog.csv"]
+message = "The path should run quote -> quote_lib -> pricing -> catalog -> catalog.py -> catalog_gen -> catalog.csv."
+
+[[check]]
+name = "M7: the Go tool has no Python in its graph"
+command = ["query", "kind('py_.*', deps(//tools/fmtcli))"]
+stdout_lines = []
+message = "//tools/fmtcli must stay a standalone Go tool: it must not depend on Python targets."
+
+[[check]]
+name = "M7: a catalog change re-runs the Python tests but no Go test"
+command = ["query", "kind('.*_test rule', rdeps(//..., //data:catalog.csv))"]
+stdout_contains = ["//data:catalog_golden_test", "//libs/pricing:pricing_test", "//services/quote:quote_test"]
+stdout_lacks = ["//tools/"]
+message = "`kind('.*_test rule', rdeps(//..., //data:catalog.csv))` is the list of tests a CSV edit affects. The Go test must not be in it."
