@@ -13,7 +13,9 @@ from practicum.site import load_curriculum
 
 SITE_URL = "https://millsks.github.io/bazel-practicum/"
 REPO_URL = "https://github.com/millsks/bazel-practicum"
-DESCRIPTION = "An interactive Bazel course: from Python developer to a polyglot monorepo, with a Bazel simulator in the page."
+DESCRIPTION = (
+    "An interactive Bazel course: from Python developer to a polyglot monorepo, with a Bazel simulator in the page."
+)
 SCRIPT_ORDER = ("viz.js", "viz-bazel.js", "course.js")
 ENGINE_DIR = Path(__file__).with_name("engine")
 

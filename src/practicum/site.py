@@ -287,6 +287,7 @@ def check_site(site_root: Path) -> list[Issue]:
                 issues.append(Issue(relative, f"lab {lab_id} has no labs/{lab_id}/lab.toml"))
             referenced_labs.add(lab_id)
     issues.extend(
-        Issue(f"../labs/{lab_id}", "lab is not introduced by any page") for lab_id in sorted(known_labs - referenced_labs)
+        Issue(f"../labs/{lab_id}", "lab is not introduced by any page")
+        for lab_id in sorted(known_labs - referenced_labs)
     )
     return issues

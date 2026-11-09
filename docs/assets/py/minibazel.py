@@ -13,7 +13,6 @@ the course's checker compares it with real Bazel.
 from __future__ import annotations
 
 import ast
-import fnmatch
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -43,6 +42,7 @@ class Label:
     name: str
 
     def __str__(self) -> str:
+        """The canonical label text, ``@repo//pkg:name`` (no ``@`` for the main repository)."""
         prefix = f"@{self.repo}" if self.repo else ""
         return f"{prefix}//{self.package}:{self.name}"
 
@@ -482,9 +482,11 @@ class Target:
         return f"{self.kind} rule" if self.is_rule else self.kind
 
     def __str__(self) -> str:
+        """The target's label."""
         return str(self.label)
 
     def __repr__(self) -> str:
+        """``<kind label>``, for debugging."""
         return f"<{self.kind_string()} {self.label}>"
 
 
@@ -542,7 +544,7 @@ _BANNED_NODES: dict[type, str] = {
     ast.Set: "syntax error: set literals are not supported",
     ast.SetComp: "syntax error: set comprehensions are not supported",
     ast.GeneratorExp: "syntax error: generator expressions are not supported",
-    ast.JoinedStr: "syntax error: f-strings are not supported (use \"%s\" % x or \"{}\".format(x))",
+    ast.JoinedStr: 'syntax error: f-strings are not supported (use "%s" % x or "{}".format(x))',
     ast.Raise: "'raise' not supported, use fail() instead",
     ast.Assert: "'assert' not supported, use fail() instead",
     ast.Delete: "'del' not supported",
@@ -608,7 +610,9 @@ def _check_starlark(tree: ast.Module, path: str, *, build_file: bool) -> None:
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "load":
             if not any(isinstance(s, ast.Expr) and s.value is node for s in tree.body):
-                raise BazelError(f"{path}:{node.lineno}:{node.col_offset + 1}: syntax error: load() must be a top-level statement")
+                raise BazelError(
+                    f"{path}:{node.lineno}:{node.col_offset + 1}: syntax error: load() must be a top-level statement"
+                )
             for arg in [*node.args, *[k.value for k in node.keywords]]:
                 if not (isinstance(arg, ast.Constant) and isinstance(arg.value, str)):
                     raise BazelError(f"{path}:{node.lineno}: syntax error: load() arguments must be string literals")
@@ -693,7 +697,7 @@ class _Exec:
             if name in RULES or name in ("glob", "select"):
                 for file, symbols in _RULE_SETS.items():
                     if name in symbols:
-                        hint = f" (load it with load(\"{file}\", \"{name}\"))"
+                        hint = f' (load it with load("{file}", "{name}"))'
                         break
             raise _Fail(f"{path}:{line}:1: name '{name}' is not defined{hint}") from exc
         except (TypeError, ValueError, KeyError, IndexError, AttributeError, ZeroDivisionError) as exc:
@@ -845,13 +849,13 @@ class Workspace:
             for n in names:
                 if n not in ext.declared and not (n == "go_sdk"):
                     raise _Fail(
-                        f"module extension \"{ext._name}\" from \"{ext._bzl}\" does not generate repository "
-                        f"\"{n}\", yet it is imported as \"{n}\" in the usage at MODULE.bazel"
+                        f'module extension "{ext._name}" from "{ext._bzl}" does not generate repository '
+                        f'"{n}", yet it is imported as "{n}" in the usage at MODULE.bazel'
                     )
                 mod.repos[n] = ext._name
             for alias, n in aliases.items():
                 if n not in ext.declared:
-                    raise _Fail(f"module extension \"{ext._name}\" does not generate repository \"{n}\"")
+                    raise _Fail(f'module extension "{ext._name}" does not generate repository "{n}"')
                 mod.repos[alias] = ext._name
                 if n in mod.pip_hubs:
                     mod.pip_hubs[alias] = mod.pip_hubs[n]
@@ -1025,9 +1029,7 @@ class Workspace:
         def select(conditions: dict[str, Any], no_match_error: str = "") -> Select:
             return Select(conditions, no_match_error, pkg.name)
 
-        def package(
-            default_visibility: list[str] | None = None, default_testonly: bool = False, **_kw: Any
-        ) -> None:
+        def package(default_visibility: list[str] | None = None, default_testonly: bool = False, **_kw: Any) -> None:
             if pkg.targets:
                 raise _Fail("package() function cannot be called after any rule is declared")
             if default_visibility is not None:
@@ -1041,7 +1043,9 @@ class Workspace:
                     raise _Fail(f"exports_files: label '{name}' must be in the current package")
                 existing = pkg.targets.get(label.name)
                 if existing is not None and existing.is_rule:
-                    raise _Fail(f"generated file '{label.name}' in rule '{existing.name}' conflicts with existing source file")
+                    raise _Fail(
+                        f"generated file '{label.name}' in rule '{existing.name}' conflicts with existing source file"
+                    )
                 pkg.targets[label.name] = Target(
                     label,
                     "source file",
@@ -1190,7 +1194,9 @@ class Workspace:
                 raise _Fail(f"{path}: //{pkg.name}:{name}: no such attribute '{attr}' in '{kind}' rule")
         for attr in rc.mandatory:
             if attr not in kwargs:
-                raise _Fail(f"{path}: //{pkg.name}:{name}: missing value for mandatory attribute '{attr}' in '{kind}' rule")
+                raise _Fail(
+                    f"{path}: //{pkg.name}:{name}: missing value for mandatory attribute '{attr}' in '{kind}' rule"
+                )
         existing = pkg.targets.get(name)
         if existing is not None:
             what = f"{existing.kind} rule" if existing.is_rule else existing.kind
@@ -1237,7 +1243,7 @@ class Workspace:
             if isinstance(value, str) or not isinstance(value, list | tuple):
                 raise _Fail(
                     f"{where}: expected value of type 'list(string)' for attribute '{attr}' in '{kind}' rule, "
-                    f"but got \"{value}\" (string)"
+                    f'but got "{value}" (string)'
                     if isinstance(value, str)
                     else f"{where}: expected a list for attribute '{attr}' in '{kind}' rule"
                 )
@@ -1252,7 +1258,9 @@ class Workspace:
                 for item in items:
                     canon = str(parse_label(item, package))
                     if canon in seen:
-                        raise _Fail(f"{where}: Label '{canon}' is duplicated in the '{attr}' attribute of rule '{name}'")
+                        raise _Fail(
+                            f"{where}: Label '{canon}' is duplicated in the '{attr}' attribute of rule '{name}'"
+                        )
                     seen.add(canon)
             if akind == "output_list":
                 for item in items:
@@ -1490,7 +1498,7 @@ class Config:
         while i < len(args):
             a = args[i]
 
-            def take() -> str:
+            def take(a: str = a) -> str:
                 nonlocal i
                 if "=" in a:
                     return a.split("=", 1)[1]
@@ -1629,7 +1637,7 @@ class _Analyzer:
                 return conditions["//conditions:default"]
             keys = "\n".join(f" {k}" for k in conditions)
             msg = no_match or (
-                f"Configurable attribute \"{attr}\" doesn't match this configuration (would a default condition "
+                f'Configurable attribute "{attr}" doesn\'t match this configuration (would a default condition '
                 f"help?).\nConditions checked:\n{keys}"
             )
             raise BazelError(f"{target.location}: {target.label}: {msg}")
@@ -1639,11 +1647,13 @@ class _Analyzer:
                 names = ", ".join(str(m[0]) for m in matching)
                 raise BazelError(
                     f"{target.location}: {target.label}: Illegal ambiguous match on configurable attribute "
-                    f"\"{attr}\" in {target.label}:\n{names}\nMultiple matches are not allowed unless one is "
+                    f'"{attr}" in {target.label}:\n{names}\nMultiple matches are not allowed unless one is '
                     "unambiguously more specialized or they resolve to the same value."
                 )
             matching = specialized
-        original = next(k for k in conditions if k != "//conditions:default" and parse_label(k, package) == matching[0][0])
+        original = next(
+            k for k in conditions if k != "//conditions:default" and parse_label(k, package) == matching[0][0]
+        )
         return conditions[original]
 
     def _settings(self, cond: Target) -> set[tuple[str, str]]:
@@ -1802,7 +1812,12 @@ class _Analyzer:
                     "Recommendation: modify the visibility declaration if you think the dependency is legitimate. "
                     "For more info see https://bazel.build/concepts/visibility"
                 )
-            if dep.is_rule and dep.attrs.get("testonly") and not target.attrs.get("testonly") and attr != "$implicit_tests":
+            if (
+                dep.is_rule
+                and dep.attrs.get("testonly")
+                and not target.attrs.get("testonly")
+                and attr != "$implicit_tests"
+            ):
                 if target.kind != "test_suite":
                     self.errors.append(
                         f"{where}: in {target.kind} rule {target.label}: non-test target '{target.label}' depends on "
@@ -1900,8 +1915,10 @@ class _Analyzer:
                         spec = spec.lstrip("-")
                         body = spec[2:] if spec.startswith("//") else spec
                         hit = (
-                            body.endswith("/...") and (user_pkg == body[:-4] or user_pkg.startswith(body[:-4] + "/"))
-                        ) or body == "..." or body == user_pkg
+                            (body.endswith("/...") and (user_pkg == body[:-4] or user_pkg.startswith(body[:-4] + "/")))
+                            or body == "..."
+                            or body == user_pkg
+                        )
                         if hit:
                             return not neg
                     for inc in group.attrs.get("includes") or []:
@@ -1951,7 +1968,9 @@ class _Analyzer:
         tools = self.resolve(target, "tools") or []
         prereq = {str(parse_label(x, pkg)) for x in [*srcs, *tools]} | {str(Label("", pkg, o)) for o in outs}
         where = f"{target.location}: in cmd attribute of genrule rule {target.label}"
-        for m in re.finditer(r"\$\((location|locations|execpath|execpaths|rootpath|rootpaths|rlocationpath)\s+([^)]+)\)", cmd):
+        for m in re.finditer(
+            r"\$\((location|locations|execpath|execpaths|rootpath|rootpaths|rlocationpath)\s+([^)]+)\)", cmd
+        ):
             ref = m.group(2).strip()
             try:
                 label = str(parse_label(ref, pkg))
@@ -1959,13 +1978,25 @@ class _Analyzer:
                 self.errors.append(f"{where}: {exc}")
                 continue
             if label not in prereq:
-                self.errors.append(f"{where}: label '{label}' in $({m.group(1)}) expression is not a declared prerequisite of this rule")
+                self.errors.append(
+                    f"{where}: label '{label}' in $({m.group(1)}) expression is not a declared prerequisite of this rule"
+                )
         if "$@" in cmd and len(outs) != 1:
             self.errors.append(f"{where}: variable '$@' : more than one output file")
         if "$<" in cmd and len(srcs) != 1:
             self.errors.append(f"{where}: variable '$<' : more than one input file")
         for m in re.finditer(r"\$\(([A-Za-z_][A-Za-z0-9_]*)\)", cmd):
-            if m.group(1) not in ("SRCS", "OUTS", "RULEDIR", "@D", "GENDIR", "BINDIR", "TARGET_CPU", "COMPILATION_MODE", "PYTHON3"):
+            if m.group(1) not in (
+                "SRCS",
+                "OUTS",
+                "RULEDIR",
+                "@D",
+                "GENDIR",
+                "BINDIR",
+                "TARGET_CPU",
+                "COMPILATION_MODE",
+                "PYTHON3",
+            ):
                 self.errors.append(f"{where}: $({m.group(1)}) not defined")
 
 
@@ -2384,6 +2415,7 @@ class Result:
     phase: str = ""
 
     def __bool__(self) -> bool:
+        """A result is truthy when the command succeeded."""
         return self.ok
 
     @property
@@ -2396,6 +2428,7 @@ class Bazel:
     """Command-shaped access to a simulated workspace: ``bazel.query(...)``, ``bazel.build(...)``, and so on."""
 
     def __init__(self, files: dict[str, str]) -> None:
+        """Evaluate ``files`` (workspace-relative path to content) as a workspace."""
         self.ws = Workspace(files)
         self.ws._current_command = "build"
 
@@ -2496,7 +2529,9 @@ class Bazel:
             targets, _excluded = self._expand(patterns, skip_manual=True)
         except BazelError as exc:
             err = f"Skipping '{patterns[0]}': {exc}"
-            return Result(False, f"ERROR: {err}\nERROR: Build did NOT complete successfully", [str(exc)], phase="loading")
+            return Result(
+                False, f"ERROR: {err}\nERROR: Build did NOT complete successfully", [str(exc)], phase="loading"
+            )
         an = _Analyzer(self.ws, cfg)
         test_labels: set[Label] = set()
         if command == "test":
@@ -2532,7 +2567,14 @@ class Bazel:
                 lines.append(f"{t:<60} (would run)")
             if not tests:
                 lines.append("ERROR: No test targets were found, yet testing was requested")
-                return Result(False, "\n".join(lines), ["No test targets were found, yet testing was requested"], built, tests, "analysis")
+                return Result(
+                    False,
+                    "\n".join(lines),
+                    ["No test targets were found, yet testing was requested"],
+                    built,
+                    tests,
+                    "analysis",
+                )
             lines.append(f"Executed 0 out of {len(tests)} tests (the simulator analyzes; it does not run tests).")
         else:
             lines.append("INFO: Build completed successfully (analysis only: the simulator does not run actions).")

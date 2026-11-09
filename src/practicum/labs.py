@@ -304,9 +304,11 @@ def resolve_source(root: Path, lab: Lab, source: Source | None) -> tuple[Source,
     """
     if source is None:
         source = Source.WORK if lab.work_dir(root).is_dir() else Source.STARTER
-    return source, {Source.WORK: lab.work_dir(root), Source.STARTER: lab.starter_dir, Source.SOLUTION: lab.solution_dir}[
-        source
-    ]
+    return source, {
+        Source.WORK: lab.work_dir(root),
+        Source.STARTER: lab.starter_dir,
+        Source.SOLUTION: lab.solution_dir,
+    }[source]
 
 
 def stage_lab(root: Path, lab: Lab, source: Source) -> Path:
@@ -428,7 +430,12 @@ def evaluate(
 
 
 def grade_lab(
-    root: Path, lab: Lab, *, source: Source | None = None, runner: Runner | None = None, on_result: Callable[[CheckResult], None] | None = None
+    root: Path,
+    lab: Lab,
+    *,
+    source: Source | None = None,
+    runner: Runner | None = None,
+    on_result: Callable[[CheckResult], None] | None = None,
 ) -> list[CheckResult]:
     """Run every check of a lab against the chosen workspace with real Bazel.
 

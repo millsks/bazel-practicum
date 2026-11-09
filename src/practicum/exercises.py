@@ -184,7 +184,7 @@ def check_exercise(sim: ModuleType, exercise: Exercise) -> ExerciseResult:
     try:
         solved = run_checks(sim, {**exercise.files, **exercise.solution}, exercise.tests)
         starter = run_checks(sim, exercise.files, exercise.tests)
-    except Exception as exc:  # noqa: BLE001 - a broken check block must be reported, not crash the run
+    except Exception as exc:
         return ExerciseResult(exercise.id, False, f"checks raised {type(exc).__name__}: {exc}")
     if not solved:
         return ExerciseResult(exercise.id, False, "no test_* functions in the checks")
@@ -209,7 +209,7 @@ def check_sandbox(sim: ModuleType, sandbox: Sandbox) -> ExerciseResult:
     for command in sandbox.commands:
         try:
             sim.Bazel(dict(sandbox.files)).run_command(command)
-        except Exception as exc:  # noqa: BLE001 - any crash is a bug to report
+        except Exception as exc:
             return ExerciseResult(sandbox.title, False, f"`{command}` crashed: {type(exc).__name__}: {exc}")
     return ExerciseResult(sandbox.title, True)
 

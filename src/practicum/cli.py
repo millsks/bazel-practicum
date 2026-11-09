@@ -141,7 +141,9 @@ def _grade(root: Path, lab_id: str, source: Source | None) -> int:
     print(f"{lab.title}", flush=True)
     results = grade_lab(root, lab, source=chosen, on_result=_print_result)
     passed = sum(r.ok for r in results)
-    print(f"\n{passed}/{len(results)} checks passed." + (" Lab complete." if passed == len(results) else ""), flush=True)
+    print(
+        f"\n{passed}/{len(results)} checks passed." + (" Lab complete." if passed == len(results) else ""), flush=True
+    )
     return 0 if passed == len(results) else 1
 
 
