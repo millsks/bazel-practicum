@@ -1,0 +1,12 @@
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "banner",
+    srcs = ["banner.py"],
+    data = select({
+        "//config:prod": ["banners/prod.txt"],
+        "//config:staging": ["banners/staging.txt"],
+        "//conditions:default": ["banners/dev.txt"],
+    }),
+    deps = ["@rules_python//python/runfiles"],
+)

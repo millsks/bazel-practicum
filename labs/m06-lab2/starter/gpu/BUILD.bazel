@@ -1,0 +1,12 @@
+load("@rules_python//python:defs.bzl", "py_test")
+
+py_test(
+    name = "cpu_math_test",
+    srcs = ["cpu_math_test.py"],
+)
+
+# This test needs a GPU. On a CPU-only platform it fails, and it breaks `bazel test //...` for everyone.
+py_test(
+    name = "train_test",
+    srcs = ["train_test.py"],
+)

@@ -1,0 +1,34 @@
+[[check]]
+name = "bazel test //... passes on this machine"
+command = ["test", "//...", "--test_output=errors"]
+message = "train_test needs a GPU. Mark it with target_compatible_with = [\"//platforms:gpu\"] so CPU-only platforms skip it."
+
+[[check]]
+name = "train_test is skipped, not run, on a CPU-only platform"
+command = ["test", "//gpu:all"]
+output_matches = ["//gpu:train_test\\s+SKIPPED"]
+message = "With target_compatible_with set, `bazel test //gpu:all` reports //gpu:train_test as SKIPPED."
+
+[[check]]
+name = "asking for train_test by name on a CPU-only platform fails"
+command = ["build", "//gpu:train_test"]
+expect = "failure"
+output_contains = ["is incompatible and cannot be built, but was explicitly requested"]
+message = "Wildcards skip incompatible targets; naming one explicitly is an error. Did you add target_compatible_with?"
+
+[[check]]
+name = "the gpu_host platform makes train_test buildable"
+command = ["build", "//gpu:train_test", "--platforms=//platforms:gpu_host"]
+message = "Declare platform(name = \"gpu_host\", parents = [\"@platforms//host\"], constraint_values = [\":gpu\"]) in platforms/BUILD.bazel."
+
+[[check]]
+name = "device prints cpu by default"
+command = ["run", "//app:device"]
+stdout_equals = "device: cpu"
+message = "Run `pixi run bazel run //app:device` in work/m06-lab2."
+
+[[check]]
+name = "device prints gpu on the gpu_host platform"
+command = ["run", "//app:device", "--platforms=//platforms:gpu_host"]
+stdout_equals = "device: gpu"
+message = "select() on the constraint value itself: data = select({\"//platforms:gpu\": [\"gpu.txt\"], \"//conditions:default\": [\"cpu.txt\"]})."

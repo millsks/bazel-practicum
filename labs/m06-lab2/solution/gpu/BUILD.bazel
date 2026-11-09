@@ -1,0 +1,13 @@
+load("@rules_python//python:defs.bzl", "py_test")
+
+py_test(
+    name = "cpu_math_test",
+    srcs = ["cpu_math_test.py"],
+)
+
+# Only platforms with a GPU can build or run this test; elsewhere `bazel test //...` skips it.
+py_test(
+    name = "train_test",
+    srcs = ["train_test.py"],
+    target_compatible_with = ["//platforms:gpu"],
+)

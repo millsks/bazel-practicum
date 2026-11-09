@@ -1,0 +1,23 @@
+load("@bazel_skylib//rules:common_settings.bzl", "string_flag")
+
+string_flag(
+    name = "env",
+    build_setting_default = "dev",
+    values = [
+        "dev",
+        "staging",
+        "prod",
+    ],
+)
+
+config_setting(
+    name = "staging",
+    flag_values = {":env": "staging"},
+    visibility = ["//visibility:public"],
+)
+
+config_setting(
+    name = "prod",
+    flag_values = {":env": "prod"},
+    visibility = ["//visibility:public"],
+)

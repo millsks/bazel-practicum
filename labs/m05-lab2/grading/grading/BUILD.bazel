@@ -1,0 +1,7 @@
+load("@rules_python//python:defs.bzl", "py_binary")
+
+# Used by the grader as --run_under: starts the test from /tmp instead of its runfiles tree.
+py_binary(
+    name = "from_tmp",
+    srcs = ["from_tmp.py"],
+)

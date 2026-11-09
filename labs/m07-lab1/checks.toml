@@ -1,0 +1,33 @@
+[[check]]
+name = "the workspace builds"
+command = ["build", "//..."]
+message = "Run `pixi run bazel build //...` in work/m07-lab1 and read the first ERROR line."
+
+[[check]]
+name = "the Go targets are a library, a binary, and two tests"
+command = ["query", "kind(go_.*, //...)"]
+stdout_lines = ["//grading:textutil_ext_test", "//textutil:textutil", "//textutil:textutil_test", "//tools/wc:wc"]
+message = "tools/wc/BUILD.bazel should declare one go_binary named wc (load it from @rules_go//go:def.bzl)."
+
+[[check]]
+name = "the internal test embeds the library"
+command = ["query", "labels(embed, //textutil:textutil_test)"]
+stdout_lines = ["//textutil:textutil"]
+message = "count_test.go is in package textutil, so it must be compiled together with the library: use embed = [\":textutil\"], not deps."
+
+[[check]]
+name = "bazel run //tools/wc counts its arguments"
+command = ["run", "//tools/wc", "--", "to be or", "not to be"]
+stdout_equals = "2 lines, 6 words"
+message = "Run `pixi run bazel run //tools/wc -- \"to be or\" \"not to be\"` in work/m07-lab1. A 'missing strict dependencies' error means the go_binary needs deps = [\"//textutil\"]."
+
+[[check]]
+name = "the Python test ships the Go binary as data"
+command = ["query", "labels(data, //tests:wc_test)"]
+stdout_lines = ["//tools/wc:wc"]
+message = "A program another program runs is a run-time file: add data = [\"//tools/wc\"] to //tests:wc_test."
+
+[[check]]
+name = "every test passes, Go and Python"
+command = ["test", "//...", "--test_output=errors"]
+message = "Read the failing test's log. wc_test.py reads the binary's runfiles path from WC_BIN: set env = {\"WC_BIN\": \"$(rlocationpath //tools/wc)\"}."

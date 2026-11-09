@@ -1,0 +1,9 @@
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "banner",
+    srcs = ["banner.py"],
+    # Ships one banner file. Make this depend on --//config:env.
+    data = ["banners/dev.txt"],
+    deps = ["@rules_python//python/runfiles"],
+)

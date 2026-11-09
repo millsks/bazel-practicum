@@ -1218,6 +1218,13 @@ class Workspace:
             attrs["visibility"] = list(pkg.default_visibility)
         if "testonly" not in attrs:
             attrs["testonly"] = rc.test or pkg.default_testonly
+        if rc.test:
+            size = attrs.get("size")
+            if size is not None and size not in ("small", "medium", "large", "enormous"):
+                raise _Fail(f"{path}: In rule '{name}', size '{size}' is not a valid size.")
+            timeout = attrs.get("timeout")
+            if timeout is not None and timeout not in ("short", "moderate", "long", "eternal"):
+                raise _Fail(f"{path}: In rule '{name}', timeout '{timeout}' is not a valid timeout.")
         label = Label("", pkg.name, name)
         target = Target(label, kind, attrs, location=path)
         pkg.targets[name] = target
@@ -2602,7 +2609,8 @@ class _Query:
 
 def _tag_match(target: Target, filters: list[str]) -> bool:
     tags = set(target.tags) | {target.attrs.get("size") or "medium"}
-    pos = [f for f in filters if not f.startswith("-")]
+    # Bazel ignores a positive "manual" filter: manual tests are never selected by tag filters.
+    pos = [f for f in filters if not f.startswith("-") and f != "manual"]
     neg = [f[1:] for f in filters if f.startswith("-")]
     if any(n in tags for n in neg):
         return False
@@ -2613,6 +2621,8 @@ def _attr_string(target: Target, attr: str) -> str:
     value = target.attrs.get(attr)
     if value is None:
         rc = target.rule_class
+        if attr == "size" and rc is not None and rc.test:
+            return "medium"
         akind = rc.attrs.get(attr) if rc else None
         return "[]" if akind and "list" in akind else ""
     if isinstance(value, list):

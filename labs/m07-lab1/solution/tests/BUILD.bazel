@@ -1,0 +1,11 @@
+load("@rules_python//python:defs.bzl", "py_test")
+
+# A Python test of a Go program: the binary arrives as a runfile through `data`,
+# and $(rlocationpath) tells the test where to look for it.
+py_test(
+    name = "wc_test",
+    srcs = ["wc_test.py"],
+    data = ["//tools/wc"],
+    env = {"WC_BIN": "$(rlocationpath //tools/wc)"},
+    deps = ["@rules_python//python/runfiles"],
+)

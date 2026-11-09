@@ -1,0 +1,21 @@
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "forecast",
+    srcs = ["dates.py"],
+    deps = ["@pypi//python_dateutil"],
+)
+
+py_test(
+    name = "dates_test",
+    srcs = [
+        "dates_test.py",
+        "pytest_main.py",
+    ],
+    args = ["$(rootpath dates_test.py)"],
+    main = "pytest_main.py",
+    deps = [
+        ":forecast",
+        "@pypi//pytest",
+    ],
+)

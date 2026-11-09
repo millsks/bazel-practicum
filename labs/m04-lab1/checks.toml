@@ -1,0 +1,39 @@
+[[check]]
+name = "requirements_lock.txt pins every package with sha256 hashes"
+file_contains = { "requirements_lock.txt" = "--hash=sha256:" }
+message = "Generate the lock with real tooling: `pixi run bazel run //:requirements.update` in work/m04-lab1. Do not write it by hand."
+
+[[check]]
+name = "the lock pins python-dateutil and pytest exactly"
+file_contains = { "requirements_lock.txt" = "python-dateutil==" }
+message = "requirements_lock.txt should list python-dateutil==<version> (and pytest==<version>). Re-run `bazel run //:requirements.update`."
+
+[[check]]
+name = "the pip hub is visible as @pypi"
+command = ["query", "@pypi//pytest + @pypi//python_dateutil"]
+stdout_lines = ["@pypi//pytest:pytest", "@pypi//python_dateutil:python_dateutil"]
+message = "Add pip.parse(...) and use_repo(...) to MODULE.bazel so the hub is visible as @pypi, then lock pytest and python-dateutil."
+
+[[check]]
+name = "the hub does not use the reserved name 'pypi'"
+command = ["mod", "show_extension", "@rules_python//python/extensions:pip.bzl%pip"]
+output_lacks = ['hub_name="pypi"']
+message = "rules_python 2.4.6 reserves hub_name = \"pypi\". Name the hub after your module (weather_pypi) and alias it: use_repo(pip, pypi = \"weather_pypi\")."
+
+[[check]]
+name = "//forecast:forecast depends on python-dateutil from the hub"
+command = ["query", "labels(deps, //forecast:forecast)"]
+stdout_lines = ["@pypi//python_dateutil:python_dateutil"]
+message = "dates.py imports dateutil; its distribution is python-dateutil, so the label is @pypi//python_dateutil (dashes become underscores)."
+
+[[check]]
+name = "//forecast:dates_test runs pytest"
+command = ["query", "labels(deps, //forecast:dates_test) + labels(main, //forecast:dates_test)"]
+stdout_lines = ["//forecast:forecast", "//forecast:pytest_main.py", "@pypi//pytest:pytest"]
+message = "Make pytest_main.py the test's main, add it to srcs, pass the test file in args, and depend on @pypi//pytest."
+
+[[check]]
+name = "bazel test //... passes and pytest collected all three tests"
+command = ["test", "//...", "--test_output=all", "--nocache_test_results"]
+output_contains = ["3 passed"]
+message = "Run `pixi run bazel test //forecast:dates_test --test_output=all`. If you see no pytest summary, the test file ran as a plain script and nothing was collected."

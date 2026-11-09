@@ -1,0 +1,18 @@
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "ledger",
+    srcs = ["ledger.py"],
+)
+
+py_test(
+    name = "ledger_test",
+    size = "small",
+    srcs = ["ledger_test.py"],
+    deps = [":ledger"],
+)
+
+py_test(
+    name = "smoke_test",
+    srcs = ["smoke_test.py"],
+)

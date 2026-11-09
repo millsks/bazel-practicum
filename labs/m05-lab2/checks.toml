@@ -1,0 +1,45 @@
+[[check]]
+name = "the ledger tests pass"
+command = ["test", "//ledger:ledger_test", "--test_output=errors"]
+message = "Read the log: a FileNotFoundError means the JSON file is not in the test's runfiles (add it to data) or the path is wrong; 'Read-only file system' means the test writes next to its source. Write to TEST_TMPDIR instead."
+
+[[check]]
+name = "the ledger tests pass from any working directory"
+command = ["test", "//ledger:ledger_test", "--run_under=//grading:from_tmp", "--test_output=errors"]
+message = "The test only works when started in the runfiles tree. Find the JSON file with the runfiles library: runfiles.Create().Rlocation(\"_main/ledger/testdata/entries.json\")."
+
+[[check]]
+name = "Bazel wrote the test logs"
+file_exists = ["bazel-testlogs/ledger/ledger_test/test.log", "bazel-testlogs/ledger/ledger_test/test.xml"]
+file_contains = { "bazel-testlogs/ledger/ledger_test/test.log" = "Ran 2 tests" }
+message = "bazel-testlogs/ledger/ledger_test/test.log should show both tests running. Is unittest.main() still at the bottom of ledger_test.py?"
+
+[[check]]
+name = "bazel test //... passes without a database"
+command = ["test", "//...", "--test_output=errors"]
+message = "//ledger:smoke_test needs a real database. Keep it out of wildcards with tags = [\"manual\"] (and \"external\", since it talks to the outside world)."
+
+[[check]]
+name = "the smoke test is manual"
+command = ["query", "attr(tags, manual, //ledger:all)"]
+stdout_contains = ["//ledger:smoke_test"]
+stdout_lacks = ["//ledger:ledger_test"]
+message = "Tag //ledger:smoke_test (and not ledger_test) with \"manual\"."
+
+[[check]]
+name = "a suite named integration holds the smoke test"
+command = ["query", "tests(//ledger:integration)"]
+stdout_lines = ["//ledger:smoke_test"]
+message = "Add test_suite(name = \"integration\", tests = [\":smoke_test\"]) to ledger/BUILD.bazel."
+
+[[check]]
+name = "bazel test //... still skips the smoke test"
+command = ["test", "//..."]
+stdout_lacks = ["//ledger:smoke_test"]
+message = "//... matches the test_suite, and a suite runs every test it names, manual or not. Tag the suite itself with \"manual\" too."
+
+[[check]]
+name = "the integration suite runs the manual test when asked"
+command = ["test", "//ledger:integration", "--test_env=LEDGER_DB_URL=memory://", "--test_output=errors"]
+stdout_contains = ["//ledger:smoke_test"]
+message = "A test_suite that names a manual test still runs it. Run `pixi run bazel test //ledger:integration --test_env=LEDGER_DB_URL=memory://`."

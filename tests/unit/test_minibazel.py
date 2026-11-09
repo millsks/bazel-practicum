@@ -1361,3 +1361,36 @@ def test_visibility_entries_must_name_package_groups() -> None:
     ) in loading.error
     assert "v3/BUILD.bazel:1:10: Label '//app:w' does not refer to a package group." in bazel.build("//v3:p").error
     assert bazel.query("deps(//v3:p)") == ["//app:w", "//v3:p"]
+
+
+# ---------------------------------------------------------------- gaps found while writing M05
+
+
+def _m05_ws(build: str) -> dict[str, str]:
+    return {
+        "MODULE.bazel": 'module(name = "m")\nbazel_dep(name = "rules_python", version = "2.4.6")\n',
+        "pkg/BUILD.bazel": 'load("@rules_python//python:defs.bzl", "py_test")\n' + build,
+        "pkg/t.py": "",
+        "pkg/m.py": "",
+        "pkg/s.py": "",
+    }
+
+
+def test_positive_manual_tag_filter_is_ignored() -> None:
+    sim = load_simulator(REPO_ROOT / "docs")
+    b = sim.Bazel(_m05_ws('py_test(name = "m", srcs = ["m.py"], tags = ["manual"])\npy_test(name = "s", srcs = ["s.py"])\n'))
+    assert b.test("//...", "--test_tag_filters=manual").tests == ["//pkg:s"]
+
+
+def test_invalid_size_is_a_loading_error() -> None:
+    sim = load_simulator(REPO_ROOT / "docs")
+    b = sim.Bazel(_m05_ws('py_test(name = "t", size = "tiny", srcs = ["t.py"])\n'))
+    result = b.build("//pkg:t")
+    assert not result.ok and result.phase == "loading"
+    assert "size 'tiny' is not a valid size" in result.error
+
+
+def test_attr_query_sees_default_test_size() -> None:
+    sim = load_simulator(REPO_ROOT / "docs")
+    b = sim.Bazel(_m05_ws('py_test(name = "t", srcs = ["t.py"])\n'))
+    assert b.query("attr(size, medium, //...)") == ["//pkg:t"]
