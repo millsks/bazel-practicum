@@ -1,0 +1,5 @@
+# Tries to reach past the filegroup into the macro's private genrule output.
+filegroup(
+    name = "peek",
+    srcs = ["//docs:faq.toc.md"],
+)

@@ -1,0 +1,15 @@
+# The table of contents for guide.md, written out by hand. faq.md needs the same
+# thing. Replace both with calls to markdown_toc from //tools:docs.bzl.
+genrule(
+    name = "guide_gen",
+    srcs = ["guide.md"],
+    outs = ["guide.toc.md"],
+    tools = ["//tools:toc"],
+    cmd = "$(location //tools:toc) $< $@",
+)
+
+filegroup(
+    name = "guide",
+    srcs = [":guide.toc.md"],
+    visibility = ["//grading:__subpackages__"],
+)

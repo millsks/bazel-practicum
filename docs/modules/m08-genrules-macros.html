@@ -1,0 +1,1447 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M08 · Generated Files &amp; Macros · Bazel Practicum</title>
+<link rel="stylesheet" href="../assets/css/course.css">
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/viz.js" defer></script>
+<script src="../assets/js/viz-bazel.js" defer></script>
+<script src="../assets/js/course.js" defer></script>
+</head>
+<body data-root="../" data-module="m08">
+<main class="lesson">
+  <header class="lesson-hero">
+    <p class="eyebrow">Stage 2 · Growing the Monorepo · Module 08</p>
+    <h1>Generated Files &amp; Macros</h1>
+    <p class="lede">Real repositories generate code: constants from a CSV, clients from a schema, a version file at release
+      time. Bazel can run any generator you have, as long as you tell it every input and every output in advance. This
+      module teaches <code>genrule</code> and its Make variables, the safer helpers in <code>bazel_skylib</code>, golden-file
+      tests, and how to stop copy-pasting BUILD code by writing your own macros.</p>
+    <div class="lesson-meta"><span>⏱ ~2.5 hours</span><span>Prerequisites: <a href="m07-rules-go.html">M07</a></span></div>
+    <ul class="objectives">
+      <li>Explain why Bazel must know every generated file before it runs anything, and use a generated file by its label</li>
+      <li>Write a <code>genrule</code> with <code>srcs</code>, <code>outs</code>, <code>cmd</code>, and <code>tools</code>, and choose the right Make variable for each path</li>
+      <li>Read the exact errors for undeclared prerequisites, <code>$@</code> with several outputs, and a binary in <code>srcs</code></li>
+      <li>Prefer <code>write_file</code>, <code>copy_file</code>, and <code>run_binary</code> from <code>bazel_skylib</code> when they fit</li>
+      <li>Guard generated files with <code>diff_test</code> against a checked-in golden, and "bless" a new golden with <code>bazel run</code></li>
+      <li>Write a legacy macro in a <code>.bzl</code> file with <code>native.*</code>, naming suffixes, passed-through visibility, and private helpers</li>
+      <li>Say what symbolic macros (<code>macro()</code>) add, and when you need a custom rule instead</li>
+    </ul>
+  </header>
+
+  <section class="lesson-section" id="why-generated">
+    <h2>Why generated files, and why declare them</h2>
+    <aside class="callout python">
+      <p>In a Python project, code generation hides in many places: a <code>build.py</code> that writes
+        <code>_version.py</code>, a <code>setup.py</code> hook that compiles <code>.proto</code> files, a Makefile target
+        that turns <code>colors.csv</code> into <code>constants.py</code>. You run it when you remember to. If you forget,
+        you import a stale file, and nothing tells you.</p>
+    </aside>
+    <p>A <strong>generated file</strong> is any file a build step produces instead of a person: a constants module, a
+      protobuf-style client, a version stamp, a processed data file. Typical reasons to generate:</p>
+    <div class="card-grid">
+      <div class="card"><h4>Code generation</h4><p>Python constants or enums from a CSV, API clients from an OpenAPI schema, gRPC stubs from <code>.proto</code> files.</p></div>
+      <div class="card"><h4>Version stamps</h4><p>A <code>version.txt</code> or <code>_build_info.py</code> holding a release number.</p></div>
+      <div class="card"><h4>Data processing</h4><p>Cleaning a CSV, compressing assets, building a lookup table a test reads.</p></div>
+      <div class="card"><h4>Documentation</h4><p>A table of contents, a reference page generated from code, a rendered diagram.</p></div>
+    </div>
+    <p>In Bazel, a generator is just another <strong>action</strong> (M02): a command with exact inputs and exact outputs.
+      Bazel must know the outputs <em>before</em> it runs anything. During analysis it plans the whole action graph,
+      and a planned action needs a list of files to produce. Other targets refer to those files by label, so the files
+      must exist as targets after loading.</p>
+    <p>That is the big difference from a Makefile habit. Make lets a recipe write any file it likes, and finds out
+      later. Bazel asks you to <em>declare</em> the outputs. In exchange it knows exactly when to re-run the generator
+      (an input's contents changed), can cache the result, and can share it with CI.</p>
+    <aside class="callout think">
+      <p>In this graph, <code>constants.py</code> is generated from <code>colors.csv</code> by a Python tool. Click
+        <code>colors.csv</code>: the generator, the library, and both tests re-run. Then click
+        <code>gen_constants.py</code> (the generator's own source). Why does editing the <em>tool</em> re-run the tests
+        too?</p>
+    </aside>
+    <div class="viz" data-viz="buildgraph" data-config='{"title": "A generated constants module: what re-runs?", "nodes": [
+      {"id": "gen_constants.py", "kind": "file", "x": 0, "y": 0},
+      {"id": "colors.csv", "kind": "file", "x": 0, "y": 1},
+      {"id": "constants.golden.py", "kind": "file", "x": 0, "y": 2},
+      {"id": "constants_test.py", "kind": "file", "x": 0, "y": 3},
+      {"id": "//tools:gen_constants", "kind": "rule", "x": 1, "y": 0, "deps": ["gen_constants.py"]},
+      {"id": "constants.py (generated)", "kind": "rule", "x": 1, "y": 1, "deps": ["//tools:gen_constants", "colors.csv"]},
+      {"id": "//palette:constants", "kind": "rule", "x": 1, "y": 2.5, "deps": ["constants.py (generated)"]},
+      {"id": "//palette:golden_test", "kind": "test", "x": 2, "y": 1.5, "deps": ["constants.py (generated)", "constants.golden.py"]},
+      {"id": "//palette:constants_test", "kind": "test", "x": 2, "y": 3, "deps": ["constants_test.py", "//palette:constants"]}
+    ]}'></div>
+    <p>The tool is an input of the generator action, so a change to the tool can change the output. Bazel tracks that
+      for you; a Makefile rarely does.</p>
+    <p><strong>Remember:</strong> a generator is an action; Bazel needs its outputs named in the BUILD file, so it can
+      plan, cache, and re-run it exactly when an input changes.</p>
+  </section>
+
+  <section class="lesson-section" id="genrule">
+    <h2>genrule: a shell command with declared files</h2>
+    <p><strong><code>genrule</code></strong> is Bazel's general-purpose generator. It is native, so it needs no
+      <code>load()</code>. It runs one Bash command, with four attributes doing most of the work:</p>
+    <dl>
+      <dt><strong><code>srcs</code></strong></dt><dd>Input files (labels). Only these are inside the sandbox.</dd>
+      <dt><strong><code>outs</code></strong></dt><dd>Output file <em>names</em>, relative to the package. Not labels: plain names.</dd>
+      <dt><strong><code>cmd</code></strong></dt><dd>The Bash command. It must create every file in <code>outs</code>.</dd>
+      <dt><strong><code>tools</code></strong></dt><dd>Programs the command runs (next sections).</dd>
+    </dl>
+    <pre data-label="gen/BUILD.bazel"><code class="language-starlark">genrule(
+    name = "count",
+    srcs = ["words.txt"],
+    outs = ["count.txt"],
+    cmd = "wc -l &lt; $(location words.txt) &gt; $@",
+)</code></pre>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">$ bazel build //gen:count
+INFO: Analyzed target //gen:count (6 packages loaded, 9 targets configured).
+INFO: Found 1 target...
+Target //gen:count up-to-date:
+  bazel-bin/gen/count.txt
+INFO: Elapsed time: 6.302s, Critical Path: 0.06s
+INFO: 2 processes: 1 internal, 1 linux-sandbox.
+INFO: Build completed successfully, 2 total actions</code></pre>
+    <p>The output lands in <code>bazel-bin/gen/count.txt</code>: the same package path, under <code>bazel-bin</code>.
+      Never under your source tree. Bazel makes outputs read-only, so editing them by hand fails; change the inputs
+      instead.</p>
+
+    <h3>Outputs are targets too</h3>
+    <p>Each name in <code>outs</code> becomes a <strong>generated file target</strong> in the package:
+      <code>//gen:count.txt</code>. You use it exactly like a source file: in another rule's <code>srcs</code> or
+      <code>data</code>, in another genrule, in a <code>py_library</code>'s <code>srcs</code> if it is a
+      <code>.py</code> file. So there are two labels here, and they mean different things:</p>
+    <table>
+      <thead><tr><th>Label</th><th>Kind</th><th>Means</th></tr></thead>
+      <tbody>
+        <tr><td><code>//gen:count</code></td><td>genrule rule</td><td>The rule. As a dependency, it stands for <em>all</em> its outputs.</td></tr>
+        <tr><td><code>//gen:count.txt</code></td><td>generated file</td><td>Exactly one output file.</td></tr>
+      </tbody>
+    </table>
+    <p>Prefer the file label when you want one specific output, so a later second output does not sneak into your
+      inputs. Give the rule a different name from its outputs: naming a genrule <code>version.txt</code> with output
+      <code>version.txt</code> builds, but Bazel warns:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">WARNING: e/BUILD.bazel:1:8: target 'version.txt' is both a rule and a file; please choose another name for the rule</code></pre>
+    <p>A common convention is a <code>_gen</code> suffix for the rule: <code>version_gen</code> producing
+      <code>version.txt</code>.</p>
+    <aside class="callout think">
+      <p>Predict before you run: what does <code>bazel query '//gen:*' --output=label_kind</code> list for this package?
+        How many targets, of which kinds? Then try <code>deps(//gen:report)</code>, which uses the output of another
+        genrule.</p>
+    </aside>
+    <div class="runnable" data-predict data-title="Rules and the files they generate" data-commands="bazel query '//gen:*' --output=label_kind|bazel query 'deps(//gen:report)'|bazel build //gen:report">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "gen")
+</textarea>
+<textarea class="file" data-path="gen/BUILD.bazel">
+genrule(
+    name = "count",
+    srcs = ["words.txt"],
+    outs = ["count.txt"],
+    cmd = "wc -l &lt; $(location words.txt) &gt; $@",
+)
+
+genrule(
+    name = "report",
+    srcs = [":count.txt"],
+    outs = ["report.md"],
+    cmd = "echo \"Words: $$(cat $(location :count.txt))\" &gt; $@",
+)
+</textarea>
+<textarea class="file" data-path="gen/words.txt" data-hidden>apple
+banana
+cherry</textarea>
+</div>
+    <p>Six targets: the BUILD file, <code>words.txt</code>, two genrules, and two generated files. Generated files
+      exist from the moment the package loads, before anything has run. That is what "declared in advance" means.</p>
+    <p><strong>Remember:</strong> <code>outs</code> are names, each becomes a <code>generated file</code> target, the
+      file lands in <code>bazel-bin/&lt;package&gt;/</code>, and you reference it by label like any other file.</p>
+  </section>
+
+  <section class="lesson-section" id="make-variables">
+    <h2>Make variables: letting Bazel write the paths</h2>
+    <p>You never know where Bazel will put a file. Inputs sit at <code>gen/words.txt</code> in the sandbox, outputs
+      under <code>bazel-out/k8-fastbuild/bin/gen/</code>, tools under yet another directory. So <code>cmd</code> uses
+      <strong>Make variables</strong>: placeholders like <code>$(location words.txt)</code> that Bazel replaces with
+      the right path before running the command. (The name comes from Make's <code>$(VAR)</code> syntax.)</p>
+    <p>We ran one genrule that prints every variable, with a source file, a generated file (<code>:count</code>), and a
+      tool in its inputs. These are the real expansions:</p>
+    <pre data-label="Real output (Bazel 9.3.2): bazel-bin/gen/vars.txt"><code class="language-none">location words.txt: gen/words.txt
+execpath words.txt: gen/words.txt
+rootpath words.txt: gen/words.txt
+rlocationpath words.txt: _main/gen/words.txt
+location :count: bazel-out/k8-fastbuild/bin/gen/count.txt
+location tool: bazel-out/k8-opt-exec/bin/tools/upper
+SRCS: gen/words.txt bazel-out/k8-fastbuild/bin/gen/count.txt
+OUTS: bazel-out/k8-fastbuild/bin/gen/vars.txt bazel-out/k8-fastbuild/bin/gen/other.txt
+RULEDIR: bazel-out/k8-fastbuild/bin/gen
+locations outs: bazel-out/k8-fastbuild/bin/gen/vars.txt</code></pre>
+    <table>
+      <thead><tr><th>Variable</th><th>Expands to</th><th>Use it for</th></tr></thead>
+      <tbody>
+        <tr><td><code>$(location X)</code></td><td>The path of the one file of <code>X</code>, from where the command runs</td><td>Almost everything in <code>cmd</code></td></tr>
+        <tr><td><code>$(locations X)</code></td><td>Space-separated paths of all files of <code>X</code></td><td>A filegroup, or a rule with several outputs</td></tr>
+        <tr><td><code>$(execpath X)</code> / <code>$(execpaths X)</code></td><td>Same as <code>location</code>(<code>s</code>) in a genrule: the path at execution time</td><td>The explicit, modern spelling</td></tr>
+        <tr><td><code>$(rootpath X)</code></td><td>The path inside a runfiles tree: <code>gen/count.txt</code>, no <code>bazel-out/...</code> prefix</td><td><code>args</code> of a <code>py_binary</code> or test that reads its <code>data</code></td></tr>
+        <tr><td><code>$(rlocationpath X)</code></td><td><code>_main/gen/words.txt</code>: repository name plus path</td><td>Looking a file up with the runfiles library (M03)</td></tr>
+        <tr><td><code>$@</code></td><td>The output path, when there is exactly one output</td><td>Single-output genrules</td></tr>
+        <tr><td><code>$&lt;</code></td><td>The input path, when there is exactly one file in <code>srcs</code></td><td>Single-input genrules</td></tr>
+        <tr><td><code>$(SRCS)</code> / <code>$(OUTS)</code></td><td>All inputs / all outputs, space separated</td><td>Loops and <code>cat $(SRCS)</code></td></tr>
+        <tr><td><code>$(RULEDIR)</code></td><td>The output directory of this package</td><td>Tools that take an output directory</td></tr>
+      </tbody>
+    </table>
+    <p>The difference between <code>execpath</code> and <code>rootpath</code> shows up for generated files:
+      <code>$(execpath :count.txt)</code> was <code>bazel-out/k8-fastbuild/bin/gen/count.txt</code>, while
+      <code>$(rootpath :count.txt)</code> was <code>gen/count.txt</code>. A genrule's command runs from the execution
+      root, so it wants execpaths. A binary started by <code>bazel run</code> or a test runs from its runfiles tree,
+      so its <code>args</code> want rootpaths.</p>
+
+    <h3>The errors you will meet</h3>
+    <p>Every one of these is an <strong>analysis</strong> error: Bazel expands the variables while planning the
+      action, before running anything. (Paths shortened from absolute to workspace-relative in all outputs below.)</p>
+    <p><strong>A label that is not an input.</strong> <code>$(location)</code> only works for labels listed in
+      <code>srcs</code>, <code>tools</code>, or <code>outs</code>:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: gen/BUILD.bazel:8:8: in cmd attribute of genrule rule //gen:undeclared: label '//gen:words.txt' in $(location) expression is not a declared prerequisite of this rule
+ERROR: gen/BUILD.bazel:8:8: Analysis of target '//gen:undeclared' (config: a7a71fd) failed
+ERROR: Analysis of target '//gen:undeclared' failed; build aborted</code></pre>
+    <p>The fix is never to hard-code the path. Add the file to <code>srcs</code>; then it is in the sandbox and in the
+      cache key.</p>
+    <p><strong><code>$@</code> with two outputs.</strong> <code>$@</code> means "the output", so it is ambiguous with
+      more than one:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: gen/BUILD.bazel:14:8: in cmd attribute of genrule rule //gen:two: variable '$@' : more than one output file
+ERROR: gen/BUILD.bazel:14:8: Analysis of target '//gen:two' (config: a7a71fd) failed
+ERROR: Analysis of target '//gen:two' failed; build aborted</code></pre>
+    <p>Use <code>$(location a.txt)</code> and <code>$(location b.txt)</code> for each output instead (outputs are
+      prerequisites too). <code>$&lt;</code> has the twin error: <code>variable '$&lt;' : more than one input
+      file</code>.</p>
+    <p><strong>A shell variable.</strong> In <code>cmd</code>, every <code>$</code> belongs to Bazel first. To reach
+      the shell, double it:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: e/BUILD.bazel:20:8: in cmd attribute of genrule rule //e:home: '$HOME' syntax is not supported; use '$(HOME)' instead for "Make" variables, or escape the '$' as '$$' if you intended this for the shell</code></pre>
+    <p>So a shell loop is <code>for f in $(SRCS); do wc -l &lt; $$f; done &gt; $@</code>. And an unknown Make
+      variable such as <code>$(VERSION)</code> fails with <code>$(VERSION) not defined</code>.</p>
+    <aside class="callout warn">
+      <p>Even <code>$$HOME</code> fails on Linux: genrules run with <code>set -u</code> and a minimal environment
+        (<code>PATH=/bin:/usr/bin:/usr/local/bin</code>, as <code>aquery</code> showed in M02), and our run stopped with
+        <code>HOME: unbound variable</code>. That is hermeticity at work. Pass what the command needs as declared
+        inputs, not through the environment.</p>
+    </aside>
+    <aside class="callout think">
+      <p>The sandbox below has three broken genrules. Run the build and read each error. Fix
+        <code>stamp</code> by declaring its input, <code>split</code> by replacing <code>$@</code>, and
+        <code>loop</code> by escaping the shell variable.</p>
+    </aside>
+    <div class="runnable" data-title="Three Make-variable mistakes" data-commands="bazel build //gen:all|bazel build //gen:stamp|bazel build //gen:split|bazel build //gen:loop">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "gen")
+</textarea>
+<textarea class="file" data-path="gen/BUILD.bazel">
+genrule(
+    name = "stamp",
+    outs = ["version.py"],
+    cmd = "echo \"VERSION = '$$(cat $(location VERSION))'\" &gt; $@",
+)
+
+genrule(
+    name = "split",
+    srcs = ["words.txt"],
+    outs = ["head.txt", "tail.txt"],
+    cmd = "head -n 1 $&lt; &gt; $@",
+)
+
+genrule(
+    name = "loop",
+    srcs = ["words.txt", "VERSION"],
+    outs = ["sizes.txt"],
+    cmd = "for f in $(SRCS); do wc -c &lt; $f; done &gt; $@",
+)
+</textarea>
+<textarea class="file" data-path="gen/words.txt" data-hidden></textarea>
+<textarea class="file" data-path="gen/VERSION" data-hidden>1.4.0</textarea>
+</div>
+    <aside class="callout sim">
+      <p>The simulator checks <code>$(location)</code> prerequisites, <code>$@</code>, <code>$&lt;</code>, and unknown
+        <code>$(NAME)</code> variables with Bazel's wording. It does not flag a bare shell <code>$f</code> or
+        <code>$HOME</code> (real Bazel does, as shown above), and it never runs the command.</p>
+    </aside>
+    <p><strong>Remember:</strong> let Bazel write paths with <code>$(location)</code>/<code>$(execpath)</code>; every
+      label you expand must be declared; <code>$@</code> and <code>$&lt;</code> need exactly one file; write
+      <code>$$</code> for the shell.</p>
+  </section>
+
+  <section class="lesson-section" id="tools">
+    <h2>tools: running your own generator</h2>
+    <aside class="callout python">
+      <p>Your <code>build.py</code> runs with whichever Python is active. On CI that might be a different version than on
+        your laptop, and on a cross-compiling build it might not even be the platform you are building for.</p>
+    </aside>
+    <p>Most generators are programs you wrote: a <code>py_binary</code> that reads a CSV and writes Python. A genrule runs
+      such a program through <strong><code>tools</code></strong>:</p>
+    <pre data-label="gen/BUILD.bazel"><code class="language-starlark">genrule(
+    name = "shout_tools",
+    srcs = ["words.txt"],
+    outs = ["shout.txt"],
+    tools = ["//tools:upper"],          # a py_binary: upper.py IN OUT
+    cmd = "$(location //tools:upper) $&lt; $@",
+)</code></pre>
+    <p>Why not just put the binary in <code>srcs</code>? Because Bazel builds the two lists in different
+      <strong>configurations</strong>. A configuration is the set of settings a target is built with: compilation
+      mode, CPU, platform, flags (M06).</p>
+    <ul>
+      <li>The <strong>target configuration</strong> is for things you are building to ship or test: <code>srcs</code>,
+        <code>deps</code>, <code>data</code>.</li>
+      <li>The <strong>exec configuration</strong> is for things that run <em>during</em> the build, on the machine that
+        executes actions: compilers, generators, everything in <code>tools</code>. It is optimized by default
+        (<code>-opt-exec</code>).</li>
+    </ul>
+    <p><code>cquery</code> shows the configuration next to each dependency. The genrule and its input use the target
+      configuration; the tool gets a different hash, the exec one:</p>
+    <pre data-label="Real output (Bazel 9.3.2), excerpt"><code class="language-none">$ bazel cquery 'deps(//gen:shout_tools, 1)' --noimplicit_deps
+//gen:shout_tools (a7a71fd)
+//gen:words.txt (null)
+//tools:upper (04bf134)
+$ bazel config
+Available configurations:
+04bf134dfa57115b01daa56bd3a30421a6e74b1819e002496a26c94ed0087067 k8-opt-exec (exec)
+...
+e722a217ced723dfeb49874b2007895ae0dc9a9d49d004d95320b88c609c409a k8-fastbuild</code></pre>
+    <p>Source files have no configuration (<code>null</code>). On a laptop the two configurations target the same CPU,
+      so the difference looks academic. It stops being academic when you cross-compile (building Linux ARM binaries on
+      a Mac): the generator must run on the Mac, while the product runs on ARM. <code>tools</code> gets that right
+      automatically.</p>
+    <p>There is also a practical reason. A <code>py_binary</code> is several files (a launcher, its
+      <code>.py</code> sources, its runfiles). In <code>tools</code>, <code>$(location)</code> means "the executable".
+      In <code>srcs</code>, it means "all of its files", and Bazel refuses:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: lt/BUILD.bazel:1:8: in cmd attribute of genrule rule //lt:shout: label '//tools:upper' in $(location) expression expands to more than one file, please use $(locations //tools:upper) instead.  Files (at most 5 shown) are: [bazel-out/k8-fastbuild/bin/tools/upper, tools/upper.py]
+ERROR: lt/BUILD.bazel:1:8: Analysis of target '//lt:shout' failed; build aborted</code></pre>
+    <p>The suggestion (<code>$(locations ...)</code>) is a trap: it would paste two paths into your command. The real
+      fix is to move the binary from <code>srcs</code> to <code>tools</code>. Note that the listed files live in
+      <code>k8-fastbuild</code>, the target configuration, which confirms the binary was built for the wrong
+      purpose.</p>
+    <p>With the tool in <code>tools</code>, <code>aquery</code> shows the whole picture: the tool's launcher and runfiles
+      are action inputs (so editing the tool re-runs the generator), and the command calls it from the exec
+      output directory:</p>
+    <pre data-label="Real output (Bazel 9.3.2), excerpt"><code class="language-none">$ bazel aquery 'mnemonic(Genrule, //gen:shout_tools)'
+action 'Executing genrule //gen:shout_tools'
+  Mnemonic: Genrule
+  Inputs: [bazel-out/k8-opt-exec/bin/tools/upper, bazel-out/k8-opt-exec/bin/tools/upper.runfiles, external/bazel_tools/tools/genrule/genrule-setup.sh, gen/words.txt, tools/upper.py]
+  Outputs: [bazel-out/k8-fastbuild/bin/gen/shout.txt]
+  Command Line: (exec /bin/bash \
+    -c \
+    'source external/bazel_tools/tools/genrule/genrule-setup.sh; bazel-out/k8-opt-exec/bin/tools/upper gen/words.txt bazel-out/k8-fastbuild/bin/gen/shout.txt')</code></pre>
+    <aside class="callout sim">
+      <p>The simulator does not model configurations or a binary's multiple files, so it accepts a
+        <code>py_binary</code> in <code>srcs</code> with <code>$(location)</code>. The exercises check where you put the
+        binary; the lab shows the real error.</p>
+    </aside>
+    <p><strong>Remember:</strong> anything the command <em>runs</em> goes in <code>tools</code> (exec configuration);
+      anything it <em>reads</em> goes in <code>srcs</code> (target configuration).</p>
+  </section>
+
+  <section class="lesson-section" id="hermetic">
+    <h2>Sandboxes, missing outputs, and other honesty checks</h2>
+    <p>M02 showed that a genrule reading a file it never declared fails in the sandbox. The same discipline applies to
+      the output side, and it catches Makefile habits early.</p>
+    <p><strong>Reading an undeclared file</strong> fails at execution, because the file is not in the sandbox:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: un/BUILD.bazel:1:8: Executing genrule //un:count failed: (Exit 1): bash failed: error executing Genrule command (from genrule rule target //un:count) /bin/bash -c 'source external/bazel_tools/tools/genrule/genrule-setup.sh; wc -l &lt; un/words.txt &gt; bazel-out/k8-fastbuild/bin/un/count.txt'
+Use --sandbox_debug to see verbose messages from the sandbox and retain the sandbox build root for debugging
+/bin/bash: line 1: un/words.txt: No such file or directory</code></pre>
+    <p><strong>Forgetting to create a declared output</strong> also fails at execution. Here <code>outs</code> lists
+      <code>left.txt</code> and <code>right.txt</code>, but the command only touches the first:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: e/BUILD.bazel:14:8: declared output 'e/right.txt' was not created by genrule. This is probably because the genrule actually didn't create this output, or because the output was a directory and the genrule was run remotely (note that only the contents of declared file outputs are copied from genrules run remotely)
+ERROR: e/BUILD.bazel:14:8: Executing genrule //e:pair failed: not all outputs were created or valid</code></pre>
+    <p><strong>Writing an undeclared file</strong> is silently thrown away. A command that also writes
+      <code>$(RULEDIR)/undeclared.txt</code> builds fine, but only the declared file appears in
+      <code>bazel-bin</code>: the sandbox is discarded after the action. If something "disappears", it was never
+      declared.</p>
+    <p><strong>Generated files are not globbed.</strong> <code>glob()</code> runs at loading time over the
+      <em>source</em> tree, so <code>glob(["*.txt"])</code> never matches a generated <code>.txt</code>. Name generated
+      files explicitly by label.</p>
+    <aside class="callout warn">
+      <p>A generator whose output is a <em>directory</em> of unknown files (protoc emitting one file per message, a
+        docs tool emitting a site) does not fit <code>outs</code>. Real rules use "tree artifacts" for that, which need a
+        custom rule (Level 3). In Level 1, either list the files you know will be produced, or make the tool write a
+        single archive.</p>
+    </aside>
+    <p><strong>Remember:</strong> undeclared inputs fail, undeclared outputs vanish, declared-but-missing outputs fail,
+      and globs never see generated files.</p>
+  </section>
+
+  <section class="lesson-section" id="skylib">
+    <h2>bazel_skylib: write_file, copy_file, run_binary</h2>
+    <p><code>genrule</code> is flexible, but it means Bash, which is fragile (quoting, <code>set -u</code>,
+      Windows). For the common cases <strong><code>bazel_skylib</code></strong>, Bazel's standard library module, has
+      purpose-built rules. Add it once to <code>MODULE.bazel</code>:</p>
+    <pre data-label="MODULE.bazel"><code class="language-starlark">bazel_dep(name = "bazel_skylib", version = "1.9.2")</code></pre>
+    <div class="card-grid">
+      <div class="card"><h4><code>write_file</code></h4><p>Writes fixed lines of text to <code>out</code>. No shell at all.</p></div>
+      <div class="card"><h4><code>copy_file</code></h4><p>Copies <code>src</code> (a file or generated file) to a new name <code>out</code>.</p></div>
+      <div class="card"><h4><code>run_binary</code></h4><p>Runs one <code>tool</code> with <code>args</code>, directly, without Bash. Takes <code>srcs</code>, <code>outs</code>, and <code>env</code>.</p></div>
+      <div class="card"><h4><code>diff_test</code></h4><p>A test that passes when two files are identical. Next section.</p></div>
+    </div>
+    <pre data-label="golden/BUILD.bazel"><code class="language-starlark">load("@bazel_skylib//rules:copy_file.bzl", "copy_file")
+load("@bazel_skylib//rules:run_binary.bzl", "run_binary")
+load("@bazel_skylib//rules:write_file.bzl", "write_file")
+
+write_file(
+    name = "greeting",
+    out = "greeting.txt",
+    content = ["hello", "world", ""],    # lines; the empty last line adds a final newline
+)
+
+copy_file(
+    name = "greeting_copy",
+    src = ":greeting.txt",
+    out = "copy.txt",
+)
+
+run_binary(
+    name = "shout",
+    srcs = ["words.txt"],
+    outs = ["shout.txt"],
+    args = [
+        "$(location words.txt)",
+        "$(location shout.txt)",
+    ],
+    tool = "//tools:upper",
+)</code></pre>
+    <p>Two details we checked. <code>write_file</code> joins <code>content</code> with newlines and adds none at the
+      end: <code>["hello", "world"]</code> produced <code>hello\nworld</code>, so add <code>""</code> for a trailing
+      newline. And <code>run_binary</code>'s <code>tool</code> is built in the exec configuration, exactly like
+      <code>genrule</code>'s <code>tools</code> (<code>cquery</code> showed <code>//tools:upper (04bf134)</code>).</p>
+    <p><strong>Prefer <code>run_binary</code> over <code>genrule</code> when all you do is run one binary.</strong>
+      There is no shell to quote, no <code>$$</code>, no <code>set -u</code> surprises, and it works on Windows. Each
+      <code>args</code> entry reaches the tool as one argument, after <code>$(location)</code> expansion. The same
+      prerequisite rule applies, with the same wording:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: rb/BUILD.bazel:3:11: in run_binary rule //rb:r: label '//rb:words.txt' in $(location) expression is not a declared prerequisite of this rule</code></pre>
+    <p>Reach for <code>genrule</code> when you genuinely need a shell: a pipeline, a loop, several commands.</p>
+    <aside class="callout note">
+      <p>In <code>bazel query --output=label_kind</code>, real Bazel lists <code>write_file</code> targets as
+        <code>_write_file rule</code> and <code>copy_file</code> as <code>_copy_file rule</code>: those two public
+        names are macros wrapping private rules. <code>run_binary</code> and <code>diff_test</code> appear under their
+        own names. (The simulator prints the public names.)</p>
+    </aside>
+    <div class="runnable" data-title="skylib generators" data-commands="bazel build //golden:all|bazel query 'labels(tool, //golden:shout)'|bazel query 'kind(&quot;generated file&quot;, //golden:*)'">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "skylib_demo")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+bazel_dep(name = "bazel_skylib", version = "1.9.2")
+</textarea>
+<textarea class="file" data-path="golden/BUILD.bazel">
+load("@bazel_skylib//rules:copy_file.bzl", "copy_file")
+load("@bazel_skylib//rules:run_binary.bzl", "run_binary")
+load("@bazel_skylib//rules:write_file.bzl", "write_file")
+
+write_file(
+    name = "greeting",
+    out = "greeting.txt",
+    content = ["hello", "world", ""],
+)
+
+copy_file(
+    name = "greeting_copy",
+    src = ":greeting.txt",
+    out = "copy.txt",
+)
+
+run_binary(
+    name = "shout",
+    srcs = ["words.txt"],
+    outs = ["shout.txt"],
+    args = [
+        "$(location words.txt)",
+        "$(location shout.txt)",
+    ],
+    tool = "//tools:upper",
+)
+</textarea>
+<textarea class="file" data-path="tools/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "upper",
+    srcs = ["upper.py"],
+    visibility = ["//visibility:public"],
+)
+</textarea>
+<textarea class="file" data-path="golden/words.txt" data-hidden></textarea>
+<textarea class="file" data-path="tools/upper.py" data-hidden></textarea>
+</div>
+    <p><strong>Remember:</strong> <code>write_file</code> for fixed text, <code>copy_file</code> to rename,
+      <code>run_binary</code> to run one tool without a shell; <code>genrule</code> only when you need Bash.</p>
+  </section>
+
+  <section class="lesson-section" id="golden">
+    <h2>Golden files and diff_test</h2>
+    <aside class="callout python">
+      <p>pytest users know snapshot testing (<code>syrupy</code>, <code>pytest-regressions</code>): the expected output
+        is stored in a file, the test compares, and a flag like <code>--snapshot-update</code> rewrites the file when the
+        change is intended.</p>
+    </aside>
+    <p>The Bazel version is the <strong>golden-file pattern</strong>. You check in the expected output (the
+      <em>golden</em>), and a test compares it with what the generator produces now. Reviewers then see generated
+      changes in code review as a diff of the golden, instead of trusting a tool blindly.</p>
+    <pre data-label="golden/BUILD.bazel (continued)"><code class="language-starlark">load("@bazel_skylib//rules:diff_test.bzl", "diff_test")
+
+diff_test(
+    name = "shout_golden_test",
+    file1 = ":shout.txt",          # generated
+    file2 = "shout.golden.txt",    # checked in
+)</code></pre>
+    <p>When they differ, the test fails with a <code>diff</code> in its log (<code>&lt;</code> is
+      <code>file1</code>, <code>&gt;</code> is <code>file2</code>). We misspelled one line of the golden:</p>
+    <pre data-label="Real output (Bazel 9.3.2), log path shortened"><code class="language-none">$ bazel test //golden:shout_golden_test --test_output=errors
+FAIL: //golden:shout_golden_test (Exit 1) (see .../testlogs/golden/shout_golden_test/test.log)
+INFO: From Testing //golden:shout_golden_test:
+==================== Test output for //golden:shout_golden_test:
+3c3
+&lt; CHERRY
+---
+&gt; CHERY
+FAIL: files "golden/shout.txt" and "golden/shout.golden.txt" differ.
+================================================================================
+//golden:shout_golden_test                                               FAILED in 0.0s
+Executed 1 out of 1 test: 1 fails locally.</code></pre>
+
+    <h3>Blessing a golden with bazel run</h3>
+    <p>When the change is intended, you "bless" the new output: copy it over the golden. Doing that by hand from
+      <code>bazel-bin</code> works, but teams make it a target. A small <code>py_binary</code> receives both files'
+      <code>rootpath</code>s and writes into the source tree, which <code>bazel run</code> exposes as
+      <code>BUILD_WORKSPACE_DIRECTORY</code> (M03):</p>
+    <pre data-label="golden/BUILD.bazel (continued)"><code class="language-starlark">py_binary(
+    name = "update_golden",
+    srcs = ["update_golden.py"],
+    args = [
+        "$(rootpath :shout.txt)",
+        "$(rootpath shout.golden.txt)",
+    ],
+    data = [
+        ":shout.txt",
+        "shout.golden.txt",
+    ],
+)</code></pre>
+    <pre data-label="golden/update_golden.py"><code class="language-python">import os
+import shutil
+import sys
+
+generated, golden = sys.argv[1], sys.argv[2]
+# `bazel run` starts in the runfiles tree; BUILD_WORKSPACE_DIRECTORY is your source tree.
+target = os.path.join(os.environ["BUILD_WORKSPACE_DIRECTORY"], golden)
+shutil.copyfile(generated, target)
+print(f"Updated {golden}")</code></pre>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">$ bazel run //golden:update_golden
+INFO: Running command line: bazel-bin/golden/update_golden golden/shout.txt golden/shout.golden.txt
+Updated golden/shout.golden.txt
+$ bazel test //golden:shout_golden_test
+//golden:shout_golden_test                                               PASSED in 0.0s
+Executed 1 out of 1 test: 1 test passes.</code></pre>
+    <p>Notice the <code>rootpath</code>s: <code>golden/shout.txt</code>, not <code>bazel-out/...</code>. The binary
+      runs from its runfiles tree, where <code>data</code> files sit at their rootpath.</p>
+    <aside class="callout pro">
+      <p>Why check generated files in at all, if Bazel can generate them? Two reasons: reviewers see the effect of a
+        generator change, and tools outside Bazel (an IDE, <code>pip install -e .</code>) can still find the file. Keep
+        the golden next to the BUILD file, name it <code>*.golden.*</code>, and add a comment telling people which
+        target blesses it.</p>
+    </aside>
+    <p><strong>Remember:</strong> <code>diff_test(file1 = generated, file2 = golden)</code> fails with a diff;
+      bless intended changes with a <code>bazel run</code> target that copies into
+      <code>BUILD_WORKSPACE_DIRECTORY</code>.</p>
+  </section>
+
+  <section class="lesson-section" id="macros">
+    <h2>Legacy macros: functions that write targets</h2>
+    <aside class="callout python">
+      <p>When you copy-paste the same ten lines three times in Python, you write a function. BUILD files have no
+        <code>def</code> (M01), so where does the function go?</p>
+    </aside>
+    <p>Into a <strong><code>.bzl</code> file</strong>: a Starlark file that may define functions, which BUILD files
+      <code>load()</code>. A function there that declares targets is a <strong>macro</strong>. Since Bazel 8 this
+      original kind is called a <strong>legacy macro</strong>, to distinguish it from symbolic macros (next section).
+      A legacy macro runs during loading; when it returns, the package simply contains the targets it declared, as if
+      you had written them by hand.</p>
+    <pre data-label="tools/macros/shout.bzl"><code class="language-starlark">"""A legacy macro: upper-case a file and bundle the result."""
+
+def _out_name(src):
+    return src.replace(".txt", ".upper.txt")
+
+def shouted_files(name, src, visibility = None):
+    """Creates &lt;name&gt;_gen (a genrule) and &lt;name&gt; (a filegroup of its output)."""
+    out = _out_name(src)
+    native.genrule(
+        name = name + "_gen",
+        srcs = [src],
+        outs = [out],
+        tools = ["//tools:upper"],
+        cmd = "$(location //tools:upper) $&lt; $@",
+        visibility = ["//visibility:private"],
+    )
+    native.filegroup(
+        name = name,
+        srcs = [":" + out],
+        visibility = visibility,
+    )</code></pre>
+    <pre data-label="notes/BUILD.bazel"><code class="language-starlark">load("//tools/macros:shout.bzl", "shouted_files")
+
+shouted_files(
+    name = "a",
+    src = "a.txt",
+)
+
+shouted_files(
+    name = "b",
+    src = "b.txt",
+    visibility = ["//visibility:public"],
+)</code></pre>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">$ bazel query '//notes:*' --output=label_kind
+source file //notes:BUILD.bazel
+filegroup rule //notes:a
+source file //notes:a.txt
+generated file //notes:a.upper.txt
+genrule rule //notes:a_gen
+filegroup rule //notes:b
+source file //notes:b.txt
+generated file //notes:b.upper.txt
+genrule rule //notes:b_gen</code></pre>
+    <p>The conventions in that file are the ones every good macro follows:</p>
+    <ul>
+      <li><strong><code>native.genrule</code>, not <code>genrule</code>.</strong> Inside a <code>.bzl</code> file,
+        native rules live under <code>native.</code>. Forget it and loading fails:
+        <code>shout.bzl:10:5: name 'genrule' is not defined (did you mean 'subrule'?)</code>. Rules from rule sets
+        (<code>py_library</code>, <code>run_binary</code>) are <code>load()</code>ed at the top of the
+        <code>.bzl</code> and called directly.</li>
+      <li><strong>A <code>name</code> parameter, and every target derived from it.</strong> The "main" target gets
+        exactly <code>name</code>; helpers get <code>name</code> plus a suffix (<code>_gen</code>). Then two calls
+        never clash, and users can guess labels. A clash is a loading error:
+        <code>Error in genrule: genrule rule 'a_gen' conflicts with existing genrule rule</code>.</li>
+      <li><strong><code>visibility</code> passed through to the main target only.</strong> Callers control who uses
+        the result; helpers stay private. With <code>visibility = None</code>, the package default applies.</li>
+      <li><strong>Private helpers start with <code>_</code>.</strong> A BUILD file cannot load them.</li>
+      <li><strong>A docstring</strong> saying which targets the macro creates.</li>
+    </ul>
+    <pre data-label="Real output (Bazel 9.3.2): load(&quot;//tools/macros:shout.bzl&quot;, &quot;shouted_files&quot;, &quot;_out_name&quot;)"><code class="language-none">ERROR: notes/BUILD.bazel:1:52: symbol '_out_name' is private and cannot be imported
+ERROR: package contains errors: notes: symbol '_out_name' is private and cannot be imported</code></pre>
+    <p>A <code>.bzl</code> file needs a package to live in: <code>tools/macros/</code> must have a
+      <code>BUILD.bazel</code> (an empty one is fine), or the <code>load()</code> label is invalid.</p>
+
+    <h3>Seeing through a macro</h3>
+    <p>Because a legacy macro just declares targets, <code>bazel query --output=build</code> shows what it expanded to,
+      plus where each target came from:</p>
+    <pre data-label="Real output (Bazel 9.3.2), excerpt, paths shortened"><code class="language-none">$ bazel query //notes:a_gen --output=build
+genrule(
+  name = "a_gen",
+  visibility = ["//visibility:private"],
+  generator_name = "a",
+  generator_function = "shouted_files",
+  ...
+  outs = ["//notes:a.upper.txt"],
+  cmd = "$(location //tools:upper) $&lt; $@",
+)
+# Rule a_gen instantiated at (most recent call last):
+#   notes/BUILD.bazel:3:14           in &lt;toplevel&gt;
+#   tools/macros/shout.bzl:10:19     in shouted_files</code></pre>
+    <p><code>generator_function</code> is queryable: <code>bazel query 'attr(generator_function, shouted_files,
+      //...)'</code> lists every target any call of the macro created. The second lab grades with it.</p>
+
+    <h3><code>print()</code> debugging</h3>
+    <p><code>print()</code> works in <code>.bzl</code> files and shows up as a <code>DEBUG</code> line while the package
+      loads:</p>
+    <pre data-label="Real output (Bazel 9.3.2), paths shortened"><code class="language-none">DEBUG: tools/macros/shout.bzl:9:10: shouted_files: a.txt -&gt; a.upper.txt
+DEBUG: tools/macros/shout.bzl:9:10: shouted_files: b.txt -&gt; b.upper.txt</code></pre>
+    <p>Use it while writing a macro, then delete it. It prints for every call, for every user, in every build that
+      loads the package; in a big repository that is noise in everyone's terminal. It also only prints when the package
+      is actually re-loaded: our next build printed nothing, because Bazel had cached the loaded package. So a missing
+      <code>DEBUG</code> line does not mean the code did not run earlier.</p>
+    <aside class="callout think">
+      <p>Run the commands below. Then add a third call, <code>shouted_files(name = "c", src = "c.txt")</code>, and
+        predict which new targets <code>//notes:*</code> lists. Finally rename the call for <code>b</code> to
+        <code>name = "a"</code> and read the error.</p>
+    </aside>
+    <div class="runnable" data-title="A macro, called twice" data-commands="bazel query '//notes:*' --output=label_kind|bazel build //notes:all|bazel query 'deps(//notes:b)'">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "macros")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="tools/macros/shout.bzl">
+"""A legacy macro: upper-case a file and bundle the result."""
+
+def _out_name(src):
+    return src.replace(".txt", ".upper.txt")
+
+def shouted_files(name, src, visibility = None):
+    """Creates &lt;name&gt;_gen (a genrule) and &lt;name&gt; (a filegroup of its output)."""
+    out = _out_name(src)
+    native.genrule(
+        name = name + "_gen",
+        srcs = [src],
+        outs = [out],
+        tools = ["//tools:upper"],
+        cmd = "$(location //tools:upper) $&lt; $@",
+        visibility = ["//visibility:private"],
+    )
+    native.filegroup(
+        name = name,
+        srcs = [":" + out],
+        visibility = visibility,
+    )
+</textarea>
+<textarea class="file" data-path="notes/BUILD.bazel">
+load("//tools/macros:shout.bzl", "shouted_files")
+
+shouted_files(
+    name = "a",
+    src = "a.txt",
+)
+
+shouted_files(
+    name = "b",
+    src = "b.txt",
+    visibility = ["//visibility:public"],
+)
+</textarea>
+<textarea class="file" data-path="tools/macros/BUILD.bazel" data-hidden></textarea>
+<textarea class="file" data-path="tools/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "upper",
+    srcs = ["upper.py"],
+    visibility = ["//visibility:public"],
+)
+</textarea>
+<textarea class="file" data-path="tools/upper.py" data-hidden></textarea>
+<textarea class="file" data-path="notes/a.txt" data-hidden></textarea>
+<textarea class="file" data-path="notes/b.txt" data-hidden></textarea>
+<textarea class="file" data-path="notes/c.txt" data-hidden></textarea>
+</div>
+    <aside class="callout sim">
+      <p>The simulator evaluates local <code>.bzl</code> files, <code>native.*</code>, and private-symbol rules like
+        Bazel. It does not show <code>print()</code> output in the command box, does not support
+        <code>--output=build</code>, and does not record <code>generator_function</code>; those are real-Bazel only.</p>
+    </aside>
+    <p><strong>Remember:</strong> a legacy macro is a <code>.bzl</code> function that calls
+      <code>native.*</code> and loaded rules; derive every name from <code>name</code>; pass
+      <code>visibility</code> to the main target; keep helpers <code>_private</code>; delete your
+      <code>print()</code>s.</p>
+  </section>
+
+  <section class="lesson-section" id="symbolic-macros">
+    <h2>Symbolic macros: <code>macro()</code> in Bazel 8+</h2>
+    <p>Legacy macros are just functions, so nothing stops a caller passing a list where a string belongs, or a macro
+      naming a target <code>gen</code> that collides with the caller's. Bazel 8 added <strong>symbolic
+      macros</strong>, declared with <code>macro()</code>. They look like rules from the outside, with typed
+      attributes, and Bazel enforces the conventions you just learned.</p>
+    <pre data-label="tools/macros/shout_sym.bzl"><code class="language-starlark">def _shouted_impl(name, visibility, src):
+    native.genrule(
+        name = name + "_gen",
+        srcs = [src],
+        outs = [name + ".upper.txt"],
+        tools = ["//tools:upper"],
+        cmd = "$(location //tools:upper) $&lt; $@",
+    )
+    native.filegroup(
+        name = name,
+        srcs = [name + ".upper.txt"],
+        visibility = visibility,
+    )
+
+shouted = macro(
+    doc = "Upper-cases src into &lt;name&gt;.upper.txt and wraps it in a filegroup.",
+    implementation = _shouted_impl,
+    attrs = {
+        "src": attr.label(mandatory = True, allow_single_file = True, configurable = False),
+    },
+)</code></pre>
+    <pre data-label="memo/BUILD.bazel"><code class="language-starlark">load("//tools/macros:shout_sym.bzl", "shouted")
+
+shouted(
+    name = "c",
+    src = "c.txt",
+)</code></pre>
+    <p>That builds in Bazel 9.3.2 and creates <code>//memo:c</code>, <code>//memo:c_gen</code>, and
+      <code>//memo:c.upper.txt</code>. The implementation receives <code>name</code> and <code>visibility</code>
+      automatically, plus each declared attribute. What you get for the extra ceremony, each verified:</p>
+    <p><strong>Typed attributes.</strong> Passing <code>src = ["c.txt"]</code> fails at the call site, naming the
+      attribute:</p>
+    <pre data-label="Real output (Bazel 9.3.2), paths shortened"><code class="language-none">Error: expected value of type 'string' for attribute 'src' of 'shouted', but got ["c.txt"] (list)</code></pre>
+    <p>An unknown attribute is refused too: <code>no such attribute 'out' in 'shouted' macro</code>.</p>
+    <p><strong>Naming enforced.</strong> Every target must be <code>name</code> or start with <code>name</code> plus
+      <code>_</code>, <code>-</code>, or <code>.</code>. Our implementation renamed to <code>name = "gen"</code>:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: memo/BUILD.bazel:3:8: in genrule rule //memo:gen: Target //memo:gen declared in symbolic macro 'c' violates macro naming rules and cannot be built. Name must be the same as the macro's name, or the macro's name followed by '_' (recommended), '-', or '.', and a non-empty string.</code></pre>
+    <p><strong>Visibility enforced.</strong> Targets inside a symbolic macro are private to the macro unless it passes
+      <code>visibility</code> through. Even a target in the <em>same package</em> cannot reach the internal output
+      <code>:c.upper.txt</code>; it must go through <code>:c</code>:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: memo/BUILD.bazel:8:10: in filegroup rule //memo:peek: Visibility error:
+target '//memo:c.upper.txt' is not visible from
+target '//memo:peek'</code></pre>
+    <aside class="callout bazel">
+      <p>Two gotchas we hit. Attributes are <strong>configurable</strong> by default, meaning they arrive as a
+        <code>select()</code>; passing one straight into <code>native.genrule(srcs = [src])</code> failed with
+        <code>expected value of type 'string' for element 0 of attribute 'srcs' of 'genrule', but got select(...)</code>.
+        Set <code>configurable = False</code> (as above) or pass the value through whole. And a <code>label</code>
+        attribute arrives as a <code>Label</code> object, not a string.</p>
+    </aside>
+    <aside class="callout sim">
+      <p>The simulator does not implement <code>macro()</code> (it reports <code>name 'macro' is not defined</code>).
+        Everything in this section is real Bazel 9.3.2 output; the exercises and labs use legacy macros, which you will
+        meet in nearly every existing repository.</p>
+    </aside>
+    <p>Which to write? For new macros shared across a big repository, symbolic macros are the recommended choice: their
+      errors point at the caller, and their encapsulation keeps internals internal. Legacy macros are simpler, still
+      fully supported, and what you will find in most existing repositories.</p>
+    <p><strong>Remember:</strong> <code>macro(implementation, attrs)</code> gives typed attributes, enforced
+      <code>name</code>-prefixed naming, and private internals; set <code>configurable = False</code> for attributes
+      you pass to non-configurable places.</p>
+  </section>
+
+  <section class="lesson-section" id="when-not-macro">
+    <h2>When a macro is the wrong tool</h2>
+    <p>A macro, legacy or symbolic, only <em>arranges existing rules</em>. It runs at loading time, so it cannot see
+      anything decided later:</p>
+    <ul>
+      <li>It cannot read a file's <em>contents</em> or a dependency's outputs: those exist only at execution.</li>
+      <li>It cannot see providers (<code>PyInfo</code>) or transitive dependencies: those come from analysis.</li>
+      <li>It cannot resolve a <code>select()</code>: configuration is not known yet.</li>
+      <li>It cannot declare outputs it learns about at run time (a directory of unknown files).</li>
+    </ul>
+    <p>If you need any of those, you need a <strong>custom rule</strong> (<code>rule()</code> with an implementation
+      function, providers, and <code>ctx.actions</code>). That is Level 3 of this course; see the
+      <a href="../reference/roadmap.html">roadmap</a>. Two signals you have outgrown a macro: you are writing ever more
+      elaborate Bash inside a genrule <code>cmd</code>, or you wish the macro could look at what its dependencies
+      contain.</p>
+    <p>The opposite mistake is common too. A macro that wraps exactly one rule and renames an attribute adds a layer
+      people must read through, and buys nothing. Write a macro when it removes real repetition (several targets that
+      always travel together) or encodes a team convention.</p>
+    <p><strong>Remember:</strong> macros compose rules at loading time; anything that needs file contents, providers,
+      or configuration needs a custom rule (Level 3).</p>
+  </section>
+
+  <section class="lesson-section" id="practice">
+    <h2>Practice</h2>
+    <p>Exercises are graded by the simulator: it checks the graph and Make-variable rules, not what commands output.
+      Open "Try commands" to run <code>bazel</code> against your edits.</p>
+
+    <div class="exercise" data-id="m08-e1" data-title="Declare the input you expand">
+      <div class="exercise-prompt">
+        <p><code>//build_info:version_py</code> writes a Python module from the <code>VERSION</code> file in the same
+          package, but analysis fails with "is not a declared prerequisite of this rule". Make it build. Keep using
+          <code>$(location ...)</code>: do not hard-code a path.</p>
+      </div>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "stamp")
+</textarea>
+<textarea class="file" data-path="build_info/BUILD.bazel">
+genrule(
+    name = "version_py",
+    outs = ["_version.py"],
+    cmd = "echo \"__version__ = '$$(cat $(location VERSION))'\" &gt; $@",
+)
+</textarea>
+<textarea class="file" data-path="build_info/VERSION" data-hidden>1.4.0</textarea>
+<script type="text/x-python" class="tests">
+def test_the_genrule_builds(bazel):
+    result = bazel.build("//build_info:version_py")
+    assert result.ok, "bazel build //build_info:version_py fails:\n" + result.error
+
+def test_version_is_a_declared_input(bazel):
+    srcs = bazel.query("labels(srcs, //build_info:version_py)")
+    assert "//build_info:VERSION" in srcs, "List VERSION in the genrule's srcs so it is in the sandbox and the cache key"
+
+def test_cmd_still_uses_location(bazel):
+    cmd = bazel.attr("//build_info:version_py", "cmd") or ""
+    assert "$(location VERSION)" in cmd or "$(execpath VERSION)" in cmd or "$<" in cmd, "Let Bazel write the path: keep $(location VERSION) (or $<) in cmd"
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p><code>$(location X)</code> only expands labels in <code>srcs</code>, <code>tools</code>, or
+          <code>outs</code>. Which attribute is for files the command reads?</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="build_info/BUILD.bazel"><code class="language-starlark">genrule(
+    name = "version_py",
+    srcs = ["VERSION"],
+    outs = ["_version.py"],
+    cmd = "echo \"__version__ = '$$(cat $(location VERSION))'\" &gt; $@",
+)</code></pre>
+        <p>With exactly one input, <code>$&lt;</code> also works. Note <code>$$(cat ...)</code>: the doubled
+          <code>$</code> passes a shell command substitution through Bazel untouched.</p>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m08-e2" data-title="Two outputs, two locations">
+      <div class="exercise-prompt">
+        <p><code>//data:split</code> should write the CSV header to <code>header.csv</code> and the rows to
+          <code>rows.csv</code>, but it uses <code>$@</code>, which fails with "variable '$@' : more than one output
+          file". Rewrite <code>cmd</code> so it builds, writing each output through its own
+          <code>$(location ...)</code>. Keep both outputs.</p>
+      </div>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "data")
+</textarea>
+<textarea class="file" data-path="data/BUILD.bazel">
+genrule(
+    name = "split",
+    srcs = ["prices.csv"],
+    outs = [
+        "header.csv",
+        "rows.csv",
+    ],
+    cmd = "head -n 1 $&lt; &gt; $@ &amp;&amp; tail -n +2 $&lt; &gt; $@",
+)
+</textarea>
+<textarea class="file" data-path="data/prices.csv" data-hidden>item,price_cents
+apple,50</textarea>
+<script type="text/x-python" class="tests">
+def test_it_builds(bazel):
+    result = bazel.build("//data:split")
+    assert result.ok, "bazel build //data:split fails:\n" + result.error
+
+def test_both_outputs_are_still_declared(bazel):
+    outs = bazel.attr("//data:split", "outs") or []
+    assert sorted(outs) == ["header.csv", "rows.csv"], f"outs should be header.csv and rows.csv, not {outs}"
+
+def test_each_output_has_its_own_location(bazel):
+    cmd = bazel.attr("//data:split", "cmd") or ""
+    for out in ("header.csv", "rows.csv"):
+        assert f"$(location {out})" in cmd or f"$(execpath {out})" in cmd, f"Write {out} through $(location {out})"
+    assert "$@" not in cmd, "Remove $@: it only works with exactly one output"
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p>Outputs are prerequisites too, so <code>$(location header.csv)</code> is allowed. <code>$&lt;</code> is fine:
+          there is one input.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="data/BUILD.bazel"><code class="language-starlark">genrule(
+    name = "split",
+    srcs = ["prices.csv"],
+    outs = [
+        "header.csv",
+        "rows.csv",
+    ],
+    cmd = "head -n 1 $&lt; &gt; $(location header.csv) &amp;&amp; tail -n +2 $&lt; &gt; $(location rows.csv)",
+)</code></pre>
+        <p>Users can now depend on <code>//data:rows.csv</code> alone, or on <code>//data:split</code> for both.</p>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m08-e3" data-title="A generator belongs in tools">
+      <div class="exercise-prompt">
+        <p><code>//api:client_gen</code> runs the <code>//tools:codegen</code> binary on <code>schema.json</code>.
+          Someone listed the binary in <code>srcs</code>. Real Bazel refuses with "label '//tools:codegen' in $(location)
+          expression expands to more than one file", and the binary would be built for the target configuration
+          instead of the exec one. Move the binary where it belongs, keeping the schema as the only input in
+          <code>srcs</code>. Then <code>//api:client</code>, a <code>py_library</code>, should use the generated
+          <code>client.py</code>.</p>
+      </div>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "api")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="api/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_library")
+
+genrule(
+    name = "client_gen",
+    srcs = [
+        "schema.json",
+        "//tools:codegen",
+    ],
+    outs = ["client.py"],
+    cmd = "$(location //tools:codegen) $(location schema.json) $@",
+)
+
+py_library(
+    name = "client",
+    srcs = [],
+)
+</textarea>
+<textarea class="file" data-path="tools/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "codegen",
+    srcs = ["codegen.py"],
+    visibility = ["//visibility:public"],
+)
+</textarea>
+<textarea class="file" data-path="api/schema.json" data-hidden>{}</textarea>
+<textarea class="file" data-path="tools/codegen.py" data-hidden></textarea>
+<script type="text/x-python" class="tests">
+def test_the_tool_is_in_tools(bazel):
+    tools = bazel.query("labels(tools, //api:client_gen)")
+    assert tools == ["//tools:codegen"], f"tools of //api:client_gen should be exactly //tools:codegen, not {tools}"
+
+def test_srcs_holds_only_the_schema(bazel):
+    srcs = bazel.query("labels(srcs, //api:client_gen)")
+    assert srcs == ["//api:schema.json"], f"srcs should hold only schema.json (what the command reads), not {srcs}"
+
+def test_the_library_uses_the_generated_file(bazel):
+    srcs = bazel.query("labels(srcs, //api:client)")
+    assert srcs == ["//api:client.py"], f"//api:client should list the generated :client.py in srcs, not {srcs}"
+    assert bazel.target("//api:client.py").kind == "generated file", "client.py should come from the genrule"
+
+def test_everything_builds(bazel):
+    result = bazel.build("//...")
+    assert result.ok, "bazel build //... fails:\n" + result.error
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p>Programs the command <em>runs</em> go in <code>tools</code>; files it <em>reads</em> go in
+          <code>srcs</code>. A generated <code>.py</code> file can go in a <code>py_library</code>'s <code>srcs</code>
+          by label: <code>":client.py"</code>.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="api/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_library")
+
+genrule(
+    name = "client_gen",
+    srcs = ["schema.json"],
+    outs = ["client.py"],
+    tools = ["//tools:codegen"],
+    cmd = "$(location //tools:codegen) $(location schema.json) $@",
+)
+
+py_library(
+    name = "client",
+    srcs = [":client.py"],
+)</code></pre>
+        <p>Since the command only runs one binary, <code>run_binary</code> from bazel_skylib would be even better: no
+          Bash, and <code>tool</code> is exec-configured. Lab 1 does exactly that.</p>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m08-e4" data-title="Write a macro for a repeated pair">
+      <div class="exercise-prompt">
+        <p><code>docs/BUILD.bazel</code> hand-writes a genrule plus a filegroup to build a table of contents for
+          <code>guide.md</code>, and <code>faq.md</code> needs the same. In <code>tools/docs.bzl</code>, write a legacy
+          macro <code>markdown_toc(name, src, visibility = None)</code> that creates:</p>
+        <ul>
+          <li><code>&lt;name&gt;_gen</code>: a genrule running <code>//tools:toc</code> (in <code>tools</code>) as
+            <code>$(location //tools:toc) $&lt; $@</code>, writing <code>&lt;name&gt;.toc.md</code>, private;</li>
+          <li><code>&lt;name&gt;</code>: a filegroup of that one file, with the caller's <code>visibility</code>.</li>
+        </ul>
+        <p>Then replace the hand-written rules with two calls, <code>guide</code> and <code>faq</code>, both visible to
+          <code>//site:__pkg__</code>, so <code>//site:all_docs</code> builds.</p>
+      </div>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "handbook")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="tools/docs.bzl">
+"""Macros for the handbook's documentation."""
+
+def markdown_toc(name, src, visibility = None):
+    """Creates &lt;name&gt;_gen (genrule) and &lt;name&gt; (filegroup of &lt;name&gt;.toc.md)."""
+    pass
+</textarea>
+<textarea class="file" data-path="docs/BUILD.bazel">
+genrule(
+    name = "guide_gen",
+    srcs = ["guide.md"],
+    outs = ["guide.toc.md"],
+    tools = ["//tools:toc"],
+    cmd = "$(location //tools:toc) $&lt; $@",
+)
+
+filegroup(
+    name = "guide",
+    srcs = [":guide.toc.md"],
+    visibility = ["//site:__pkg__"],
+)
+</textarea>
+<textarea class="file" data-path="tools/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "toc",
+    srcs = ["toc.py"],
+    visibility = ["//visibility:public"],
+)
+</textarea>
+<textarea class="file" data-path="site/BUILD.bazel" data-readonly>
+filegroup(
+    name = "all_docs",
+    srcs = [
+        "//docs:faq",
+        "//docs:guide",
+    ],
+)
+</textarea>
+<textarea class="file" data-path="tools/toc.py" data-hidden></textarea>
+<textarea class="file" data-path="docs/guide.md" data-hidden></textarea>
+<textarea class="file" data-path="docs/faq.md" data-hidden></textarea>
+<script type="text/x-python" class="tests">
+def test_the_site_builds(bazel):
+    result = bazel.build("//site:all_docs")
+    assert result.ok, "bazel build //site:all_docs fails:\n" + result.error
+
+def test_each_call_creates_a_genrule_and_a_filegroup(bazel):
+    for name in ("guide", "faq"):
+        assert bazel.target(f"//docs:{name}_gen").kind == "genrule", f"//docs:{name}_gen should be a genrule"
+        assert bazel.target(f"//docs:{name}").kind == "filegroup", f"//docs:{name} should be a filegroup"
+        srcs = bazel.query(f"labels(srcs, //docs:{name})")
+        assert srcs == [f"//docs:{name}.toc.md"], f"//docs:{name} should hold exactly :{name}.toc.md, not {srcs}"
+
+def test_the_tool_is_in_tools(bazel):
+    for name in ("guide", "faq"):
+        assert bazel.query(f"labels(tools, //docs:{name}_gen)") == ["//tools:toc"], f"//docs:{name}_gen should run //tools:toc from tools"
+
+def test_the_genrules_stay_private(bazel):
+    for name in ("guide", "faq"):
+        vis = bazel.attr(f"//docs:{name}_gen", "visibility") or []
+        assert vis == ["//visibility:private"], f"//docs:{name}_gen should be private; pass the caller's visibility to the filegroup only"
+
+def test_build_file_uses_the_macro(bazel):
+    build = bazel.ws.files.get("docs/BUILD.bazel", "")
+    assert "markdown_toc(" in build and "//tools:docs.bzl" in build, "Load markdown_toc from //tools:docs.bzl and call it in docs/BUILD.bazel"
+    assert "genrule(" not in build, "Remove the hand-written genrule: the macro creates it"
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p>Inside the <code>.bzl</code> file, write <code>native.genrule(...)</code> and
+          <code>native.filegroup(...)</code>. Build names with <code>name + "_gen"</code> and
+          <code>name + ".toc.md"</code>. In the BUILD file: <code>load("//tools:docs.bzl", "markdown_toc")</code>.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="tools/docs.bzl"><code class="language-starlark">"""Macros for the handbook's documentation."""
+
+def markdown_toc(name, src, visibility = None):
+    """Creates &lt;name&gt;_gen (genrule) and &lt;name&gt; (filegroup of &lt;name&gt;.toc.md)."""
+    out = name + ".toc.md"
+    native.genrule(
+        name = name + "_gen",
+        srcs = [src],
+        outs = [out],
+        tools = ["//tools:toc"],
+        cmd = "$(location //tools:toc) $&lt; $@",
+        visibility = ["//visibility:private"],
+    )
+    native.filegroup(
+        name = name,
+        srcs = [":" + out],
+        visibility = visibility,
+    )</code></pre>
+<pre data-path="docs/BUILD.bazel"><code class="language-starlark">load("//tools:docs.bzl", "markdown_toc")
+
+markdown_toc(
+    name = "guide",
+    src = "guide.md",
+    visibility = ["//site:__pkg__"],
+)
+
+markdown_toc(
+    name = "faq",
+    src = "faq.md",
+    visibility = ["//site:__pkg__"],
+)</code></pre>
+        <p>The third call costs four lines. Lab 2 has you write this same macro and checks it with real Bazel.</p>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m08-e5" data-title="Guard a generated file with a golden">
+      <div class="exercise-prompt">
+        <p><code>//api:schema_gen</code> runs <code>//tools:gen_schema</code> on <code>models.py</code>, but it is a
+          genrule that only runs one binary. Replace it with a <code>run_binary</code> of the same name producing
+          <code>schema.json</code> (args: <code>$(location models.py)</code> then <code>$(location schema.json)</code>).
+          Then add a <code>diff_test</code> named <code>schema_golden_test</code> comparing the generated
+          <code>schema.json</code> (as <code>file1</code>) with the checked-in <code>schema.golden.json</code>, so
+          <code>bazel test //...</code> selects it.</p>
+      </div>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "api")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+bazel_dep(name = "bazel_skylib", version = "1.9.2")
+</textarea>
+<textarea class="file" data-path="api/BUILD.bazel">
+genrule(
+    name = "schema_gen",
+    srcs = ["models.py"],
+    outs = ["schema.json"],
+    tools = ["//tools:gen_schema"],
+    cmd = "$(location //tools:gen_schema) $&lt; $@",
+)
+</textarea>
+<textarea class="file" data-path="tools/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "gen_schema",
+    srcs = ["gen_schema.py"],
+    visibility = ["//visibility:public"],
+)
+</textarea>
+<textarea class="file" data-path="api/models.py" data-hidden></textarea>
+<textarea class="file" data-path="api/schema.golden.json" data-hidden>{}</textarea>
+<textarea class="file" data-path="tools/gen_schema.py" data-hidden></textarea>
+<script type="text/x-python" class="tests">
+def test_schema_gen_is_a_run_binary(bazel):
+    t = bazel.target("//api:schema_gen")
+    assert t.kind == "run_binary", f"//api:schema_gen should be a run_binary, but it is a {t.kind}"
+    assert bazel.query("labels(tool, //api:schema_gen)") == ["//tools:gen_schema"], "Set tool = \"//tools:gen_schema\""
+    assert bazel.target("//api:schema.json").kind == "generated file", "outs should still produce schema.json"
+
+def test_the_golden_test_compares_the_right_files(bazel):
+    t = bazel.target("//api:schema_golden_test")
+    assert t.kind == "diff_test", f"//api:schema_golden_test should be a diff_test, not a {t.kind}"
+    assert bazel.query("labels(file1, //api:schema_golden_test)") == ["//api:schema.json"], "file1 should be the generated :schema.json"
+    assert bazel.query("labels(file2, //api:schema_golden_test)") == ["//api:schema.golden.json"], "file2 should be the checked-in schema.golden.json"
+
+def test_bazel_test_selects_it(bazel):
+    result = bazel.test("//...")
+    assert result.ok, "bazel test //... fails:\n" + result.error
+    assert result.tests == ["//api:schema_golden_test"], f"bazel test //... would run {result.tests}"
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p>Load <code>run_binary</code> from <code>@bazel_skylib//rules:run_binary.bzl</code> and
+          <code>diff_test</code> from <code>@bazel_skylib//rules:diff_test.bzl</code>. <code>run_binary</code> has
+          <code>tool</code> (singular) and <code>args</code> (a list), but no <code>cmd</code>.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="api/BUILD.bazel"><code class="language-starlark">load("@bazel_skylib//rules:diff_test.bzl", "diff_test")
+load("@bazel_skylib//rules:run_binary.bzl", "run_binary")
+
+run_binary(
+    name = "schema_gen",
+    srcs = ["models.py"],
+    outs = ["schema.json"],
+    args = [
+        "$(location models.py)",
+        "$(location schema.json)",
+    ],
+    tool = "//tools:gen_schema",
+)
+
+diff_test(
+    name = "schema_golden_test",
+    file1 = ":schema.json",
+    file2 = "schema.golden.json",
+)</code></pre>
+        <p>Add an <code>update_golden</code> <code>py_binary</code> (as in the <a href="#golden">golden files</a>
+          section) so a teammate who changes the models can bless the new schema with one <code>bazel run</code>.</p>
+      </details>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="lab">
+    <h2>Labs: generators for real</h2>
+    <p>The simulator stops before execution, so it cannot run a generator, compare a golden, or show the
+      "expands to more than one file" error. These two labs do, with real Bazel. The first builds a code generator
+      pipeline with a golden test; the second has you write a macro and use it twice.</p>
+
+    <div class="lab" data-id="m08-lab1" data-title="Generate a constants module">
+      <div class="lab-prompt">
+        <p><code>//tools:gen_constants</code> turns <code>palette/colors.csv</code> into a Python module of constants.
+          <code>//palette:constants</code> is a <code>py_library</code> made of that generated file, and
+          <code>constants_test</code> imports it. Right now nothing builds: the generator is a genrule that lists the
+          binary in <code>srcs</code>. Make the pipeline work, replace the genrule with a <code>run_binary</code> named
+          <code>constants_gen</code>, and add a <code>diff_test</code> named <code>constants_golden_test</code> against
+          the checked-in <code>constants.golden.py</code>. The golden is out of date (the CSV gained
+          <code>teal</code>): bless it with the provided <code>update_golden</code> target, not by editing it.</p>
+        <ul class="checklist" data-id="m08-lab1-steps">
+          <li>Run <code>pixi run start m08-lab1</code>, then <code>cd work/m08-lab1</code></li>
+          <li>Run <code>pixi run bazel build //palette:constants_gen</code> and read the "expands to more than one file" error</li>
+          <li>Replace the genrule with <code>run_binary</code> (<code>tool</code>, <code>srcs</code>, <code>outs</code>, <code>args</code>); build it and <code>cat bazel-bin/palette/constants.py</code></li>
+          <li>Run <code>pixi run bazel test //palette:constants_test</code></li>
+          <li>Add the <code>diff_test</code>, run <code>pixi run bazel test //... --test_output=errors</code>, and read the diff</li>
+          <li>Run <code>pixi run bazel run //palette:update_golden</code>, confirm the golden gained only the <code>TEAL</code> line, and test again</li>
+          <li>Back at the repository root, run <code>pixi run grade m08-lab1</code></li>
+        </ul>
+      </div>
+      <details class="hint"><summary>Hint</summary>
+        <p>The tool takes two arguments, the CSV and the output path:
+          <code>args = ["$(location colors.csv)", "$(location constants.py)"]</code>. Keep <code>outs =
+          ["constants.py"]</code> so <code>:constants.py</code> still means the generated file. Load
+          <code>run_binary</code> and <code>diff_test</code> from <code>@bazel_skylib//rules:</code>; the module is
+          already in <code>MODULE.bazel</code>.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-label="palette/BUILD.bazel"><code class="language-starlark">load("@bazel_skylib//rules:diff_test.bzl", "diff_test")
+load("@bazel_skylib//rules:run_binary.bzl", "run_binary")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
+
+run_binary(
+    name = "constants_gen",
+    srcs = ["colors.csv"],
+    outs = ["constants.py"],
+    args = [
+        "$(location colors.csv)",
+        "$(location constants.py)",
+    ],
+    tool = "//tools:gen_constants",
+)
+
+py_library(
+    name = "constants",
+    srcs = [":constants.py"],
+)
+
+py_test(
+    name = "constants_test",
+    srcs = ["constants_test.py"],
+    deps = [":constants"],
+)
+
+py_binary(
+    name = "update_golden",
+    srcs = ["update_golden.py"],
+    args = [
+        "$(rootpath :constants.py)",
+        "$(rootpath constants.golden.py)",
+    ],
+    data = [
+        ":constants.py",
+        "constants.golden.py",
+    ],
+)
+
+diff_test(
+    name = "constants_golden_test",
+    file1 = ":constants.py",
+    file2 = "constants.golden.py",
+)</code></pre>
+        <p>Before blessing, the golden test fails with exactly the missing line (real output):</p>
+<pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">6d5
+&lt; TEAL = "#008080"
+FAIL: files "palette/constants.py" and "palette/constants.golden.py" differ. </code></pre>
+        <p>After <code>bazel run //palette:update_golden</code> prints <code>Updated palette/constants.golden.py</code>,
+          both tests pass, and <code>constants_test</code> stays <code>(cached)</code> because nothing it depends on
+          changed.</p>
+      </details>
+    </div>
+
+    <div class="lab" data-id="m08-lab2" data-title="Write a macro, use it twice">
+      <div class="lab-prompt">
+        <p>The handbook's <code>docs/BUILD.bazel</code> builds a table of contents for <code>guide.md</code> by hand,
+          and <code>faq.md</code> needs one too. Write <code>markdown_toc</code> in <code>tools/docs.bzl</code> (its
+          docstring is the spec) and call it twice. The grader adds a <code>//grading</code> package whose
+          <code>diff_test</code>s compare <code>//docs:guide</code> and <code>//docs:faq</code> against golden files, and
+          a <code>//grading/peek</code> package that must <em>not</em> be able to reach the genrule's output
+          directly.</p>
+        <ul class="checklist" data-id="m08-lab2-steps">
+          <li>Run <code>pixi run start m08-lab2</code>, then <code>cd work/m08-lab2</code></li>
+          <li>Read <code>tools/docs.bzl</code> and <code>docs/BUILD.bazel</code>; build <code>//docs:all</code> once to see the hand-written version work</li>
+          <li>Write the macro with <code>native.genrule</code> and <code>native.filegroup</code>; add a <code>print()</code> to check what it receives, then remove it</li>
+          <li>Replace the hand-written rules with two calls, visible to <code>//grading:__subpackages__</code></li>
+          <li>Run <code>pixi run bazel query 'attr(generator_function, markdown_toc, //docs:all)'</code> and <code>cat bazel-bin/docs/faq.toc.md</code></li>
+          <li>Back at the repository root, run <code>pixi run grade m08-lab2</code></li>
+        </ul>
+      </div>
+      <details class="hint"><summary>Hint</summary>
+        <p>It is exercise 4 with a different visibility. The genrule must stay
+          <code>//visibility:private</code>; only the filegroup gets the caller's <code>visibility</code>. If the grader
+          reports "the macro's genrule output stays private" failing, you passed <code>visibility</code> to the genrule
+          too, which also makes its output file visible.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-label="tools/docs.bzl"><code class="language-starlark">"""Macros for the handbook's documentation."""
+
+def _toc_name(name):
+    """The output file for markdown_toc(name = ...). Private: BUILD files cannot load it."""
+    return name + ".toc.md"
+
+def markdown_toc(name, src, visibility = None):
+    """Generates a table of contents for one Markdown file. (Docstring as in the starter.)"""
+    out = _toc_name(name)
+    native.genrule(
+        name = name + "_gen",
+        srcs = [src],
+        outs = [out],
+        tools = ["//tools:toc"],
+        cmd = "$(location //tools:toc) $&lt; $@",
+        visibility = ["//visibility:private"],
+    )
+    native.filegroup(
+        name = name,
+        srcs = [":" + out],
+        visibility = visibility,
+    )</code></pre>
+<pre data-label="docs/BUILD.bazel"><code class="language-starlark">load("//tools:docs.bzl", "markdown_toc")
+
+markdown_toc(
+    name = "guide",
+    src = "guide.md",
+    visibility = ["//grading:__subpackages__"],
+)
+
+markdown_toc(
+    name = "faq",
+    src = "faq.md",
+    visibility = ["//grading:__subpackages__"],
+)</code></pre>
+        <p>A generated file takes the visibility of the rule that generates it. That is why the private genrule keeps
+          <code>faq.toc.md</code> private, and other packages must go through the filegroup: the grader's
+          <code>//grading/peek</code> build fails with <code>target '//docs:faq.toc.md' is not visible from target
+          '//grading/peek:peek'</code>.</p>
+      </details>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="quiz">
+    <h2>Quiz</h2>
+    <div class="quiz" data-id="m08-quiz">
+<script type="application/json">
+{"title": "Generated files and macros quiz", "passScore": 0.7, "questions": [
+  {"type": "single", "prompt": "Why must a genrule list its outputs in <code>outs</code> before it runs?", "options": ["So Bazel can delete stale files first", "Bazel plans the whole action graph during analysis, and other targets refer to the outputs by label", "Because Bash needs to know the file names", "It does not: outs is optional documentation"], "answer": 1, "explanation": "<p>Each name in <code>outs</code> becomes a <code>generated file</code> target at loading time, so other rules can depend on it, and analysis can plan the action that produces it. That is also what lets Bazel cache it and re-run it only when inputs change.</p>"},
+  {"type": "output", "prompt": "What does <code>bazel query '//gen:*' --output=label_kind</code> print for this package (with <code>gen/words.txt</code> on disk)?", "code": "genrule(\n    name = \"count\",\n    srcs = [\"words.txt\"],\n    outs = [\"count.txt\"],\n    cmd = \"wc -l < $< > $@\",\n)", "lang": "starlark", "answer": "source file //gen:BUILD.bazel\ngenrule rule //gen:count\ngenerated file //gen:count.txt\nsource file //gen:words.txt", "explanation": "<p>Four targets, sorted by label: the BUILD file and <code>words.txt</code> are source files, <code>count</code> is the rule, and <code>count.txt</code> is a generated file that exists as a target before anything runs.</p>"},
+  {"type": "single", "prompt": "Does this analyze?", "code": "genrule(\n    name = \"split\",\n    srcs = [\"in.csv\"],\n    outs = [\"a.csv\", \"b.csv\"],\n    cmd = \"cp $< $@\",\n)", "lang": "starlark", "options": ["Yes", "No: variable '$@' : more than one output file", "No: variable '$<' : more than one input file", "It analyzes, then fails at execution because b.csv is missing"], "answer": 1, "explanation": "<p><code>$@</code> means \"the one output\". With two outputs, Bazel refuses at analysis. Write <code>$(location a.csv)</code> and <code>$(location b.csv)</code> instead. (<code>$&lt;</code> is fine: there is one input.)</p>"},
+  {"type": "single", "prompt": "A genrule's <code>cmd</code> uses <code>$(location config.yaml)</code>, but <code>config.yaml</code> is in no attribute. What does Bazel 9.3.2 report?", "options": ["missing input file '//pkg:config.yaml'", "label '//pkg:config.yaml' in $(location) expression is not a declared prerequisite of this rule", "No such file or directory, at execution", "Nothing: Bazel adds it to srcs"], "answer": 1, "explanation": "<p>Make-variable expansion happens at analysis, and only labels in <code>srcs</code>, <code>tools</code>, or <code>outs</code> can be expanded. Add the file to <code>srcs</code>.</p>"},
+  {"type": "single", "prompt": "A genrule runs a <code>py_binary</code> generator. Where does the binary go, and why?", "options": ["srcs, because it is an input", "tools, so it is built in the exec configuration and $(location) names its executable", "deps, like any Python dependency", "data, so it is in runfiles"], "answer": 1, "explanation": "<p><code>tools</code> builds the program for the machine that runs the build (exec configuration) and makes <code>$(location)</code> mean the executable. In <code>srcs</code> it is built for the target configuration, and <code>$(location)</code> fails because a <code>py_binary</code> has several files. genrule has no <code>deps</code> or <code>data</code>.</p>"},
+  {"type": "multi", "prompt": "Which of these are analysis-time errors for a genrule? Select all that apply.", "options": ["<code>variable '$&lt;' : more than one input file</code>", "<code>'$HOME' syntax is not supported</code>", "<code>declared output 'e/right.txt' was not created by genrule</code>", "<code>$(VERSION) not defined</code>", "<code>/bin/bash: line 1: un/words.txt: No such file or directory</code>"], "answer": [0, 1, 3], "explanation": "<p>Make-variable problems are found while Bazel expands <code>cmd</code> during analysis. A missing output and an undeclared read can only be noticed when the command actually runs, at execution.</p>"},
+  {"type": "text", "prompt": "In a genrule <code>cmd</code>, how do you write the shell variable <code>$f</code> inside a <code>for</code> loop?", "answer": ["$$f"], "explanation": "<p>Bazel expands every <code>$</code> first. <code>$$</code> is an escaped dollar sign that reaches the shell as <code>$</code>. A bare <code>$f</code> is an error: \"'$f' syntax is not supported\".</p>"},
+  {"type": "single", "prompt": "A <code>py_binary</code> started with <code>bazel run</code> takes a generated file in <code>data</code> and its path in <code>args</code>. Which Make variable fits <code>args</code>?", "options": ["$(execpath :out.txt)", "$(rootpath :out.txt)", "$@", "$(RULEDIR)"], "answer": 1, "explanation": "<p>A binary runs from its runfiles tree, where <code>data</code> files sit at their rootpath (<code>pkg/out.txt</code>). The execpath (<code>bazel-out/k8-fastbuild/bin/pkg/out.txt</code>) is for commands run from the execution root, such as a genrule's <code>cmd</code>.</p>"},
+  {"type": "single", "prompt": "When should you prefer skylib's <code>run_binary</code> over <code>genrule</code>?", "options": ["Never: genrule is native", "When the command runs exactly one tool with arguments: no shell, no $$ escaping, works on Windows", "Only for Go tools", "When you need a shell pipeline"], "answer": 1, "explanation": "<p><code>run_binary</code> runs <code>tool</code> directly with <code>args</code>, building the tool in the exec configuration. Keep <code>genrule</code> for real shell work: pipelines, loops, several commands.</p>"},
+  {"type": "single", "prompt": "<code>diff_test(name = \"t\", file1 = \":gen.json\", file2 = \"gen.golden.json\")</code> fails after an intended generator change. What is the team-friendly fix?", "options": ["Delete the diff_test", "Edit gen.golden.json by hand to match", "Run a bless target (bazel run //pkg:update_golden) that copies the new output over the golden, and review the diff", "Run bazel clean"], "answer": 2, "explanation": "<p>The golden exists so reviewers see generated changes. A <code>bazel run</code> target writing into <code>BUILD_WORKSPACE_DIRECTORY</code> updates it exactly, and the change appears in code review.</p>"},
+  {"type": "single", "prompt": "Does this <code>.bzl</code> file load?", "code": "def stamped(name, src):\n    genrule(\n        name = name,\n        srcs = [src],\n        outs = [name + \".txt\"],\n        cmd = \"cp $< $@\",\n    )", "lang": "starlark", "options": ["Yes", "No: name 'genrule' is not defined; use native.genrule", "No: macros cannot create genrules", "No: the macro needs a visibility parameter"], "answer": 1, "explanation": "<p>In a <code>.bzl</code> file, native rules are reached through <code>native.</code>. Real Bazel 9.3.2 says <code>name 'genrule' is not defined (did you mean 'subrule'?)</code>. A <code>visibility</code> parameter is good practice, not required.</p>"},
+  {"type": "single", "prompt": "<code>docs.bzl</code> defines <code>_helper</code> and <code>markdown_toc</code>. A BUILD file writes <code>load(\"//tools:docs.bzl\", \"markdown_toc\", \"_helper\")</code>. What happens?", "options": ["Both load", "Loading fails: symbol '_helper' is private and cannot be imported", "_helper loads with a warning", "Only markdown_toc loads; _helper is silently skipped"], "answer": 1, "explanation": "<p>Names starting with an underscore are private to their <code>.bzl</code> file. That is how you keep helpers out of your macro's public API.</p>"},
+  {"type": "multi", "prompt": "What does a symbolic macro (<code>macro()</code>) enforce that a legacy macro does not? Select all that apply.", "options": ["Attribute types checked at the call site", "Targets named <code>name</code> or <code>name</code> plus <code>_</code>, <code>-</code>, or <code>.</code> and a suffix", "Internal targets private to the macro unless visibility is passed through", "Reading the contents of input files", "Access to dependencies' providers"], "answer": [0, 1, 2], "explanation": "<p>Symbolic macros add typed attributes, naming rules, and encapsulation. Like legacy macros they run at loading time, so file contents and providers are out of reach: that needs a custom rule.</p>"},
+  {"type": "single", "prompt": "You want a macro that inspects each dependency's <code>PyInfo</code> and generates a file listing its transitive sources. What do you need?", "options": ["A legacy macro with native.existing_rules()", "A symbolic macro with attr.label_list", "A custom rule (Level 3): providers exist only during analysis", "A genrule with $(SRCS)"], "answer": 2, "explanation": "<p>Macros run during loading, before analysis computes providers. A rule's implementation function receives its dependencies' providers and can declare actions from them.</p>"}
+]}
+</script>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="recap">
+    <h2>Recap</h2>
+    <ul>
+      <li>A generator is an action. Bazel needs its outputs declared in advance so it can plan, cache, and re-run it exactly when inputs change.</li>
+      <li><code>genrule</code>: <code>srcs</code> (read), <code>outs</code> (names written), <code>tools</code> (programs run), <code>cmd</code> (Bash). Outputs land in <code>bazel-bin/&lt;package&gt;/</code>.</li>
+      <li>Every out is a <code>generated file</code> target; use it by label like a source file, and name the rule differently from its outputs.</li>
+      <li>Make variables write paths for you: <code>$(location)</code>/<code>$(execpath)</code> in commands, <code>$(rootpath)</code> for runfiles, <code>$@</code>/<code>$&lt;</code> only with exactly one file, <code>$$</code> for the shell.</li>
+      <li>Programs go in <code>tools</code> (exec configuration); a binary in <code>srcs</code> fails with "expands to more than one file".</li>
+      <li>Undeclared inputs fail in the sandbox, undeclared outputs vanish, missing declared outputs fail, and globs never see generated files.</li>
+      <li>Prefer skylib's <code>write_file</code>, <code>copy_file</code>, and <code>run_binary</code>; keep genrule for real shell work.</li>
+      <li><code>diff_test</code> plus a checked-in golden makes generated changes reviewable; bless with a <code>bazel run</code> target writing into <code>BUILD_WORKSPACE_DIRECTORY</code>.</li>
+      <li>Legacy macros are <code>.bzl</code> functions using <code>native.*</code>; derive names from <code>name</code>, pass <code>visibility</code> to the main target, keep helpers <code>_private</code>, and remove <code>print()</code>s.</li>
+      <li>Symbolic macros add typed attributes, naming rules, and encapsulation; anything needing file contents or providers needs a custom rule.</li>
+    </ul>
+    <div class="flashcards" data-title="Generated files and macros review">
+<script type="application/json">
+[
+  {"front": "<code>//gen:count</code> vs <code>//gen:count.txt</code>?", "back": "The genrule (stands for all its outputs) vs one generated file target."},
+  {"front": "Where does a genrule's output land?", "back": "bazel-bin/&lt;package&gt;/&lt;name&gt;, never in the source tree. Outputs are read-only."},
+  {"front": "<code>$(location X)</code> fails with \"not a declared prerequisite\". Fix?", "back": "List X in srcs (or tools, or outs). Only declared labels can be expanded."},
+  {"front": "<code>$@</code> with two outputs?", "back": "Analysis error \"variable '$@' : more than one output file\". Use $(location a) and $(location b)."},
+  {"front": "execpath vs rootpath?", "back": "execpath: from the execution root (bazel-out/.../bin/pkg/f), for genrule cmd. rootpath: inside runfiles (pkg/f), for args of binaries and tests."},
+  {"front": "Why does a generator binary go in <code>tools</code>?", "back": "tools is built in the exec configuration (the build machine) and $(location) names its executable. In srcs, $(location) expands to several files and fails."},
+  {"front": "How do you reach the shell's <code>$f</code> in cmd?", "back": "Write $$f. A bare $f is an analysis error."},
+  {"front": "When run_binary instead of genrule?", "back": "When the command just runs one tool with arguments: no shell, no quoting, works on Windows."},
+  {"front": "How does the golden-file pattern work?", "back": "diff_test(file1 = generated, file2 = checked-in golden). Bless intended changes with a bazel run target that copies into BUILD_WORKSPACE_DIRECTORY."},
+  {"front": "Four habits of a good legacy macro?", "back": "native.* for native rules; names derived from name (main = name, helpers = name + suffix); visibility passed to the main target only; _private helpers."},
+  {"front": "What does <code>macro()</code> add?", "back": "Typed attributes, enforced naming (name, or name + _/-/. + suffix), and private internals. Attributes are configurable unless configurable = False."},
+  {"front": "When is a macro the wrong tool?", "back": "When you need file contents, providers, select() results, or unknown outputs: write a custom rule (Level 3)."}
+]
+</script>
+    </div>
+    <h3>Going further</h3>
+    <ul>
+      <li><a href="https://bazel.build/reference/be/general#genrule">genrule</a> in the Bazel build encyclopedia: every attribute</li>
+      <li><a href="https://bazel.build/reference/be/make-variables">Make variables</a>: <code>$(location)</code>, <code>$(execpath)</code>, <code>$(rootpath)</code>, <code>$(rlocationpath)</code>, and predefined variables</li>
+      <li><a href="https://bazel.build/extending/macros">Macros</a>: symbolic macros, attributes, naming, and visibility</li>
+      <li><a href="https://bazel.build/extending/legacy-macros">Legacy macros</a>: conventions and pitfalls</li>
+      <li><a href="https://github.com/bazelbuild/bazel-skylib/tree/main/docs">bazel_skylib documentation</a>: <code>write_file</code>, <code>copy_file</code>, <code>run_binary</code>, <code>diff_test</code></li>
+      <li><a href="https://registry.bazel.build/modules/bazel_skylib">bazel_skylib on the Bazel Central Registry</a></li>
+      <li><a href="https://bazel.build/extending/rules">Rules</a>: where you go when a macro is not enough (Level 3)</li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>
