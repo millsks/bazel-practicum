@@ -40,7 +40,7 @@
         <tr><td><code>src/</code> layout, editable install</td><td><code>imports = ["src"]</code> on the <code>py_library</code></td><td><a href="../modules/m03-rules-python.html#src-layout">M03</a></td></tr>
         <tr><td>A virtualenv with Python 3.13</td><td><code>python.toolchain(python_version = "3.13", is_default = True)</code>: Bazel downloads the interpreter</td><td><a href="../modules/m00-orientation.html#three-files">M00</a>, <a href="../modules/m03-rules-python.html">M03</a></td></tr>
         <tr><td><code>requirements.in</code> + <code>pip-compile</code></td><td><code>compile_pip_requirements</code>; <code>bazel run //:requirements.update</code> writes the lock file</td><td><a href="../modules/m04-bzlmod-pypi.html">M04</a></td></tr>
-        <tr><td><code>pip install -r requirements.txt</code></td><td><code>pip.parse(hub_name = "pypi", requirements_lock = ...)</code> + <code>use_repo(pip, "pypi")</code>, then <code>deps = ["@pypi//requests"]</code></td><td><a href="../modules/m04-bzlmod-pypi.html">M04</a></td></tr>
+        <tr><td><code>pip install -r requirements.txt</code></td><td><code>pip.parse(hub_name = "myrepo_pypi", requirements_lock = ...)</code> + <code>use_repo(pip, pypi = "myrepo_pypi")</code>, then <code>deps = ["@pypi//requests"]</code></td><td><a href="../modules/m04-bzlmod-pypi.html">M04</a></td></tr>
         <tr><td><code>open("data/x.json")</code> relative to the cwd</td><td><code>data = ["data/x.json"]</code>, then find it with the runfiles library</td><td><a href="../modules/m03-rules-python.html#runfiles">M03</a></td></tr>
         <tr><td><code>pytest -k name</code>, <code>pytest path::test</code></td><td><code>bazel test //pkg:target</code>; inside a target, <code>--test_filter=...</code> or <code>--test_arg=...</code></td><td><a href="../modules/m05-testing.html">M05</a></td></tr>
         <tr><td><code>pytest -m "not slow"</code></td><td><code>tags = ["slow"]</code>, then <code>--test_tag_filters=-slow</code></td><td><a href="../modules/m05-testing.html">M05</a></td></tr>
@@ -75,11 +75,11 @@ compile_pip_requirements(
 )</code></pre>
 <pre data-label="MODULE.bazel"><code class="language-starlark">pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
 pip.parse(
-    hub_name = "pypi",
+    hub_name = "myrepo_pypi",  # "pypi" is reserved by rules_python; alias it below
     python_version = "3.13",
     requirements_lock = "//:requirements_lock.txt",
 )
-use_repo(pip, "pypi")</code></pre>
+use_repo(pip, pypi = "myrepo_pypi")</code></pre>
 <pre data-label="Terminal"><code class="language-bash">pixi run bazel run //:requirements.update   # re-lock
 pixi run bazel test //:requirements_test    # fails if the lock is stale</code></pre>
       </div>

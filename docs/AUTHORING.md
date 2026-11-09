@@ -93,6 +93,11 @@ write it down.
 - **Caching.** An action's key is a hash of its command, environment, and input contents. Tests are actions: an
   unchanged test reports `(cached) PASSED`. `bazel clean` is almost never needed; `--disk_cache=PATH` gives a
   shared local cache.
+- **PyPI hubs.** rules_python 2.4.6 reserves `hub_name = "pypi"` (every build warns). Name the hub after the
+  module and alias it: `pip.parse(hub_name = "weather_pypi", ...)` then `use_repo(pip, pypi = "weather_pypi")`, so
+  labels stay `@pypi//requests`. Labels use the normalized distribution name (lowercase, `-` and `.` to `_`).
+  A `py_test` that uses pytest needs a main shim (`main = "pytest_main.py"` calling `pytest.main(sys.argv[1:])`),
+  or it passes without running anything. Tag `compile_pip_requirements` targets `manual` (their test needs the network).
 - **MODULE.bazel.lock** is generated; commit it in real projects (this repository ignores it inside lab copies).
 - Bazel convenience symlinks: `bazel-bin`, `bazel-out`, `bazel-testlogs`, `bazel-<workspace name>`.
 
