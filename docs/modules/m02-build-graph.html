@@ -1,0 +1,1238 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M02 · The Build Graph &amp; Caching · Bazel Practicum</title>
+<link rel="stylesheet" href="../assets/css/course.css">
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/viz.js" defer></script>
+<script src="../assets/js/viz-bazel.js" defer></script>
+<script src="../assets/js/course.js" defer></script>
+</head>
+<body data-root="../" data-module="m02">
+<main class="lesson">
+  <header class="lesson-hero">
+    <p class="eyebrow">Stage 1 · Foundations · Module 02</p>
+    <h1>The Build Graph &amp; Caching</h1>
+    <p class="lede">Every BUILD file you write adds nodes and edges to one graph of your whole repository. This module
+      shows how Bazel checks that graph (who may depend on whom, and what kind of thing each edge needs), how it turns
+      the graph into actions, and why an honest graph is what makes rebuilds fast and test results cacheable.</p>
+    <div class="lesson-meta"><span>⏱ ~2.5 hours</span><span>Prerequisites: <a href="m01-workspaces-targets.html">M01</a></span></div>
+    <ul class="objectives">
+      <li>Read <code>srcs</code>, <code>deps</code>, and <code>data</code> as edges of a graph, and query them</li>
+      <li>Control who may depend on a target with visibility, choosing the least permissive setting that works</li>
+      <li>Diagnose cycles, <code>testonly</code> violations, and "does not have mandatory providers" errors</li>
+      <li>Say which of the three phases (loading, analysis, execution) produced an error</li>
+      <li>Explain actions, action keys, and sandboxing, and why an undeclared file read fails</li>
+      <li>Predict what re-runs after a change, keep tests <code>(cached)</code>, and use <code>--disk_cache</code></li>
+    </ul>
+  </header>
+
+  <section class="lesson-section" id="edges">
+    <h2>Edges: srcs, deps, and data</h2>
+    <aside class="callout python">
+      <p>In Python, dependencies are implicit. <code>import lib.greet</code> works if <code>lib/</code> is somewhere on
+        <code>sys.path</code>, and <code>open("prices.csv")</code> works if the file happens to be in the current directory.
+        Nothing writes down that <code>app</code> needs <code>lib</code>, or that a test needs a CSV file.</p>
+    </aside>
+    <p>Bazel makes you write those facts down, and each one becomes an <strong>edge</strong>: an arrow from a target to
+      something it needs. The targets are the <strong>nodes</strong>. Together they form the <strong>build graph</strong>
+      (strictly, a <em>directed acyclic graph</em>: arrows have a direction, and no path may loop back to where it
+      started).</p>
+    <p>For Python rules, three attributes carry almost every edge:</p>
+    <div class="card-grid">
+      <div class="card"><h4><code>srcs</code></h4><p>The target's own source files, usually in its own package. For <code>py_*</code> rules, the <code>.py</code> files.</p></div>
+      <div class="card"><h4><code>deps</code></h4><p>Other <em>code</em> this target imports: libraries that must provide Python information. Their own deps come along transitively.</p></div>
+      <div class="card"><h4><code>data</code></h4><p>Files the program <em>reads at run time</em>: CSVs, templates, config. Bazel places them next to the program when it runs.</p></div>
+    </div>
+    <p>Here is a small workspace. <code>//app:hello</code> imports a library and reads a config file that lives in another
+      package. Before you run anything, predict what the first command prints.</p>
+    <div class="runnable" data-title="Edges of //app:hello" data-predict data-commands="bazel query 'labels(data, //app:hello)'|bazel query 'deps(//app:hello)' --noimplicit_deps|bazel query 'kind(&quot;source file&quot;, deps(//app:hello))' --noimplicit_deps">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "edges")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="app/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_binary")
+
+filegroup(
+    name = "cfg",
+    srcs = ["//config:settings.yaml"],
+)
+
+py_binary(
+    name = "hello",
+    srcs = ["hello.py"],
+    data = [":cfg"],
+    deps = ["//lib:greet"],
+)
+</textarea>
+<textarea class="file" data-path="lib/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "greet",
+    srcs = ["greet.py"],
+    visibility = ["//app:__pkg__"],
+)
+</textarea>
+<textarea class="file" data-path="config/BUILD.bazel">
+exports_files(["settings.yaml"])
+</textarea>
+<textarea class="file" data-path="app/hello.py" data-hidden></textarea>
+<textarea class="file" data-path="lib/greet.py" data-hidden></textarea>
+<textarea class="file" data-path="config/settings.yaml" data-hidden></textarea>
+</div>
+    <p><code>labels(data, X)</code> lists only the direct <code>data</code> edges of <code>X</code>: here
+      <code>//app:cfg</code>. <code>deps(X)</code> follows every edge, transitively, and includes source files, because
+      files are targets too. The real Bazel output for the last command matches the simulator's:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">//app:hello.py
+//config:settings.yaml
+//lib:greet.py</code></pre>
+    <aside class="callout note">
+      <p>Real <code>bazel query 'deps(...)'</code> also lists <em>implicit</em> dependencies that rules add for you, such
+        as the Python toolchain. <code>--noimplicit_deps</code> hides most of them. The simulator shows only the edges
+        you wrote.</p>
+    </aside>
+    <p><strong>Remember:</strong> <code>srcs</code> is your own code, <code>deps</code> is code you import,
+      <code>data</code> is files you open. Each is an edge, and Bazel only knows about edges you declare.</p>
+  </section>
+
+  <section class="lesson-section" id="visibility">
+    <h2>Visibility: who may depend on you</h2>
+    <aside class="callout python">
+      <p>Python's privacy is a convention: a leading underscore says "please don't import this". Anyone can ignore it,
+        and in a big repository someone always does. Then you cannot change your "private" module without breaking a team
+        you have never heard of.</p>
+    </aside>
+    <p>Bazel enforces privacy. Every rule target has a <strong>visibility</strong>: the list of packages allowed to
+      depend on it. The default is <code>//visibility:private</code>, meaning only targets in the same package. Put
+      <code>greet</code> in <code>//lib</code> and use it from <code>//app</code> without saying anything, and the build
+      stops:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: app/BUILD.bazel:3:10: in py_binary rule //app:hello: Visibility error:
+target '//lib:greet' is not visible from
+target '//app:hello'
+Recommendation: modify the visibility declaration if you think the dependency is legitimate. For more info see https://bazel.build/concepts/visibility
+ERROR: app/BUILD.bazel:3:10: Analysis of target '//app:hello' (config: a7a71fd) failed
+ERROR: Analysis of target '//app:hello' failed; build aborted
+INFO: Elapsed time: 0.331s, Critical Path: 0.00s
+INFO: 1 process: 1 internal.
+ERROR: Build did NOT complete successfully</code></pre>
+    <p>The error points at the <em>user</em> (<code>app/BUILD.bazel</code>), but the fix goes on the
+      <em>dependency</em>: the owner of <code>greet</code> decides who may use it. These are the values you can list:</p>
+    <table>
+      <thead><tr><th>Value</th><th>Who may depend on the target</th></tr></thead>
+      <tbody>
+        <tr><td><code>//visibility:private</code></td><td>Only its own package (the default).</td></tr>
+        <tr><td><code>//app:__pkg__</code></td><td>Exactly the package <code>//app</code>, not its subpackages.</td></tr>
+        <tr><td><code>//app:__subpackages__</code></td><td><code>//app</code> and every package below it (<code>//app/cli</code>, <code>//app/cli/v2</code>, …).</td></tr>
+        <tr><td><code>//tools:friends</code></td><td>The packages named by a <code>package_group</code> target called <code>friends</code>.</td></tr>
+        <tr><td><code>//visibility:public</code></td><td>Everyone, in every repository.</td></tr>
+      </tbody>
+    </table>
+    <p><code>__pkg__</code> and <code>__subpackages__</code> are not targets. They are special names that only mean
+      something inside a visibility list. The list is a union: if any entry admits the user, it is allowed.</p>
+
+    <h3>Package groups and package defaults</h3>
+    <p>A <strong><code>package_group</code></strong> names a set of packages once, so many targets can share it.
+      Patterns ending in <code>/...</code> include subpackages:</p>
+    <pre data-label="internal/BUILD.bazel"><code class="language-starlark">package_group(
+    name = "friends",
+    packages = [
+        "//app/...",
+        "//tools/release",
+    ],
+)</code></pre>
+    <p>Writing <code>visibility</code> on every target gets repetitive. <strong><code>package(default_visibility = [...])</code></strong>,
+      called at the top of a BUILD file before any rule, sets the default for every rule in that package. A target's own
+      <code>visibility</code> still overrides it.</p>
+    <pre data-label="lib/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//internal:friends"])
+
+py_library(
+    name = "core",          # visible to //internal:friends
+    srcs = ["core.py"],
+)
+
+py_library(
+    name = "scratch",
+    srcs = ["scratch.py"],
+    visibility = ["//visibility:private"],   # overrides the default
+)</code></pre>
+
+    <h3>The mistake everybody makes once</h3>
+    <p>A label without a colon names the target with the same name as the package: <code>//app</code> means
+      <code>//app:app</code>. So <code>visibility = ["//app"]</code> does not mean "the app package". Bazel tries to load
+      a target called <code>app</code> as a package group:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: app/BUILD.bazel: no such target '//app:app': target 'app' not declared in package 'app' defined by app/BUILD.bazel
+ERROR: lib/BUILD.bazel:3:11: no such target '//app:app': target 'app' not declared in package 'app' defined by app/BUILD.bazel and referenced by '//lib:greet'
+ERROR: Analysis of target '//app:hello' failed; build aborted: Analysis failed</code></pre>
+    <p>Write <code>"//app:__pkg__"</code>. (If <code>//app:app</code> does exist and is not a package group, you get a
+      different, equally confusing error.)</p>
+
+    <aside class="callout think">
+      <p>Edit <code>lib/BUILD.bazel</code> below until <code>//app:hello</code> and <code>//app/cli:main</code> both build
+        but <code>//web:page</code> does not. Try <code>__pkg__</code> first and see which one still fails. Then try
+        <code>__subpackages__</code>.</p>
+    </aside>
+    <div class="runnable" data-title="Find the narrowest visibility" data-commands="bazel build //app:hello //app/cli:main|bazel build //web:page|bazel build //...">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "vis")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="lib/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "greet",
+    srcs = ["greet.py"],
+)
+</textarea>
+<textarea class="file" data-path="app/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "hello",
+    srcs = ["hello.py"],
+    deps = ["//lib:greet"],
+)
+</textarea>
+<textarea class="file" data-path="app/cli/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "main",
+    srcs = ["main.py"],
+    deps = ["//lib:greet"],
+)
+</textarea>
+<textarea class="file" data-path="web/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "page",
+    srcs = ["page.py"],
+    deps = ["//lib:greet"],
+)
+</textarea>
+<textarea class="file" data-path="lib/greet.py" data-hidden></textarea>
+<textarea class="file" data-path="app/hello.py" data-hidden></textarea>
+<textarea class="file" data-path="app/cli/main.py" data-hidden></textarea>
+<textarea class="file" data-path="web/page.py" data-hidden></textarea>
+</div>
+    <aside class="callout pro">
+      <p>Reach for <code>//visibility:public</code> last. Public targets are an API: anyone can depend on them, and
+        removing that later is a migration. Start private, then widen to the exact packages that need access. In code
+        review, a new <code>public</code> deserves a question.</p>
+    </aside>
+    <p><strong>Remember:</strong> targets are private by default; the dependency's owner grants access; prefer
+      <code>:__pkg__</code> or a <code>package_group</code> over <code>public</code>; and <code>//app</code> is not the
+      same as <code>//app:__pkg__</code>.</p>
+  </section>
+
+  <section class="lesson-section" id="source-files">
+    <h2>Source files in other packages</h2>
+    <p>Visibility covers files too. A <strong>source file</strong> is a target in the package that contains it, so
+      <code>config/settings.yaml</code> is <code>//config:settings.yaml</code>. In Bazel 9, source files are private
+      unless their package says otherwise. How you say it is <strong><code>exports_files</code></strong>:</p>
+    <pre data-label="config/BUILD.bazel"><code class="language-starlark">exports_files(
+    ["settings.yaml"],
+    visibility = ["//app:__pkg__"],
+)</code></pre>
+    <p>Without the <code>visibility</code> argument, <code>exports_files</code> makes the files public. Bazel reports a
+      missing export in two ways, depending on whether anything in the file's own package mentions the file.</p>
+    <p>If <strong>nothing</strong> in <code>//config</code> refers to <code>settings.yaml</code>, Bazel does not even
+      create a target for it, and it tells you exactly what to add:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: config/BUILD.bazel: no such target '//config:settings.yaml': target 'settings.yaml' not declared in package 'config' defined by config/BUILD.bazel; however, a source file of this name exists.  (Perhaps add 'exports_files(["settings.yaml"])' to config/BUILD.bazel?)
+ERROR: app/BUILD.bazel:3:10: no such target '//config:settings.yaml': target 'settings.yaml' not declared in package 'config' defined by config/BUILD.bazel; however, a source file of this name exists.  (Perhaps add 'exports_files(["settings.yaml"])' to config/BUILD.bazel?) and referenced by '//app:hello'
+ERROR: Analysis of target '//app:hello' failed; build aborted: Analysis failed</code></pre>
+    <p>If a rule in <code>//config</code> <strong>does</strong> use the file (say, a <code>filegroup</code>), the target
+      exists but is private, and you get a visibility error with a pointed last sentence:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: app/BUILD.bazel:3:10: in py_binary rule //app:hello: Visibility error:
+target '//config:settings.yaml' is not visible from
+target '//app:hello'
+Recommendation: modify the visibility declaration if you think the dependency is legitimate. For more info see https://bazel.build/concepts/visibility. To set the visibility of that source file target, use the exports_files() function</code></pre>
+    <aside class="callout bazel">
+      <p>Older Bazel versions let other packages use any source file that a rule in its package mentioned. Bazel 9
+        does not: a file in another package needs <code>exports_files()</code> (or a visible <code>filegroup</code> that
+        wraps it). Old BUILD files that relied on the leak fail with the error above after an upgrade.</p>
+    </aside>
+    <p>There are two good ways to share files across packages. <strong>Export the file</strong> when another package
+      needs that one file by name. <strong>Wrap it in a visible <code>filegroup</code></strong> when you want to hand
+      out a set of files under one stable name, so the owner can add or rename files without breaking users.</p>
+    <aside class="callout sim">
+      <p>The simulator reports both cases as a plain visibility error. Real Bazel's two messages are above; both are
+        fixed by <code>exports_files</code>.</p>
+    </aside>
+    <p><strong>Remember:</strong> files are targets with visibility too; in Bazel 9 another package can use a source
+      file only if its package exports it.</p>
+  </section>
+
+  <section class="lesson-section" id="testonly">
+    <h2>testonly: keeping test helpers out of production</h2>
+    <aside class="callout python">
+      <p>In a Python project, <code>tests/fakes.py</code> sits next to production code, and nothing stops
+        <code>app/main.py</code> from importing a fake clock. It works, so it ships.</p>
+    </aside>
+    <p>Set <code>testonly = True</code> on a target that only tests should use: fakes, fixtures, test data. Bazel then
+      refuses any edge from a non-test target to it. Test rules (<code>py_test</code>) are testonly automatically, and
+      another <code>testonly</code> library may depend on it too.</p>
+    <pre data-label="app/BUILD.bazel"><code class="language-starlark">py_library(
+    name = "fake_clock",
+    srcs = ["fake_clock.py"],
+    testonly = True,
+)
+
+py_binary(
+    name = "hello",
+    srcs = ["hello.py"],
+    deps = [":fake_clock"],    # a production binary using a fake
+)</code></pre>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: app/BUILD.bazel:9:10: in py_binary rule //app:hello: non-test target '//app:hello' depends on testonly target '//app:fake_clock' and doesn't have testonly attribute set
+ERROR: app/BUILD.bazel:9:10: Analysis of target '//app:hello' (config: a7a71fd) failed
+ERROR: Analysis of target '//app:hello' failed; build aborted</code></pre>
+    <p>The fix is almost never to mark <code>hello</code> testonly. Move the fake into the test's <code>deps</code>, or
+      have the binary depend on a real implementation. <code>package(default_testonly = True)</code> marks a whole
+      package of test helpers at once.</p>
+    <p><strong>Remember:</strong> <code>testonly</code> is visibility for "only tests"; it fails at analysis, before any
+      code runs.</p>
+  </section>
+
+  <section class="lesson-section" id="cycles">
+    <h2>Dependency cycles, and how to break them</h2>
+    <aside class="callout python">
+      <p>Python tolerates circular imports, sometimes: <code>orders.py</code> imports <code>users.py</code>, which imports
+        <code>orders.py</code>, and it works until someone moves an import to module level and gets
+        <code>ImportError: cannot import name ... (most likely due to a circular import)</code>.</p>
+    </aside>
+    <p>Bazel does not tolerate them at all. A build graph must be acyclic, because Bazel builds a target only after
+      everything it depends on. If <code>//orders</code> depends on <code>//users</code> and <code>//users</code> on
+      <code>//orders</code>, neither can go first:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: orders/BUILD.bazel:3:11: in py_library rule //orders:orders: cycle in dependency graph:
+    //orders:orders (e722a217ced723dfeb49874b2007895ae0dc9a9d49d004d95320b88c609c409a)
+.-> //orders:orders (a7a71fd16b14112464272f754633480c74c664f2488224c592ebf2dfc7a06b18)
+|   //users:users (a7a71fd16b14112464272f754633480c74c664f2488224c592ebf2dfc7a06b18)
+`-- //orders:orders (a7a71fd16b14112464272f754633480c74c664f2488224c592ebf2dfc7a06b18)
+ERROR: Analysis of target '//orders:orders' failed; build aborted</code></pre>
+    <p>Read the ASCII loop from <code>.-&gt;</code> down to <code>`--</code>: orders → users → orders. The hex strings
+      are configuration hashes (which flags each target was built with); ignore them for now.</p>
+    <p><code>bazel query</code> runs before analysis, so it still works on a cyclic graph. <code>somepath(A, B)</code>
+      prints one path from <code>A</code> to <code>B</code>, which is how you find the edge to cut in a big graph:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">$ bazel query 'somepath(//orders, //users)'
+//orders:orders
+//users:users</code></pre>
+
+    <h3>The fix: extract what both sides share</h3>
+    <p>A cycle usually means two packages share an idea that belongs to neither. Typically <code>orders</code> needs
+      <code>users</code> only for a <code>UserId</code> type, and <code>users</code> needs <code>orders</code> only for
+      an <code>OrderId</code>. Move the shared code into a third library that both depend on, and the loop becomes a
+      V:</p>
+    <pre class="mermaid">flowchart LR
+  subgraph Before
+    O1["//orders"] --> U1["//users"]
+    U1 --> O1
+  end
+  subgraph After
+    O2["//orders"] --> S["//shared:ids"]
+    U2["//users"] --> S
+  end</pre>
+    <p>Other ways out: merge the two targets into one (if they really are one unit), or invert one edge by passing a
+      function or interface in at run time instead of importing it. Extraction is the most common and the easiest to
+      review.</p>
+    <aside class="callout think">
+      <p>In the sandbox, run the build to see the cycle, then run <code>somepath</code> both ways. Then break it: create
+        <code>shared/BUILD.bazel</code> with a <code>py_library</code> named <code>ids</code> (its source
+        <code>shared/ids.py</code> already exists), point both packages at it, and remove their deps on each other.</p>
+    </aside>
+    <div class="runnable" data-title="A cycle between two packages" data-commands="bazel build //...|bazel query 'somepath(//orders, //users)'|bazel query 'somepath(//users, //orders)'">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "shop")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="orders/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "orders",
+    srcs = ["orders.py"],
+    visibility = ["//users:__pkg__"],
+    deps = ["//users"],
+)
+</textarea>
+<textarea class="file" data-path="users/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "users",
+    srcs = ["users.py"],
+    visibility = ["//orders:__pkg__"],
+    deps = ["//orders"],
+)
+</textarea>
+<textarea class="file" data-path="shared/BUILD.bazel"></textarea>
+<textarea class="file" data-path="orders/orders.py" data-hidden></textarea>
+<textarea class="file" data-path="users/users.py" data-hidden></textarea>
+<textarea class="file" data-path="shared/ids.py" data-hidden></textarea>
+</div>
+    <p><strong>Remember:</strong> the graph must be acyclic; Bazel reports a cycle at analysis; find it with
+      <code>somepath</code>, and break it by extracting the shared code into its own library.</p>
+  </section>
+
+  <section class="lesson-section" id="providers">
+    <h2>Providers: what kind of thing is on the other end</h2>
+    <p>An edge is not just "depends on". Each attribute expects a certain <em>kind</em> of target. Bazel checks that
+      through <strong>providers</strong>: small, typed bundles of information a target hands to the targets that depend
+      on it. You never write providers in BUILD files; rules create them.</p>
+    <p>For Python, the important one is <strong><code>PyInfo</code></strong>. A <code>py_library</code> returns a
+      <code>PyInfo</code> listing its Python sources and import paths (plus those of its own deps). A
+      <code>py_binary</code> collects the <code>PyInfo</code> of everything in its <code>deps</code> to know which files
+      to put on its Python path. So <code>deps</code> of a Python rule <em>requires</em> <code>PyInfo</code> (or
+      <code>CcInfo</code>, for C extensions).</p>
+    <p>A <code>filegroup</code> is just a named bag of files. It returns no <code>PyInfo</code>. Put one in
+      <code>deps</code> and analysis fails:</p>
+    <pre data-label="app/BUILD.bazel"><code class="language-starlark">filegroup(
+    name = "templates",
+    srcs = ["page.html"],
+)
+
+py_binary(
+    name = "hello",
+    srcs = ["hello.py"],
+    deps = [":templates"],     # files are not Python code
+)</code></pre>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">ERROR: app/BUILD.bazel:8:10: in deps attribute of py_binary rule //app:hello: '//app:templates' does not have mandatory providers: 'PyInfo' or 'CcInfo'. Since this rule was created by the macro 'py_binary', the error might have been caused by the macro implementation
+ERROR: app/BUILD.bazel:8:10: Analysis of target '//app:hello' (config: a7a71fd) failed
+ERROR: Analysis of target '//app:hello' failed; build aborted</code></pre>
+    <p>Read it as: "the <code>deps</code> attribute needs something that provides <code>PyInfo</code>; this does not".
+      The sentence about the macro is boilerplate: <code>py_binary</code> is a macro wrapping the real rule, and Bazel
+      cannot tell whose mistake it was. It was yours.</p>
+    <p>The fix depends on what the files are:</p>
+    <ul>
+      <li><strong>Files the program reads</strong> (templates, CSV, YAML): move the filegroup to <code>data</code>. Any target that produces files is fine there.</li>
+      <li><strong>Python code</strong>: make it a <code>py_library</code> with those files in <code>srcs</code>, and keep it in <code>deps</code>.</li>
+    </ul>
+    <aside class="callout warn">
+      <p>The reverse mistake is quieter. A <code>.yaml</code> file in a Python rule's <code>srcs</code> builds without
+        complaint with rules_python 2.4.6 (we checked), so nothing tells you it is in the wrong place. Keep
+        <code>srcs</code> for <code>.py</code> files and put files the program reads in <code>data</code>, where readers
+        and tools expect them.</p>
+    </aside>
+    <p><strong>Remember:</strong> attributes check providers, not names. <code>deps</code> of a Python rule needs
+      <code>PyInfo</code>; files go in <code>data</code>.</p>
+  </section>
+
+  <section class="lesson-section" id="phases">
+    <h2>The three phases</h2>
+    <p>Every <code>bazel build</code> or <code>bazel test</code> goes through three phases, in order. Knowing which phase
+      an error came from tells you where to look.</p>
+    <div class="viz" data-viz="phases"></div>
+    <dl>
+      <dt><strong>Loading</strong></dt>
+      <dd>Bazel evaluates the BUILD files (and the <code>.bzl</code> files they load) of the packages your command
+        needs. Errors here are Starlark errors: an undefined name, a syntax error, an empty <code>glob</code>. A loading
+        error breaks the whole package, so every target in it is unusable.</dd>
+      <dt><strong>Analysis</strong></dt>
+      <dd>For each target, the rule's implementation runs. It looks up every dependency, checks visibility,
+        <code>testonly</code>, cycles, and providers, and declares the <strong>actions</strong> needed to build the
+        outputs. Nothing has run yet.</dd>
+      <dt><strong>Execution</strong></dt>
+      <dd>Bazel runs the actions whose outputs are needed and not already cached. Errors here come from real commands:
+        a missing input file, a failing compiler, a failing test.</dd>
+    </dl>
+    <p>Each package in this sandbox fails in a different phase. Predict which phase before you run each command.</p>
+    <div class="runnable" data-title="One error per phase" data-commands="bazel build //loading:app|bazel build //analysis:app|bazel build //execution:app">
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "phases")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="loading/BUILD.bazel">
+py_binary(
+    name = "app",
+    srcs = ["app.py"],
+)
+</textarea>
+<textarea class="file" data-path="analysis/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "app",
+    srcs = ["app.py"],
+    deps = ["//lib:greet"],
+)
+</textarea>
+<textarea class="file" data-path="lib/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "greet",
+    srcs = ["greet.py"],
+)
+</textarea>
+<textarea class="file" data-path="execution/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "app",
+    srcs = ["app.py"],
+    data = ["config.yaml"],
+)
+</textarea>
+<textarea class="file" data-path="loading/app.py" data-hidden></textarea>
+<textarea class="file" data-path="analysis/app.py" data-hidden></textarea>
+<textarea class="file" data-path="lib/greet.py" data-hidden></textarea>
+<textarea class="file" data-path="execution/app.py" data-hidden></textarea>
+</div>
+    <p>The execution one surprises people. <code>config.yaml</code> is in the same package, so Bazel creates a target for
+      it from the label alone and analysis passes. Only when an action needs the file does Bazel notice it does not
+      exist. Real Bazel, with the same mistake in a genrule's <code>srcs</code>:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">INFO: Analyzed target //gen:count (1 packages loaded, 2 targets configured).
+ERROR: gen/BUILD.bazel:1:8: Executing genrule //gen:count failed: missing input file '//gen:wordz.txt'
+ERROR: gen/BUILD.bazel:1:8: Executing genrule //gen:count failed: 1 input file(s) do not exist
+Target //gen:count failed to build
+Use --verbose_failures to see the command lines of failed build steps.
+ERROR: gen/BUILD.bazel:1:8 Executing genrule //gen:count failed: 1 input file(s) do not exist
+INFO: Elapsed time: 0.168s, Critical Path: 0.00s
+INFO: 1 process: 1 internal.
+ERROR: Build did NOT complete successfully</code></pre>
+    <table>
+      <thead><tr><th>Phase</th><th>Errors you meet there</th></tr></thead>
+      <tbody>
+        <tr><td>Loading</td><td><code>name 'py_binary' is not defined</code>, syntax errors, <code>glob pattern ... didn't match anything</code>, <code>no such package</code></td></tr>
+        <tr><td>Analysis</td><td><code>no such target</code>, <code>Visibility error</code>, <code>does not have mandatory providers</code>, <code>depends on testonly target</code>, <code>cycle in dependency graph</code></td></tr>
+        <tr><td>Execution</td><td><code>missing input file</code>, a command exiting non-zero, <code>FAILED</code> tests, undeclared files not found in the sandbox</td></tr>
+      </tbody>
+    </table>
+    <aside class="callout tip">
+      <p>Two tells in the output. "Analysis of target ... failed; build aborted" means analysis. A line starting
+        "Executing ..." or a test marked <code>FAILED</code> means execution. Loading errors usually print a Starlark
+        traceback or "error loading package".</p>
+    </aside>
+    <p><strong>Remember:</strong> loading reads BUILD files, analysis checks the graph and plans actions, execution runs
+      them. Everything in the earlier sections of this module is an analysis error.</p>
+  </section>
+
+  <section class="lesson-section" id="actions">
+    <h2>Actions and action keys</h2>
+    <p>Analysis turns targets into <strong>actions</strong>. An action is one command with an exact list of input
+      files, an exact list of output files, and an environment. "Run this genrule's shell command", "write a launcher
+      script", and "run this test" are each an action.</p>
+    <p>You can see the actions Bazel plans with <code>bazel aquery</code> ("action query"). For a genrule that counts
+      lines in <code>words.txt</code>:</p>
+    <pre data-label="gen/BUILD.bazel"><code class="language-starlark">genrule(
+    name = "count",
+    srcs = ["words.txt"],
+    outs = ["count.txt"],
+    cmd = "wc -l &lt; $(location words.txt) &gt; $@",
+)</code></pre>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">$ bazel aquery //gen:count
+INFO: Analyzed target //gen:count (1 packages loaded, 2 targets configured).
+INFO: Found 1 target...
+action 'Executing genrule //gen:count'
+  Mnemonic: Genrule
+  Target: //gen:count
+  Configuration: k8-fastbuild
+  Execution platform: @@platforms//host:host
+  ActionKey: 1c74c343d28db6786290499ca59ef411b61fe731182471b2b4e790d46cda0d18
+  Inputs: [external/bazel_tools/tools/genrule/genrule-setup.sh, gen/words.txt]
+  Outputs: [bazel-out/k8-fastbuild/bin/gen/count.txt]
+  Environment: [PATH=/bin:/usr/bin:/usr/local/bin]
+  Command Line: (exec /bin/bash \
+    -c \
+    'source external/bazel_tools/tools/genrule/genrule-setup.sh; wc -l &lt; gen/words.txt &gt; bazel-out/k8-fastbuild/bin/gen/count.txt')</code></pre>
+    <p>Everything Bazel needs to decide "can I skip this?" is on that screen. The <strong>action key</strong> is a hash
+      of the command line, the environment, and the action's settings. Before running an action, Bazel combines that
+      key with the hashes of the <em>contents</em> of every input file. If an earlier run produced outputs for exactly
+      that combination, Bazel reuses them instead of running the command.</p>
+    <p>Three consequences follow, and they explain most of Bazel's behavior:</p>
+    <ol>
+      <li><strong>Content, not timestamps.</strong> <code>touch words.txt</code> changes nothing: our next build reported
+        <code>1 action cache hit</code>. (Make uses timestamps; Bazel does not.)</li>
+      <li><strong>The environment is part of the key.</strong> Changing <code>--action_env=NOTE=b</code> to
+        <code>NOTE=c</code> re-ran every affected action and test in our runs, even though no file changed.</li>
+      <li><strong>Undeclared inputs are invisible to the key.</strong> If a command reads a file not in its inputs, the
+        key does not change when that file does, and Bazel would happily reuse a stale result. The next section is about
+        how Bazel stops that from happening.</li>
+    </ol>
+    <aside class="callout sim">
+      <p><code>aquery</code>, action keys, and running commands are execution-time concepts the simulator does not
+        model. Everything from here to the end of the module is shown with real Bazel output and practiced in the labs.</p>
+    </aside>
+    <p><strong>Remember:</strong> an action is a command plus exact inputs and outputs; its cache key hashes the command,
+      environment, and input contents.</p>
+  </section>
+
+  <section class="lesson-section" id="hermeticity">
+    <h2>Sandboxing and hermeticity</h2>
+    <aside class="callout python">
+      <p>A pytest test can open any file on your disk. It passes on your laptop because <code>prices.csv</code> happens to
+        be in the working directory, and fails on CI, or worse, passes on CI against a stale copy.</p>
+    </aside>
+    <p>A build is <strong>hermetic</strong> when each action's result depends only on its declared inputs: not on what
+      else is on the machine, not on what ran before. Hermeticity is what makes action keys trustworthy, and therefore
+      what makes caching safe.</p>
+    <p>Bazel enforces it with a <strong>sandbox</strong>. On Linux, each action runs in a fresh directory tree (an
+      execution root) that contains symlinks to only the action's declared inputs. Files you did not declare are simply
+      not there. A genrule that reads a file it never listed:</p>
+    <pre data-label="gen/BUILD.bazel"><code class="language-starlark">genrule(
+    name = "count",
+    outs = ["count.txt"],
+    cmd = "wc -l &lt; gen/words.txt &gt; $@",    # reads a file it never declared
+)</code></pre>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">INFO: Analyzed target //gen:count (2 packages loaded, 2 targets configured).
+ERROR: gen/BUILD.bazel:1:8: Executing genrule //gen:count failed: (Exit 1): bash failed: error executing Genrule command (from genrule rule target //gen:count) /bin/bash -c 'source external/bazel_tools/tools/genrule/genrule-setup.sh; wc -l &lt; gen/words.txt &gt; bazel-out/k8-fastbuild/bin/gen/count.txt'
+Use --sandbox_debug to see verbose messages from the sandbox and retain the sandbox build root for debugging
+/bin/bash: line 1: gen/words.txt: No such file or directory
+Target //gen:count failed to build
+Use --verbose_failures to see the command lines of failed build steps.
+INFO: Elapsed time: 0.223s, Critical Path: 0.03s
+INFO: 2 processes: 2 internal.
+ERROR: Build did NOT complete successfully</code></pre>
+    <p>The file is right there in your workspace, but not in the sandbox. Run the same build with
+      <code>--spawn_strategy=standalone</code> (no sandbox) and it "works": exactly the kind of accidental success the
+      sandbox exists to catch. The fix is to declare the input and let Bazel tell the command where it is:
+      <code>srcs = ["words.txt"]</code> and <code>$(location words.txt)</code>.</p>
+
+    <h3>Tests and runfiles</h3>
+    <p>Tests and binaries see their files through <strong>runfiles</strong>: a directory tree, built next to the
+      executable, holding its sources, its deps, and its <code>data</code>. A <code>py_test</code> starts with its
+      working directory at the root of that tree. So a test that opens <code>herm/words.txt</code> without declaring it
+      fails, even though the path is correct relative to your workspace:</p>
+    <pre data-label="Real output (Bazel 9.3.2), excerpt from --test_output=errors"><code class="language-none">FileNotFoundError: [Errno 2] No such file or directory: 'herm/words.txt'
+----------------------------------------------------------------------
+Ran 1 test in 0.001s
+FAILED (errors=1)
+cwd: /root/.cache/bazel/_bazel_root/cafad382fe0dddd68f47a0053524c931/sandbox/linux-sandbox/3/execroot/_main/bazel-out/k8-fastbuild/bin/herm/words_test.runfiles/_main</code></pre>
+    <p>Add <code>data = ["words.txt"]</code> to the <code>py_test</code> and it passes. In real projects, declare the
+      file on the <em>library that reads it</em>, not on each test: <code>data</code> is transitive, so every binary and
+      test that depends on the library gets the file. Lab 1 practices exactly this. Module 03 covers runfiles in depth,
+      including the runfiles library for reading them portably.</p>
+    <aside class="callout danger" data-title="The Path.resolve() trap">
+      <p>The Linux sandbox hides undeclared files from <em>relative</em> paths, but it is not a full jail. An absolute
+        path into your source tree still works. So does <code>Path(__file__).resolve().parent / "words.txt"</code>:
+        <code>resolve()</code> follows the runfiles symlink back into your workspace, where the undeclared file sits.
+        We tried it: the test passed with no <code>data</code>, and after we edited <code>words.txt</code> it still
+        reported <code>(cached) PASSED</code>, because the file is not an input. Use
+        <code>Path(__file__).parent</code> (no <code>resolve()</code>) and declare the file.</p>
+    </aside>
+    <p><strong>Remember:</strong> hermetic means "depends only on declared inputs"; the sandbox makes undeclared reads
+      fail; and anything that escapes the sandbox also escapes the cache key.</p>
+  </section>
+
+  <section class="lesson-section" id="incremental">
+    <h2>Incremental rebuilds and cached tests</h2>
+    <p>Put the pieces together. Every action is keyed by its command and its input contents. Change one file, and only
+      the actions that (transitively) take that file as input get a new key. Everything else is a cache hit.</p>
+    <p>Click each source file in the graph below. Notice which tests re-run, and which stay <code>(cached)</code>.</p>
+    <div class="viz" data-viz="buildgraph" data-config='{"title": "An inventory service: change a file, see what re-runs", "nodes": [
+      {"id": "stock.py", "kind": "file", "x": 0, "y": 0},
+      {"id": "prices.csv", "kind": "file", "x": 0, "y": 1},
+      {"id": "report.py", "kind": "file", "x": 0, "y": 2},
+      {"id": "stock_test.py", "kind": "file", "x": 0, "y": 3},
+      {"id": "report_test.py", "kind": "file", "x": 0, "y": 4},
+      {"id": "//inventory:stock", "kind": "rule", "x": 1, "y": 0.5, "deps": ["stock.py", "prices.csv"]},
+      {"id": "//app:report_lib", "kind": "rule", "x": 1, "y": 2, "deps": ["report.py", "//inventory:stock"]},
+      {"id": "//app:report", "kind": "rule", "x": 2, "y": 1.5, "deps": ["//app:report_lib"]},
+      {"id": "//inventory:stock_test", "kind": "test", "x": 2, "y": 3, "deps": ["stock_test.py", "//inventory:stock"]},
+      {"id": "//app:report_test", "kind": "test", "x": 2, "y": 4, "deps": ["report_test.py", "//app:report_lib"]}
+    ]}'></div>
+    <aside class="callout think">
+      <p>Edit <code>report_test.py</code>: one test re-runs. Edit <code>prices.csv</code>: everything does, because it is
+        <code>data</code> of the library at the bottom of the graph. What would happen if <code>prices.csv</code> were
+        read but <em>not</em> declared? (Answer: nothing would re-run, and the tests would report stale results.)</p>
+    </aside>
+    <p>Here is the same thing for real. Two packages, each with a test; nothing changed since the last run:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">$ bazel test //...
+INFO: Analyzed 4 targets (0 packages loaded, 0 targets configured).
+INFO: Found 2 targets and 2 test targets...
+INFO: Elapsed time: 0.175s, Critical Path: 0.01s
+INFO: 1 process: 2 action cache hit, 1 internal.
+INFO: Build completed successfully, 1 total action
+//app:hello_test                                                (cached) PASSED in 0.5s
+//lib:greet_test                                                (cached) PASSED in 0.8s
+Executed 0 out of 2 tests: 2 tests pass.</code></pre>
+    <p>Then one line is appended to <code>lib/greet.py</code>. Only the test that depends on it runs:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">$ bazel test //...
+INFO: Analyzed 4 targets (0 packages loaded, 0 targets configured).
+INFO: Found 2 targets and 2 test targets...
+INFO: Elapsed time: 0.926s, Critical Path: 0.76s
+INFO: 4 processes: 1 action cache hit, 3 internal, 2 linux-sandbox.
+INFO: Build completed successfully, 4 total actions
+//app:hello_test                                                (cached) PASSED in 0.5s
+//lib:greet_test                                                         PASSED in 0.6s
+Executed 1 out of 2 tests: 2 tests pass.</code></pre>
+    <p>The <code>PASSED in 0.5s</code> on a cached line is the time the test took when it actually ran. The
+      <code>N processes: ...</code> line counts what happened: <em>action cache hit</em> (skipped),
+      <em>internal</em> (bookkeeping Bazel does in-process, such as writing symlinks), and <em>linux-sandbox</em>
+      (commands that really ran, sandboxed).</p>
+
+    <h3>The action cache, and why <code>bazel clean</code> is rarely needed</h3>
+    <p>The <strong>action cache</strong> lives in Bazel's <em>output base</em> (a directory under
+      <code>~/.cache/bazel</code>, one per workspace). It maps action keys to the outputs they produced. Test results are
+      outputs of the test action, so they are cached exactly like compiled files.</p>
+    <p><code>bazel clean</code> deletes the outputs and that cache. Coming from Make or a stale <code>__pycache__</code>,
+      it is tempting to run it whenever something looks odd. With Bazel it almost never helps: if inputs are declared,
+      the cache cannot be stale, and cleaning only throws away work. When a clean <em>does</em> change the result, that
+      is a hermeticity bug (an undeclared input) worth finding, not a ritual worth repeating.</p>
+
+    <h3>Why a test is never cached</h3>
+    <p>If <code>bazel test</code> re-runs a test every time even though nothing changed, look for one of these:</p>
+    <ul>
+      <li><strong><code>--nocache_test_results</code></strong> (or <code>-t-</code>) on the command line or in a
+        <code>.bazelrc</code>. It forces every test to run.</li>
+      <li><strong><code>tags = ["external"]</code></strong> on the test. It tells Bazel the test talks to the outside
+        world (a network service, say), so its result can never be cached.</li>
+      <li><strong>A volatile input</strong>: a generated file that embeds a timestamp or random value changes every
+        build, so the test's key changes too.</li>
+    </ul>
+    <p>Lab 2 has the first two hidden in a real workspace.</p>
+
+    <h3>A cache that survives: <code>--disk_cache</code></h3>
+    <p>The action cache is per workspace and disappears with <code>bazel clean</code>. <code>--disk_cache=PATH</code> adds
+      a second cache in a directory you choose, keyed the same way, shared by every workspace and every clean. It also
+      remembers older results: the local action cache keeps only the latest result for each output, so switching back
+      to a previous version of a file re-runs its actions, while with a disk cache our rebuild of a previously seen
+      version reported <code>1 disk cache hit</code>. Put it in your <code>.bazelrc</code>:</p>
+    <pre data-label=".bazelrc"><code class="language-ini">build --disk_cache=~/.cache/bazel-disk</code></pre>
+    <p>After <code>bazel clean</code>, the next test run gets its results back from that directory:</p>
+    <pre data-label="Real output (Bazel 9.3.2)"><code class="language-none">$ bazel clean
+INFO: Starting clean (this may take a while). Use --async if the clean takes more than several minutes.
+$ bazel test //...
+INFO: Analyzed 3 targets (96 packages loaded, 2895 targets configured).
+INFO: Found 1 target and 2 test targets...
+INFO: Elapsed time: 2.730s, Critical Path: 0.65s
+INFO: 25 processes: 4 disk cache hit, 23 internal.
+INFO: Build completed successfully, 25 total actions
+//textstats:report_test                                         (cached) PASSED in 0.4s
+//textstats:stats_test                                          (cached) PASSED in 0.3s
+Executed 0 out of 2 tests: 2 tests pass.</code></pre>
+    <aside class="callout warn">
+      <p>Use an absolute path or <code>~/</code> for <code>--disk_cache</code>. We tried
+        <code>--disk_cache=%workspace%/.cache</code>: Bazel 9.3.2 does not expand <code>%workspace%</code> in this flag and
+        created a directory literally named <code>%workspace%</code>. A relative path is resolved from the workspace
+        root, which also works, but then each workspace gets its own cache.</p>
+    </aside>
+    <p>A <strong>remote cache</strong> is the same idea over the network: CI fills it, and every developer's build
+      downloads results instead of recomputing them. It is only safe because of everything in this module: honest
+      edges, sandboxed actions, and content-hashed keys. Setting one up is part of Level 2 of this course.</p>
+    <aside class="callout pro">
+      <p>Teams usually commit a <code>.bazelrc</code> with <code>build --disk_cache=~/.cache/bazel-disk</code> for
+        local work. The disk cache grows without bound by default;
+        <code>--experimental_disk_cache_gc_max_size=20G</code> caps it.</p>
+    </aside>
+    <p><strong>Remember:</strong> only actions downstream of a change re-run; tests are actions, so unchanged tests report
+      <code>(cached) PASSED</code>; <code>bazel clean</code> is a smell, not a fix; <code>--disk_cache</code> keeps results
+      across cleans and workspaces.</p>
+  </section>
+
+  <section class="lesson-section" id="practice">
+    <h2>Practice</h2>
+    <p>Each exercise is graded by the simulator. Open "Try commands" to run <code>bazel</code> against your edits before
+      pressing <strong>Check</strong>.</p>
+
+    <div class="exercise" data-id="m02-e1" data-title="Grant access, and no more">
+      <div class="exercise-prompt">
+        <p><code>//app:hello</code> fails with a visibility error on <code>//lib:greet</code>. Fix it the least permissive
+          way: <code>//app:hello</code> must build, but <code>//tools:audit</code>, which also tries to use the library,
+          must still be refused. Do not touch <code>app/</code> or <code>tools/</code>.</p>
+      </div>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "vis")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="lib/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "greet",
+    srcs = ["greet.py"],
+)
+</textarea>
+<textarea class="file" data-path="app/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "hello",
+    srcs = ["hello.py"],
+    deps = ["//lib:greet"],
+)
+</textarea>
+<textarea class="file" data-path="tools/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "audit",
+    srcs = ["audit.py"],
+    deps = ["//lib:greet"],
+)
+</textarea>
+<textarea class="file" data-path="lib/greet.py" data-hidden></textarea>
+<textarea class="file" data-path="app/hello.py" data-hidden></textarea>
+<textarea class="file" data-path="tools/audit.py" data-hidden></textarea>
+<script type="text/x-python" class="tests">
+def test_app_hello_builds(bazel):
+    result = bazel.build("//app:hello")
+    assert result.ok, "bazel build //app:hello fails:\n" + result.error
+
+def test_tools_audit_is_still_refused(bazel):
+    result = bazel.build("//tools:audit")
+    assert not result.ok and "not visible" in result.error, "//tools:audit must still get a visibility error: grant access to //app only"
+
+def test_greet_is_not_public(bazel):
+    vis = bazel.attr("//lib:greet", "visibility") or []
+    assert "//visibility:public" not in vis, "//visibility:public works, but it lets every package in, not just //app"
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p>Add a <code>visibility</code> list to <code>greet</code> naming exactly one package. The special name for "this
+          package and not its subpackages" ends in <code>:__pkg__</code>. <code>"//app"</code> alone is a label for
+          <code>//app:app</code>, which does not exist.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="lib/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "greet",
+    srcs = ["greet.py"],
+    visibility = ["//app:__pkg__"],
+)</code></pre>
+        <p>If <code>//app/cli</code> later needs it too, widen to <code>//app:__subpackages__</code>, or define a
+          <code>package_group</code> once several unrelated packages need it.</p>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m02-e2" data-title="Break the cycle">
+      <div class="exercise-prompt">
+        <p><code>//orders</code> and <code>//users</code> depend on each other, so nothing builds. Both only need the ID
+          types now in <code>shared/ids.py</code>. Create a <code>py_library</code> named <code>//shared:ids</code> from
+          that file, make both <code>//orders</code> and <code>//users</code> depend on it, and remove their dependencies
+          on each other. Give <code>ids</code> a visibility that admits just those two packages.</p>
+      </div>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "shop")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="orders/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "orders",
+    srcs = ["orders.py"],
+    visibility = ["//users:__pkg__"],
+    deps = ["//users"],
+)
+</textarea>
+<textarea class="file" data-path="users/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "users",
+    srcs = ["users.py"],
+    visibility = ["//orders:__pkg__"],
+    deps = ["//orders"],
+)
+</textarea>
+<textarea class="file" data-path="shared/BUILD.bazel"></textarea>
+<textarea class="file" data-path="orders/orders.py" data-hidden></textarea>
+<textarea class="file" data-path="users/users.py" data-hidden></textarea>
+<textarea class="file" data-path="shared/ids.py" data-hidden></textarea>
+<script type="text/x-python" class="tests">
+def test_shared_ids_is_a_py_library(bazel):
+    t = bazel.target("//shared:ids")
+    assert t.kind == "py_library", f"//shared:ids should be a py_library, but it is a {t.kind}"
+
+def test_both_packages_use_shared_ids(bazel):
+    for user in ("//orders:orders", "//users:users"):
+        assert "//shared:ids" in bazel.query(f"deps({user}, 1)"), f"{user} should list //shared:ids in deps"
+
+def test_no_edge_left_between_orders_and_users(bazel):
+    assert bazel.query("somepath(//orders, //users)") == [], "//orders still reaches //users: remove that dep"
+    assert bazel.query("somepath(//users, //orders)") == [], "//users still reaches //orders: remove that dep"
+
+def test_everything_builds(bazel):
+    result = bazel.build("//...")
+    assert result.ok, "bazel build //... fails:\n" + result.error
+
+def test_ids_is_not_public(bazel):
+    vis = bazel.attr("//shared:ids", "visibility") or []
+    assert "//visibility:public" not in vis, "Admit //orders and //users only, not everyone"
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p>A visibility list can hold several entries: <code>["//orders:__pkg__", "//users:__pkg__"]</code>. Once neither
+          package depends on the other, the <code>visibility</code> they granted each other is no longer needed either;
+          you may delete it.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="shared/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "ids",
+    srcs = ["ids.py"],
+    visibility = [
+        "//orders:__pkg__",
+        "//users:__pkg__",
+    ],
+)</code></pre>
+<pre data-path="orders/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "orders",
+    srcs = ["orders.py"],
+    deps = ["//shared:ids"],
+)</code></pre>
+<pre data-path="users/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "users",
+    srcs = ["users.py"],
+    deps = ["//shared:ids"],
+)</code></pre>
+        <p>The Python side changes the same way: <code>orders.py</code> and <code>users.py</code> now
+          <code>from shared.ids import OrderId, UserId</code> instead of importing each other.</p>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m02-e3" data-title="Export a source file">
+      <div class="exercise-prompt">
+        <p><code>//app:hello</code> reads <code>config/settings.yaml</code> at run time, but the file is private to
+          <code>//config</code>. Change only <code>config/BUILD.bazel</code> so that <code>//app:hello</code> builds while
+          <code>//ops:deploy</code>, which also lists the file, is still refused. Keep the <code>all_configs</code>
+          filegroup working for <code>//config</code> itself.</p>
+      </div>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "cfg")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="config/BUILD.bazel">
+filegroup(
+    name = "all_configs",
+    srcs = ["settings.yaml"],
+)
+</textarea>
+<textarea class="file" data-path="app/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "hello",
+    srcs = ["hello.py"],
+    data = ["//config:settings.yaml"],
+)
+</textarea>
+<textarea class="file" data-path="ops/BUILD.bazel" data-readonly>
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "deploy",
+    srcs = ["deploy.py"],
+    data = ["//config:settings.yaml"],
+)
+</textarea>
+<textarea class="file" data-path="config/settings.yaml" data-hidden>greeting: Hello</textarea>
+<textarea class="file" data-path="app/hello.py" data-hidden></textarea>
+<textarea class="file" data-path="ops/deploy.py" data-hidden></textarea>
+<script type="text/x-python" class="tests">
+def test_app_hello_builds(bazel):
+    result = bazel.build("//app:hello")
+    assert result.ok, "bazel build //app:hello fails:\n" + result.error
+
+def test_ops_deploy_is_still_refused(bazel):
+    result = bazel.build("//ops:deploy")
+    assert not result.ok and "not visible" in result.error, "//ops:deploy must still get a visibility error: export the file to //app only"
+
+def test_the_filegroup_still_exists(bazel):
+    t = bazel.target("//config:all_configs")
+    assert t.kind == "filegroup", "keep the all_configs filegroup"
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p><code>exports_files</code> takes a list of file names and an optional <code>visibility</code>. Without
+          <code>visibility</code> the files become public, which would let <code>//ops</code> in too.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="config/BUILD.bazel"><code class="language-starlark">exports_files(
+    ["settings.yaml"],
+    visibility = ["//app:__pkg__"],
+)
+
+filegroup(
+    name = "all_configs",
+    srcs = ["settings.yaml"],
+)</code></pre>
+        <p>The real error for the starter ends with "To set the visibility of that source file target, use the
+          exports_files() function". Bazel told you the answer.</p>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m02-e4" data-title="Files are not Python code">
+      <div class="exercise-prompt">
+        <p>A teammate added the HTML templates to <code>//web:server</code>'s <code>deps</code>, and the build fails with
+          "does not have mandatory providers: 'PyInfo' or 'CcInfo'". The server reads the templates at run time. Fix the
+          BUILD file so <code>//web:server</code> builds and the templates still reach it. Keep
+          <code>//web:render</code> in <code>deps</code>: it is real Python code.</p>
+      </div>
+<textarea class="file" data-path="MODULE.bazel" data-readonly>
+module(name = "web")
+
+bazel_dep(name = "rules_python", version = "2.4.6")
+</textarea>
+<textarea class="file" data-path="web/BUILD.bazel">
+load("@rules_python//python:defs.bzl", "py_binary", "py_library")
+
+filegroup(
+    name = "templates",
+    srcs = [
+        "templates/index.html",
+        "templates/item.html",
+    ],
+)
+
+py_library(
+    name = "render",
+    srcs = ["render.py"],
+)
+
+py_binary(
+    name = "server",
+    srcs = ["server.py"],
+    deps = [
+        ":render",
+        ":templates",
+    ],
+)
+</textarea>
+<textarea class="file" data-path="web/render.py" data-hidden></textarea>
+<textarea class="file" data-path="web/server.py" data-hidden></textarea>
+<textarea class="file" data-path="web/templates/index.html" data-hidden></textarea>
+<textarea class="file" data-path="web/templates/item.html" data-hidden></textarea>
+<script type="text/x-python" class="tests">
+def test_server_builds(bazel):
+    result = bazel.build("//web:server")
+    assert result.ok, "bazel build //web:server fails:\n" + result.error
+
+def test_templates_are_data(bazel):
+    data = bazel.query("labels(data, //web:server)")
+    assert "//web:templates" in data, "//web:server should list :templates in data, since it reads them at run time"
+
+def test_render_is_still_a_dep(bazel):
+    deps = bazel.query("labels(deps, //web:server)")
+    assert deps == ["//web:render"], f"deps of //web:server should be exactly :render, but it is {deps}"
+</script>
+      <details class="hint"><summary>Hint</summary>
+        <p><code>deps</code> is for code you import (targets that provide <code>PyInfo</code>). Which attribute is for files
+          a program opens?</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-path="web/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_binary", "py_library")
+
+filegroup(
+    name = "templates",
+    srcs = [
+        "templates/index.html",
+        "templates/item.html",
+    ],
+)
+
+py_library(
+    name = "render",
+    srcs = ["render.py"],
+)
+
+py_binary(
+    name = "server",
+    srcs = ["server.py"],
+    data = [":templates"],
+    deps = [":render"],
+)</code></pre>
+        <p>Even better, if only <code>render.py</code> opens the templates, put <code>data = [":templates"]</code> on
+          <code>:render</code>: <code>data</code> is transitive, so the server (and any test of <code>render</code>) gets
+          them automatically.</p>
+      </details>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="lab">
+    <h2>Labs: hermeticity and caching for real</h2>
+    <p>The simulator stops at analysis, so it cannot show a sandbox hiding a file or a test result coming from a cache.
+      These two labs do, with real Bazel. The first proves that undeclared inputs fail; the second proves your tests are
+      cacheable and that results survive <code>bazel clean</code>.</p>
+
+    <div class="lab" data-id="m02-lab1" data-title="Declare every input">
+      <div class="lab-prompt">
+        <p>The <code>//inventory</code> package has a library that reads <code>prices.csv</code> at run time, a test for
+          it, and a genrule that counts the items in the CSV. Neither the library nor the genrule declares the file, so the
+          test cannot find it and the genrule fails in the sandbox. Declare the file where it is used. Do not change any
+          <code>.py</code> file.</p>
+        <ul class="checklist" data-id="m02-lab1-steps">
+          <li>Run <code>pixi run start m02-lab1</code>, then <code>cd work/m02-lab1</code></li>
+          <li>Run <code>pixi run bazel test //inventory:stock_test --test_output=errors</code> and find the path in the <code>FileNotFoundError</code>: which directory was the test looking in?</li>
+          <li>Add <code>prices.csv</code> to the <code>data</code> of the library that opens it (not just the test) and re-run</li>
+          <li>Run <code>pixi run bazel build //inventory:item_count</code>, read the sandbox error, and declare the input in the genrule's <code>srcs</code>, using <code>$(location prices.csv)</code> in <code>cmd</code></li>
+          <li>Check <code>cat bazel-bin/inventory/item_count.txt</code> prints 3</li>
+          <li>Back at the repository root, run <code>pixi run grade m02-lab1</code></li>
+        </ul>
+      </div>
+      <details class="hint"><summary>Hint</summary>
+        <p>The test's traceback ends in <code>.../stock_test.runfiles/_main/inventory/prices.csv</code>: the runfiles
+          tree. A file gets into runfiles through <code>data</code>. For the genrule, a file gets into the sandbox
+          through <code>srcs</code>, and <code>$(location prices.csv)</code> expands to its path there.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-label="inventory/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+# The library reads prices.csv at run time (see stock.py).
+py_library(
+    name = "stock",
+    srcs = ["stock.py"],
+    data = ["prices.csv"],
+)
+
+py_test(
+    name = "stock_test",
+    srcs = ["stock_test.py"],
+    deps = [":stock"],
+)
+
+# Counts the items in the price list (every line but the header).
+genrule(
+    name = "item_count",
+    srcs = ["prices.csv"],
+    outs = ["item_count.txt"],
+    cmd = "tail -n +2 $(location prices.csv) | wc -l &gt; $@",
+)</code></pre>
+        <p>Because <code>data</code> sits on the library, every future binary or test that depends on
+          <code>:stock</code> gets <code>prices.csv</code> without anyone remembering to add it. And because it is now
+          an input, editing a price re-runs <code>stock_test</code>; before, a cached result could have hidden the
+          change.</p>
+      </details>
+    </div>
+
+    <div class="lab" data-id="m02-lab2" data-title="Tests that stay cached">
+      <div class="lab-prompt">
+        <p>In <code>//textstats</code>, both tests pass, but they run every single time, and CI is slow. Nothing in them
+          is volatile; something in the workspace's configuration keeps Bazel from reusing results. Find and remove it,
+          then add a disk cache so results also survive <code>bazel clean</code>. The grader runs <code>bazel test
+          //...</code> twice, then <code>bazel clean</code>, then <code>bazel test //...</code> again, and expects
+          <code>Executed 0 out of 2 tests</code> both times after the first.</p>
+        <ul class="checklist" data-id="m02-lab2-steps">
+          <li>Run <code>pixi run start m02-lab2</code>, then <code>cd work/m02-lab2</code></li>
+          <li>Run <code>pixi run bazel test //...</code> twice; note the second run says <code>Executed 2 out of 2</code></li>
+          <li>Read <code>.bazelrc</code> and <code>textstats/BUILD.bazel</code>; remove what forces re-runs</li>
+          <li>Run the tests twice again and look for <code>(cached) PASSED</code></li>
+          <li>Add <code>build --disk_cache=~/.cache/bazel-disk</code> to <code>.bazelrc</code>; run the tests, <code>pixi run bazel clean</code>, and run them again</li>
+          <li>Back at the repository root, run <code>pixi run grade m02-lab2</code></li>
+        </ul>
+      </div>
+      <details class="hint"><summary>Hint</summary>
+        <p>There are two culprits: a <code>test</code> flag in <code>.bazelrc</code> whose name says what it does, and a
+          tag on <code>report_test</code> that tells Bazel the test talks to the outside world. The comment says the test
+          no longer does.</p>
+      </details>
+      <details class="solution"><summary>Show solution</summary>
+<pre data-label=".bazelrc"><code class="language-ini"># Keep action outputs and test results in a cache that survives `bazel clean`
+# (and is shared by every workspace on this machine).
+build --disk_cache=~/.cache/bazel-disk
+
+# Show the output of failing tests.
+test --test_output=errors</code></pre>
+<pre data-label="textstats/BUILD.bazel"><code class="language-starlark">load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "stats",
+    srcs = ["stats.py"],
+)
+
+py_test(
+    name = "stats_test",
+    srcs = ["stats_test.py"],
+    deps = [":stats"],
+)
+
+py_test(
+    name = "report_test",
+    srcs = ["report_test.py"],
+    deps = [":stats"],
+)</code></pre>
+        <p>With the starter, the second run prints <code>Executed 2 out of 2 tests</code> and no <code>(cached)</code>. With
+          the fix, it prints <code>Executed 0 out of 2 tests</code>, and after <code>bazel clean</code> the summary line
+          reports <code>4 disk cache hit</code>.</p>
+      </details>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="quiz">
+    <h2>Quiz</h2>
+    <div class="quiz" data-id="m02-quiz">
+<script type="application/json">
+{"title": "Build graph and caching quiz", "passScore": 0.7, "questions": [
+  {"type": "single", "prompt": "<code>app.py</code> opens <code>templates/page.html</code> at run time. Which attribute of the <code>py_binary</code> should list the template?", "options": ["srcs", "deps", "data", "visibility"], "answer": 2, "explanation": "<p><code>data</code> is for files a program reads while it runs; Bazel puts them in the runfiles tree. <code>srcs</code> is for the target's own Python files, and <code>deps</code> needs targets that provide <code>PyInfo</code>.</p>"},
+  {"type": "single", "prompt": "A <code>py_library</code> has no <code>visibility</code> attribute and its package has no <code>package()</code> call. Who may depend on it?", "options": ["Every package", "Only targets in its own package", "Its package and all subpackages", "Only tests"], "answer": 1, "explanation": "<p>The default is <code>//visibility:private</code>: only the same package. Subpackages are separate packages and are not included.</p>"},
+  {"type": "single", "prompt": "<code>//lib:greet</code> should be usable from <code>//app</code> and nowhere else. Which visibility is correct?", "options": ["<code>[\"//app\"]</code>", "<code>[\"//app:__pkg__\"]</code>", "<code>[\"//app/...\"]</code>", "<code>[\"//visibility:public\"]</code>"], "answer": 1, "explanation": "<p><code>//app:__pkg__</code> means exactly that package. <code>//app</code> is the label <code>//app:app</code>, which Bazel tries to load as a package group. <code>/...</code> patterns belong inside a <code>package_group</code>'s <code>packages</code>, not in a visibility list. Public lets everyone in.</p>"},
+  {"type": "multi", "prompt": "<code>//lib:core</code> has <code>visibility = [\"//app:__subpackages__\"]</code>. Which packages may depend on it? Select all that apply.", "options": ["//app", "//app/cli", "//app/cli/v2", "//application", "//lib"], "answer": [0, 1, 2, 4], "explanation": "<p><code>__subpackages__</code> covers <code>//app</code> and everything below it. <code>//application</code> only shares a prefix of characters, not a path. <code>//lib</code> is the target's own package, which can always use it.</p>"},
+  {"type": "single", "prompt": "With Bazel 9, <code>//app:hello</code> has <code>data = [\"//config:settings.yaml\"]</code>. <code>config/BUILD.bazel</code> contains a <code>filegroup</code> that lists <code>settings.yaml</code>, with default visibility. What happens?", "options": ["It builds: source files are always visible", "Visibility error on <code>//config:settings.yaml</code>; fix with <code>exports_files</code>", "Loading error in <code>config/BUILD.bazel</code>", "Execution error: missing input file"], "answer": 1, "explanation": "<p>Source files are private to their package unless exported. Because the filegroup mentions the file, the target exists and the error is a visibility error ending in \"To set the visibility of that source file target, use the exports_files() function\". If nothing in <code>//config</code> mentioned it, you would get \"no such target ... Perhaps add 'exports_files([\\\"settings.yaml\\\"])'\" instead.</p>"},
+  {"type": "single", "prompt": "Does this analyze?", "code": "py_library(\n    name = \"fakes\",\n    srcs = [\"fakes.py\"],\n    testonly = True,\n)\n\npy_test(\n    name = \"app_test\",\n    srcs = [\"app_test.py\"],\n    deps = [\":fakes\"],\n)", "lang": "starlark", "options": ["Yes: a test may depend on a testonly target", "No: testonly targets cannot be used in deps", "No: app_test also needs testonly = True", "Only with --test_output=all"], "answer": 0, "explanation": "<p>Test rules are testonly automatically, so <code>py_test</code> may depend on testonly libraries. Only non-test targets such as <code>py_binary</code> or a plain <code>py_library</code> are refused.</p>"},
+  {"type": "single", "prompt": "<code>bazel build //...</code> fails with <code>does not have mandatory providers: 'PyInfo' or 'CcInfo'</code> in the <code>deps</code> attribute of a <code>py_binary</code>. What is the most likely cause?", "options": ["A missing <code>load()</code>", "A <code>filegroup</code> (or other non-Python target) in <code>deps</code>", "A dependency cycle", "The Python toolchain is not registered"], "answer": 1, "explanation": "<p>Python <code>deps</code> require the <code>PyInfo</code> provider, which <code>py_library</code> returns and <code>filegroup</code> does not. Move files to <code>data</code>, or wrap Python files in a <code>py_library</code>.</p>"},
+  {"type": "output", "prompt": "<code>//a</code> depends on <code>//b</code>, <code>//b</code> on <code>//c</code>, and <code>//c</code> on <code>//a</code>. Each is a <code>py_library</code> named like its package. What does <code>bazel query 'somepath(//a, //c)'</code> print?", "answer": "//a:a\n//b:b\n//c:c", "explanation": "<p>Query runs before analysis, so a cycle does not stop it. <code>somepath</code> prints one path from the first set to the second, in order. The cycle itself appears as an error only when you build.</p>"},
+  {"type": "multi", "prompt": "Which of these errors happen during the <strong>analysis</strong> phase? Select all that apply.", "options": ["<code>name 'py_binary' is not defined</code>", "<code>target '//lib:greet' is not visible from target '//app:hello'</code>", "<code>cycle in dependency graph</code>", "<code>missing input file '//gen:wordz.txt'</code>", "<code>does not have mandatory providers</code>"], "answer": [1, 2, 4], "explanation": "<p>An undefined name is a loading error: the BUILD file cannot even be evaluated. Visibility, cycles, and providers are checked when rules are analyzed. A missing same-package file passes analysis and fails at execution, when an action needs it.</p>"},
+  {"type": "single", "prompt": "Which change does <strong>not</strong> change a genrule action's cache key?", "options": ["Editing the contents of a file in its <code>srcs</code>", "Running <code>touch</code> on a file in its <code>srcs</code> without changing its contents", "Editing its <code>cmd</code>", "Passing a different <code>--action_env</code> value"], "answer": 1, "explanation": "<p>Bazel hashes input <em>contents</em>, not timestamps, so <code>touch</code> changes nothing. The command line and environment are part of the key, so changing either re-runs the action.</p>"},
+  {"type": "single", "prompt": "A <code>py_test</code> opens <code>data/words.txt</code> with a relative path but does not list the file in <code>data</code>. On Linux with default settings, what happens?", "options": ["It passes: the file is in the workspace", "It fails with <code>FileNotFoundError</code>: the file is not in the test's runfiles or sandbox", "Analysis fails: undeclared file", "Bazel adds the file automatically"], "answer": 1, "explanation": "<p>The test runs in its runfiles tree inside a sandbox containing only declared inputs. Bazel cannot detect the read in advance, so the failure shows up when the test runs. Declaring the file in <code>data</code> (ideally on the library that reads it) fixes it.</p>"},
+  {"type": "multi", "prompt": "<code>bazel test //...</code> re-runs a test every time even though nothing changed. Which of these could cause that? Select all that apply.", "options": ["<code>test --nocache_test_results</code> in <code>.bazelrc</code>", "<code>tags = [\"external\"]</code> on the test", "A data file generated with the current timestamp in it", "<code>size = \"small\"</code> on the test", "The test has more than one <code>deps</code> entry"], "answer": [0, 1, 2], "explanation": "<p>The flag forces tests to run; the <code>external</code> tag marks the result uncacheable; and a volatile generated input changes the test's key every build. Size and the number of deps do not affect caching.</p>"},
+  {"type": "text", "prompt": "Write the flag (with an example value) that adds a local cache that survives <code>bazel clean</code> and is shared between workspaces.", "answer": ["--disk_cache=~/.cache/bazel-disk", "--disk_cache", "build --disk_cache=~/.cache/bazel-disk"], "explanation": "<p><code>--disk_cache=PATH</code> stores action results under PATH, keyed the same way as the in-memory action cache. Put it in <code>.bazelrc</code> as <code>build --disk_cache=~/.cache/bazel-disk</code>. Use an absolute or <code>~/</code> path: <code>%workspace%</code> is not expanded in this flag.</p>"},
+  {"type": "single", "prompt": "Your build gives a wrong result, and <code>bazel clean</code> followed by a rebuild fixes it. What does that tell you?", "options": ["Nothing: cleaning regularly is normal Bazel hygiene", "Some action has an undeclared input (a hermeticity bug) that you should find", "The disk cache is corrupted and must be deleted", "Bazel 9 has a known caching bug"], "answer": 1, "explanation": "<p>With declared inputs and content-hashed keys, a cached result can only be wrong if an action read something it did not declare. Clean hides the symptom once; finding the undeclared input fixes it for everyone, including CI and remote caches.</p>"}
+]}
+</script>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="recap">
+    <h2>Recap</h2>
+    <ul>
+      <li><code>srcs</code>, <code>deps</code>, and <code>data</code> are edges of the build graph; <code>bazel query</code> walks them, and files are nodes too.</li>
+      <li>Targets are private by default. The dependency's owner grants access with <code>:__pkg__</code>, <code>:__subpackages__</code>, a <code>package_group</code>, or (rarely) <code>//visibility:public</code>; <code>package(default_visibility = ...)</code> sets a package-wide default.</li>
+      <li>In Bazel 9, a source file in another package is usable only if that package <code>exports_files()</code> it (or wraps it in a visible <code>filegroup</code>).</li>
+      <li><code>testonly</code> keeps fakes and fixtures out of production targets.</li>
+      <li>The graph must be acyclic; find cycles with <code>somepath</code> and break them by extracting a shared library.</li>
+      <li>Attributes check providers: Python <code>deps</code> need <code>PyInfo</code>, so files go in <code>data</code>.</li>
+      <li>Loading evaluates BUILD files, analysis checks the graph and declares actions, execution runs them; each has its own family of errors.</li>
+      <li>An action's key hashes its command, environment, and input contents. Sandboxing hides undeclared inputs so keys stay honest.</li>
+      <li>Only actions downstream of a change re-run; unchanged tests report <code>(cached) PASSED</code>. <code>bazel clean</code> is rarely the answer; <code>--disk_cache</code> keeps results across cleans.</li>
+    </ul>
+    <div class="flashcards" data-title="Build graph review">
+<script type="application/json">
+[
+  {"front": "What is the difference between <code>deps</code> and <code>data</code>?", "back": "deps: code you import (must provide PyInfo). data: files you read at run time (any files), placed in runfiles."},
+  {"front": "Default visibility of a rule target?", "back": "//visibility:private: only targets in the same package may depend on it."},
+  {"front": "<code>//app:__pkg__</code> vs <code>//app:__subpackages__</code>?", "back": "__pkg__ admits exactly //app. __subpackages__ admits //app and every package below it."},
+  {"front": "Why is <code>visibility = [\"//app\"]</code> wrong?", "back": "//app means the target //app:app, which Bazel tries to use as a package_group. Write //app:__pkg__."},
+  {"front": "How does another package use <code>config/settings.yaml</code> in Bazel 9?", "back": "config/BUILD.bazel must exports_files([\"settings.yaml\"]) (ideally with a narrow visibility), or wrap it in a visible filegroup."},
+  {"front": "What does <code>testonly = True</code> enforce?", "back": "Only tests and other testonly targets may depend on it. A py_binary that does gets an analysis error."},
+  {"front": "How do you break a dependency cycle?", "back": "Find it with somepath, then extract the code both sides share into a third library that both depend on."},
+  {"front": "\"does not have mandatory providers: 'PyInfo'\" means?", "back": "A non-Python target (often a filegroup) is in deps. Move it to data, or make it a py_library."},
+  {"front": "Name the three phases in order.", "back": "Loading (evaluate BUILD files), analysis (check the graph, declare actions), execution (run actions)."},
+  {"front": "What goes into an action's cache key?", "back": "Its command line, environment, and settings, combined with the content hashes of its declared inputs."},
+  {"front": "Why does an undeclared file read fail under Bazel?", "back": "Actions and tests run in a sandbox containing only declared inputs; the file is not there."},
+  {"front": "Two reasons a test is never <code>(cached)</code>?", "back": "--nocache_test_results in .bazelrc, or tags = [\"external\"] on the test. (Also: a volatile generated input.)"}
+]
+</script>
+    </div>
+    <h3>Going further</h3>
+    <ul>
+      <li><a href="https://bazel.build/concepts/visibility">Visibility</a> on bazel.build: every visibility form, package groups, and load visibility</li>
+      <li><a href="https://bazel.build/concepts/dependencies">Dependencies</a>: the kinds of edges and how to keep them accurate</li>
+      <li><a href="https://bazel.build/run/build#phases">Build phases</a>: loading, analysis, and execution in the user guide</li>
+      <li><a href="https://bazel.build/basics/hermeticity">Hermeticity</a>: what it means and how to find non-hermetic actions</li>
+      <li><a href="https://bazel.build/docs/sandboxing">Sandboxing</a>: strategies, <code>--sandbox_debug</code>, and platform differences</li>
+      <li><a href="https://bazel.build/remote/caching">Remote caching</a>, including <code>--disk_cache</code></li>
+      <li><a href="https://bazel.build/query/aquery">Action graph query (aquery)</a></li>
+      <li><a href="https://rules-python.readthedocs.io/">rules_python documentation</a>: <code>py_library</code>, <code>data</code>, and runfiles</li>
+      <li><a href="https://registry.bazel.build/">Bazel Central Registry</a></li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>

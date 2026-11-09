@@ -209,6 +209,8 @@ def _rc(kind: str, attrs: dict[str, str], **kw: Any) -> RuleClass:
 
 
 _PYDEP = ("PyInfo", "CcInfo")
+# The Python toolchain rules_python 2.4.6 registers when MODULE.bazel calls no python.toolchain() (verified).
+_RULES_PYTHON_DEFAULT_PYTHON = "3.14"
 _GO_EXTS = (".go", ".s", ".S", ".h", ".c", ".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx", ".inc", ".m", ".mm", ".syso")
 
 RULES: dict[str, RuleClass] = {
@@ -1940,7 +1942,9 @@ class _Analyzer:
                     if path in self.ws.files
                     else f"rule '{dep.label}' does not exist"
                 )
-                self.errors.append(f"{where}: in {attr} attribute of {target.kind} rule {target.label}: {problem}{suffix}")
+                self.errors.append(
+                    f"{where}: in {attr} attribute of {target.kind} rule {target.label}: {problem}{suffix}"
+                )
             elif needs and not self._provides(dep, needs):
                 names = " or ".join(f"'{n}'" for n in needs)
                 self.errors.append(
@@ -2045,13 +2049,22 @@ class _Analyzer:
             srcs = self.resolve(target, "srcs") or []
             main = self.resolve(target, "main")
             if not main and not target.attrs.get("main_module"):
+                # rules_python matches the default main against the end of each src path: tests/x_test.py works.
                 default = f"{target.name}.py"
                 names = [parse_label(s, target.label.package).name for s in srcs]
-                if default not in names:
+                hits = [n for n in names if n == default or n.endswith("/" + default)]
+                if not hits:
                     self.errors.append(
                         f"{where}: in {target.kind} rule {target.label}: \nError in fail: corresponding default "
                         f"'{default}' does not appear in srcs. Add it or override default file name with a 'main' "
                         "attribute"
+                    )
+                elif len(hits) > 1:
+                    prefix = f"{target.label.package}/" if target.label.package else ""
+                    self.errors.append(
+                        f"{where}: in {target.kind} rule {target.label}: \nError in fail: default main file "
+                        f"'{default}' matches multiple files in srcs. Perhaps specify an explicit file with 'main' "
+                        f"attribute? Matches were: {', '.join(prefix + h for h in hits)}"
                     )
             elif main:
                 names = [str(parse_label(s, target.label.package)) for s in srcs]
@@ -2060,6 +2073,13 @@ class _Analyzer:
                         f"{where}: in {target.kind} rule {target.label}: \nError in fail: could not find '{main}' as "
                         "specified by 'main' attribute"
                     )
+            wanted = self.resolve(target, "python_version")
+            if wanted and not self._python_registered(str(wanted)):
+                self.errors.append(
+                    f"{where}: While resolving toolchains for target {target.label}: No matching toolchains found "
+                    "for types:\n  @@bazel_tools//tools/python:toolchain_type\nTo debug, rerun with "
+                    "--toolchain_resolution_debug='@@bazel_tools//tools/python:toolchain_type'"
+                )
         if target.kind == "genrule":
             self._check_make_vars(target)
         if target.kind in ("go_binary", "go_test", "go_library"):
@@ -2067,6 +2087,18 @@ class _Analyzer:
             embed = self.resolve(target, "embed") or []
             if target.kind == "go_library" and not srcs and not embed:
                 pass
+
+    def _python_registered(self, version: str) -> bool:
+        """Whether a Python toolchain for ``version`` is registered.
+
+        Registered versions come from python.toolchain() calls; without any, rules_python 2.4.6's default (3.14).
+        """
+        registered = [v for v in self.ws.module.python_versions if v] or [_RULES_PYTHON_DEFAULT_PYTHON]
+
+        def minor(v: str) -> str:
+            return ".".join(v.split(".")[:2])
+
+        return any(version == v or minor(version) == v or version == minor(v) for v in registered)
 
     def _check_make_vars(self, target: Target) -> None:
         cmds = [target.attrs.get(k) for k in ("cmd", "cmd_bash")]
@@ -2391,6 +2423,12 @@ class _Query:
         elif not t.startswith("//"):
             t = "//" + t
         body = t[2:]
+        package_part = body.split(":", 1)[0]
+        if "//" in package_part:
+            raise BazelError(
+                f"invalid package name '{package_part.rsplit('/', 1)[0]}': package names may not contain '//' path "
+                "separators"
+            )
         recursive = body == "..." or body.startswith("...:") or "/...:" in body or body.endswith("/...")
         if recursive:
             base, _, suffix = body.partition("...")
@@ -2772,6 +2810,7 @@ class Bazel:
                 fmt = next((f.split("=", 1)[1] for f in flags if f.startswith("--output")), "label")
                 cfg_flags = [f for f in flags if not f.startswith("--output")]
                 labels = self.query(exprs[0], *cfg_flags) if cmd == "query" else self.cquery(exprs[0], *cfg_flags)
+                labels = list(dict.fromkeys(labels))  # each target once, even if reached through two equal labels
                 if fmt == "label_kind":
                     text = "\n".join(f"{self.ws.target(parse_label(lbl)).kind_string()} {lbl}" for lbl in labels)
                 elif fmt == "package":

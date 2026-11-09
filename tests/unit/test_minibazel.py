@@ -112,10 +112,14 @@ def test_no_module_bazel() -> None:
 
 def test_missing_load_names_the_file_to_load() -> None:
     error = build_error({"app/BUILD.bazel": 'py_binary(name = "x", srcs = ["x.py"])\n'})
-    assert error == (
-        "Skipping '//...': error loading package 'app': app/BUILD.bazel:1:1: name 'py_binary' is not defined "
-        '(load it with load("@rules_python//python:defs.bzl", "py_binary"))'
-    ) or "name 'py_binary' is not defined" in error
+    assert (
+        error
+        == (
+            "Skipping '//...': error loading package 'app': app/BUILD.bazel:1:1: name 'py_binary' is not defined "
+            '(load it with load("@rules_python//python:defs.bzl", "py_binary"))'
+        )
+        or "name 'py_binary' is not defined" in error
+    )
 
 
 def test_missing_load_fails_build_in_loading_phase() -> None:
@@ -188,7 +192,9 @@ def test_load_must_be_top_level() -> None:
 
 def test_duplicate_targets() -> None:
     error = build_error({"a/BUILD.bazel": PY + 'py_library(name = "l")\npy_library(name = "l")\n'})
-    assert "a/BUILD.bazel:3:11: Error in py_library: py_library rule 'l' conflicts with existing py_library rule" in error
+    assert (
+        "a/BUILD.bazel:3:11: Error in py_library: py_library rule 'l' conflicts with existing py_library rule" in error
+    )
 
 
 def test_output_conflicting_with_a_rule() -> None:
@@ -350,9 +356,43 @@ def test_no_such_target_referenced_by() -> None:
     files = {"a/BUILD.bazel": PY + 'py_binary(name = "x", srcs = ["x.py"], deps = [":nope"])\n', "a/x.py": ""}
     error = build_error(files, "//a:x")
     assert (
-        "a/BUILD.bazel:2:10: no such target '//a:nope': target 'nope' not declared in package 'a' defined by "
-        "a/BUILD.bazel and referenced by '//a:x'"
+        "a/BUILD.bazel:2:10: in deps attribute of py_binary rule //a:x: rule '//a:nope' does not exist. Since this "
+        "rule was created by the macro 'py_binary', the error might have been caused by the macro implementation"
     ) in error
+
+
+def test_no_such_target_in_another_package() -> None:
+    files = {
+        "a/BUILD.bazel": PY + 'py_binary(name = "x", srcs = ["x.py"], deps = ["//b:nope"])\n',
+        "a/x.py": "",
+        "b/BUILD.bazel": "",
+    }
+    assert (
+        "a/BUILD.bazel:2:10: no such target '//b:nope': target 'nope' not declared in package 'b' defined by "
+        "b/BUILD.bazel and referenced by '//a:x'"
+    ) in build_error(files, "//a:x")
+
+
+def test_files_in_deps_are_misplaced() -> None:
+    files = {
+        "a/BUILD.bazel": PY + 'py_library(name = "l", deps = [":x.py", "//b:g.py"])\n',
+        "a/x.py": "",
+        "b/BUILD.bazel": 'exports_files(["g.py"])\n',
+        "b/g.py": "",
+    }
+    error = build_error(files, "//a:l")
+    assert (
+        "in deps attribute of py_library rule //a:l: source file '//a:x.py' is misplaced here (expected no files)"
+        in error
+    )
+    assert "source file '//b:g.py' is misplaced here (expected no files)" in error
+
+
+def test_missing_same_package_label_outside_deps_is_a_file() -> None:
+    files = {"a/BUILD.bazel": 'filegroup(name = "f", srcs = [":nope"])\n'}
+    result = ws(files).build("//a:f")
+    assert result.phase == "execution"
+    assert result.errors == ["missing input file '//a:nope'"]
 
 
 def test_no_such_package() -> None:
@@ -379,7 +419,11 @@ def test_existing_file_not_mentioned_by_a_rule_is_not_a_target() -> None:
 
 
 def test_label_crossing_into_a_subpackage_fails_loading() -> None:
-    files = {"b/BUILD.bazel": 'filegroup(name = "fg", srcs = ["sub/c.txt"])\n', "b/sub/BUILD.bazel": "", "b/sub/c.txt": ""}
+    files = {
+        "b/BUILD.bazel": 'filegroup(name = "fg", srcs = ["sub/c.txt"])\n',
+        "b/sub/BUILD.bazel": "",
+        "b/sub/c.txt": "",
+    }
     result = ws(files).build("//b:fg")
     assert result.phase == "loading"
     assert (
@@ -481,7 +525,10 @@ def test_default_visibility_applies_to_rules_and_files() -> None:
 
 
 def test_source_files_are_private_unless_exported() -> None:
-    assert "target '//b:f.txt' is not visible from" in _vis('filegroup(name = "fg", srcs = ["f.txt"])\n', "//b:f.txt").error
+    assert (
+        "target '//b:f.txt' is not visible from"
+        in _vis('filegroup(name = "fg", srcs = ["f.txt"])\n', "//b:f.txt").error
+    )
     assert _vis('exports_files(["f.txt"])\n', "//b:f.txt").ok
     assert not _vis('exports_files(["f.txt"], visibility = ["//c:__pkg__"])\n', "//b:f.txt").ok
 
@@ -534,7 +581,8 @@ def test_misplaced_source_file() -> None:
 
 def test_testonly() -> None:
     files = {
-        "a/BUILD.bazel": PY + 'py_library(name = "t", testonly = True)\npy_binary(name = "x", srcs = ["x.py"], deps = [":t"])\n'
+        "a/BUILD.bazel": PY
+        + 'py_library(name = "t", testonly = True)\npy_binary(name = "x", srcs = ["x.py"], deps = [":t"])\n'
         'py_test(name = "ok", srcs = ["ok.py"], deps = [":t"])\n',
         "a/x.py": "",
         "a/ok.py": "",
@@ -558,7 +606,10 @@ def test_cycle() -> None:
         + 'py_library(name = "p", deps = [":q"])\npy_library(name = "q", deps = [":r"])\npy_library(name = "r", deps = [":p"])\n'
     }
     error = build_error(files, "//a:p")
-    assert "a/BUILD.bazel:2:11: in py_library rule //a:p: cycle in dependency graph:\n.-> //a:p\n|   //a:q\n|   //a:r\n`-- //a:p" in error
+    assert (
+        "a/BUILD.bazel:2:11: in py_library rule //a:p: cycle in dependency graph:\n.-> //a:p\n|   //a:q\n|   //a:r\n`-- //a:p"
+        in error
+    )
 
 
 def test_py_binary_default_main() -> None:
@@ -598,7 +649,10 @@ def test_genrule_make_variables() -> None:
 
 
 def test_generated_file_depends_on_its_rule() -> None:
-    files = {"g/BUILD.bazel": "genrule(name = 'g', srcs = ['in.txt'], outs = ['out.txt'], cmd = 'cp $< $@')\n", "g/in.txt": ""}
+    files = {
+        "g/BUILD.bazel": "genrule(name = 'g', srcs = ['in.txt'], outs = ['out.txt'], cmd = 'cp $< $@')\n",
+        "g/in.txt": "",
+    }
     bazel = ws(files)
     assert bazel.query("deps(//g:out.txt)") == ["//g:g", "//g:in.txt", "//g:out.txt"]
     assert bazel.target("//g:out.txt").kind == "generated file"
@@ -624,7 +678,9 @@ def test_select_key_must_be_a_config_setting() -> None:
 
 
 def test_select_errors_at_loading() -> None:
-    assert "select({}) with an empty dictionary" in build_error({"a/BUILD.bazel": 'filegroup(name = "y", srcs = select({}))\n'})
+    assert "select({}) with an empty dictionary" in build_error(
+        {"a/BUILD.bazel": 'filegroup(name = "y", srcs = select({}))\n'}
+    )
     files = {"a/BUILD.bazel": 'filegroup(name = "y", tags = select({"//conditions:default": []}))\n'}
     assert "attribute 'tags' is not configurable" in build_error(files)
 
@@ -691,8 +747,11 @@ def test_attr_without_flags_refuses_configurable_values(sel: Any) -> None:
 def test_define_values_and_bazelrc_configs(sel: Any) -> None:
     no_match = sel.build("//c:b")
     assert not no_match.ok
-    assert 'Configurable attribute "srcs" doesn\'t match this configuration (would a default condition help?)' in no_match.error
-    assert "Conditions checked:\n //c:fast\n //c:is_prod" in no_match.error
+    assert (
+        'c/BUILD.bazel:19:10: configurable attribute "srcs" in //c:b doesn\'t match this configuration. Would a '
+        "default condition help?\n\nConditions checked:\n //c:fast\n //c:is_prod\n\nTo see a condition's definition, "
+        "run: bazel query --output=build <condition label>."
+    ) in no_match.error
     assert sel.build("//c:b", "--config=fast").ok
     assert sel.build("//c:b", "--define=mode=fast").ok
     assert sel.build("//c:b", "--define", "mode=fast").ok
@@ -717,11 +776,16 @@ def test_specialization_and_ambiguity(sel: Any) -> None:
     assert sel.cquery("labels(srcs, //c:c)", "-c", "opt", "--//c:color=blue") == ["//c:d2"]
     assert sel.cquery("labels(srcs, //c:c)", "--//c:color=blue") == ["//c:d1"]
     result = sel.build("//c:d", "-c", "opt", "--//c:color=blue")
-    assert 'Illegal ambiguous match on configurable attribute "srcs" in //c:d:\n//c:blue, //c:opt' in result.error
+    assert (
+        'Illegal ambiguous match on configurable attribute "srcs" in //c:d:\n//c:blue\n//c:opt\nMultiple'
+        in result.error
+    )
 
 
 def test_no_match_error(sel: Any) -> None:
-    assert "//c:g: build with -c opt" in sel.build("//c:g").error
+    assert 'configurable attribute "srcs" in //c:g doesn\'t match this configuration: build with -c opt' in (
+        sel.build("//c:g").error
+    )
     assert sel.build("//c:g", "-c", "opt").ok
 
 
@@ -729,7 +793,8 @@ def test_constraint_values_and_platforms(sel: Any) -> None:
     assert sel.cquery("labels(srcs, //c:e)") == ["//c:d1"]
     assert sel.cquery("labels(srcs, //c:e)", "--platforms=//c:win") == ["//c:d2"]
     assert sel.cquery("labels(srcs, //c:e)", "--platforms=//c:win_child") == ["//c:d2"]
-    assert sel.cquery("labels(srcs, //c:e)", "--host_os=darwin") == []
+    with pytest.raises(mb.BazelError, match="doesn't match this configuration"):
+        sel.cquery("labels(srcs, //c:e)", "--host_os=darwin")
     with pytest.raises(mb.BazelError, match="does not provide PlatformInfo"):
         sel.cquery("labels(srcs, //c:e)", "--platforms=//c:d1")
 
@@ -857,8 +922,8 @@ def pats() -> Any:
 
 
 def test_target_patterns_in_query(pats: Any) -> None:
-    assert pats.query("//...") == ["//a/sub:s", "//a:lib", "//a:m", "//a:t", "//other:o"]
-    assert pats.query("//a/...") == ["//a/sub:s", "//a:lib", "//a:m", "//a:t"]
+    assert pats.query("//...") == ["//a:lib", "//a:m", "//a:t", "//a/sub:s", "//other:o"]
+    assert pats.query("//a/...") == ["//a:lib", "//a:m", "//a:t", "//a/sub:s"]
     assert pats.query("//a:all") == ["//a:lib", "//a:m", "//a:t"]
     assert pats.query("//a:*") == ["//a:BUILD.bazel", "//a:lib", "//a:lib.py", "//a:m", "//a:m.py", "//a:t", "//a:t.py"]
     assert pats.query("//a:all-targets") == pats.query("//a:*")
@@ -871,7 +936,11 @@ def test_build_skips_manual_targets_and_honours_exclusions(pats: Any) -> None:
     bazel = ws(files)
     assert bazel.build("//...").targets == ["//a/sub:s", "//a:lib", "//a:t", "//other:o"]
     assert bazel.build("//a:all").targets == ["//a:lib", "//a:t"]
-    assert bazel.build("//...", "-//a/...").targets == ["//other:o"]
+    assert bazel.build("--", "//...", "-//a/...").targets == ["//other:o"]
+    assert len(bazel.build("--", "-//a/...", "//...").targets) == 4  # patterns apply left to right
+    invalid = bazel.build("//...", "-//a/...")
+    assert invalid.phase == "options"
+    assert invalid.output == "ERROR: Invalid options syntax: -//a/..."
     assert bazel.build("--", "//...", "-//a:t").targets == ["//a/sub:s", "//a:lib", "//other:o"]
     assert bazel.build("//a:m").targets == ["//a:m"]
 
@@ -911,9 +980,17 @@ def tests_ws() -> Any:
 def test_bazel_test_selects_non_manual_tests(tests_ws: Any) -> None:
     result = tests_ws.test("//...")
     assert result.ok
-    assert result.tests == ["//t:d", "//t:l", "//t:s"]
+    # //t:man lists the manual test explicitly, and //... includes //t:man, so //t:m runs too (as in Bazel 9.3.2)
+    assert result.tests == ["//t:d", "//t:l", "//t:m", "//t:s"]
     assert "//t:lib" in result.targets
-    assert "Executed 0 out of 3 tests (the simulator analyzes; it does not run tests)." in result.output
+    assert ws({**TEST_FILES, "t/BUILD.bazel": TEST_FILES["t/BUILD.bazel"].split("test_suite")[0]}).test(
+        "//..."
+    ).tests == [
+        "//t:d",
+        "//t:l",
+        "//t:s",
+    ]
+    assert "Executed 0 out of 4 tests (the simulator analyzes; it does not run tests)." in result.output
 
 
 def test_test_suites(tests_ws: Any) -> None:
@@ -926,16 +1003,16 @@ def test_test_suites(tests_ws: Any) -> None:
 
 
 def test_tag_and_size_filters(tests_ws: Any) -> None:
-    assert tests_ws.test("//...", "--test_tag_filters=-slow").tests == ["//t:d", "//t:s"]
+    assert tests_ws.test("//...", "--test_tag_filters=-slow").tests == ["//t:d", "//t:m", "//t:s"]
     assert tests_ws.test("//...", "--test_tag_filters=slow").tests == ["//t:l"]
     assert tests_ws.test("//...", "--test_tag_filters=small").tests == ["//t:s"]
     assert tests_ws.test("//...", "--test_size_filters=small,large").tests == ["//t:l", "//t:s"]
-    assert tests_ws.test("//...", "--test_size_filters=medium").tests == ["//t:d"]
+    assert tests_ws.test("//...", "--test_size_filters=medium").tests == ["//t:d", "//t:m"]
 
 
 def test_build_tests_only(tests_ws: Any) -> None:
     result = tests_ws.test("//...", "--build_tests_only", "--keep_going")
-    assert result.targets == ["//t:d", "//t:l", "//t:s"]
+    assert result.targets == ["//t:d", "//t:l", "//t:m", "//t:s"]
 
 
 def test_no_tests_found(tests_ws: Any) -> None:
@@ -994,7 +1071,11 @@ def test_bzl_in_a_directory_that_is_not_a_package() -> None:
 
 
 def test_load_cycle() -> None:
-    files = {"m/BUILD.bazel": 'load(":a.bzl", "x")\n', "m/a.bzl": 'load(":b.bzl", "y")\nx = 1\n', "m/b.bzl": 'load(":a.bzl", "x")\ny = 1\n'}
+    files = {
+        "m/BUILD.bazel": 'load(":a.bzl", "x")\n',
+        "m/a.bzl": 'load(":b.bzl", "y")\nx = 1\n',
+        "m/b.bzl": 'load(":a.bzl", "x")\ny = 1\n',
+    }
     assert "cycle in load graph" in build_error(files, "//m:all")
 
 
@@ -1025,7 +1106,9 @@ def test_run_command_query_formats(q: Any) -> None:
     assert q.run_command("pixi run bazel query //... --output=package").output == "a\nb"
     assert q.run_command("bazel query 'kind(go_library, //...)'").output == "INFO: Empty results"
     assert q.run_command("bazel query //... --output=xml").errors
-    assert q.run_command("bazel query //a:app //b:t").errors == ["query expects exactly one query expression (quote it)"]
+    assert q.run_command("bazel query //a:app //b:t").errors == [
+        "query expects exactly one query expression (quote it)"
+    ]
     assert q.run_command("bazel query 'allrdeps(//b:l3)' --universe_scope=//...").ok
 
 
@@ -1071,7 +1154,10 @@ def test_run_command_misc() -> None:
 def test_build_output_lists_errors_like_bazel() -> None:
     files = {"a/BUILD.bazel": PY + 'py_library(name = "l", deps = [":nope"])\n'}
     output = ws(files).run_command("bazel build //a:l").output
-    assert output.splitlines()[-2:] == ["ERROR: Analysis of target failed; build aborted", "ERROR: Build did NOT complete successfully"]
+    assert output.splitlines()[-2:] == [
+        "ERROR: Analysis of target failed; build aborted",
+        "ERROR: Build did NOT complete successfully",
+    ]
 
 
 def test_target_and_exists_and_result_helpers() -> None:
@@ -1147,3 +1233,88 @@ def test_run_checks_gives_each_check_a_fresh_workspace() -> None:
     checks = "def test_one(bazel):\n    bazel.target('//a:x')\n    assert bazel.printed() == ['loaded']\n\n"
     checks += "def test_two(bazel):\n    assert bazel.printed() == []\n"
     assert all(r["ok"] for r in mb.run_checks(files, checks))
+
+
+# --------------------------------------------------------------------- regressions verified against Bazel 9.3.2
+
+
+def test_unknown_options_are_rejected() -> None:
+    files = {"app/BUILD.bazel": PY + 'py_binary(name = "cli", srcs = ["cli.py"])\n', "app/cli.py": ""}
+    bazel = ws(files)
+    assert bazel.run_command("bazel run //app:cli --name Ada").output == "ERROR: --name :: Unrecognized option: --name"
+    assert bazel.run_command("bazel build //app:cli -x").output == "ERROR: -x :: Unrecognized option: -x"
+    assert bazel.run_command("bazel run //app:cli -- --name Ada").ok
+    ok = "bazel build //app:cli --keep_going --nokeep_going --verbose_failures --test_output errors --nobuild"
+    assert bazel.run_command(ok).ok
+
+
+def test_query_subtraction_without_space_and_sort_order() -> None:
+    files = {
+        "lib/BUILD.bazel": 'filegroup(name = "l")\n',
+        "tools/BUILD.bazel": 'filegroup(name = "gen")\n',
+        "tools/exp/BUILD.bazel": 'filegroup(name = "x")\n',
+    }
+    bazel = ws(files)
+    assert bazel.query("//...") == ["//lib:l", "//tools:gen", "//tools/exp:x"]
+    assert bazel.query("//... -//lib/...") == ["//tools:gen", "//tools/exp:x"]
+    with pytest.raises(mb.BazelError, match="invalid package name '...-//lib': package names may not contain '//'"):
+        bazel.query("//...-//lib/...")
+
+
+def test_own_module_name_is_the_main_repository() -> None:
+    module = 'module(name = "greeter")\n'
+    bazel = mb.Bazel(
+        {
+            "MODULE.bazel": module,
+            "a/BUILD.bazel": 'filegroup(name = "x")\nfilegroup(name = "y", srcs = ["@greeter//a:x"])\n',
+        }
+    )
+    assert bazel.query("@greeter//a:x") == ["//a:x"]
+    assert bazel.build("//a:y").ok
+
+
+def test_deps_results_are_unique() -> None:
+    files = {
+        "docs/BUILD.bazel": 'filegroup(name = "pages", srcs = ["intro.md"])\n'
+        'filegroup(name = "all", srcs = [":pages", "intro.md"])\n',
+        "docs/intro.md": "",
+    }
+    assert ws(files).query("deps(//docs:all)") == ["//docs:all", "//docs:intro.md", "//docs:pages"]
+
+
+def test_default_main_matches_the_end_of_a_src_path() -> None:
+    files = {
+        "p/BUILD.bazel": PY + 'py_test(name = "counting_test", srcs = ["tests/counting_test.py"])\n'
+        'py_binary(name = "amb", srcs = ["x/amb.py", "y/amb.py"])\npy_binary(name = "near", srcs = ["xnear.py"])\n',
+        "p/tests/counting_test.py": "",
+        "p/x/amb.py": "",
+        "p/y/amb.py": "",
+        "p/xnear.py": "",
+    }
+    bazel = ws(files)
+    assert bazel.build("//p:counting_test").ok
+    assert (
+        "Error in fail: default main file 'amb.py' matches multiple files in srcs. Perhaps specify an explicit file "
+        "with 'main' attribute? Matches were: p/x/amb.py, p/y/amb.py"
+    ) in bazel.build("//p:amb").error
+    assert "corresponding default 'near.py' does not appear in srcs" in bazel.build("//p:near").error
+
+
+def test_python_version_needs_a_registered_toolchain() -> None:
+    build = PY + 'py_binary(name = "v312", srcs = ["v.py"], main = "v.py", python_version = "3.12")\n'
+    build += 'py_binary(name = "v313", srcs = ["v.py"], main = "v.py", python_version = "3.13")\n'
+    build += 'py_binary(name = "v314", srcs = ["v.py"], main = "v.py", python_version = "3.14")\n'
+    with_313 = MODULE + 'python = use_extension("@rules_python//python/extensions:python.bzl", "python")\n'
+    with_313 += 'python.toolchain(python_version = "3.13", is_default = True)\n'
+    bazel = mb.Bazel({"MODULE.bazel": with_313, "p/BUILD.bazel": build, "p/v.py": ""})
+    error = bazel.build("//p:v312").error
+    assert (
+        "While resolving toolchains for target //p:v312: No matching toolchains found for types:\n"
+        "  @@bazel_tools//tools/python:toolchain_type"
+    ) in error
+    assert bazel.build("//p:v313").ok
+    assert not bazel.build("//p:v314").ok
+    # without python.toolchain(), rules_python 2.4.6 registers only its default, Python 3.14
+    default = mb.Bazel({"MODULE.bazel": MODULE, "p/BUILD.bazel": build, "p/v.py": ""})
+    assert default.build("//p:v314").ok
+    assert not default.build("//p:v313").ok
